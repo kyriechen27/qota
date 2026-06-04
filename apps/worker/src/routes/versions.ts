@@ -6,7 +6,7 @@ import { Hono } from 'hono';
 import type { AppEnv } from '../env';
 import { requireUser } from '../middleware/auth';
 import { badRequest, notFound } from '../utils/errors';
-import { requireProjectAccess } from '../lib/memberships';
+import { requireProjectAccess, visibleProjectIds } from '../lib/memberships';
 import { makeStorage } from '../lib/s3';
 import { audit } from '../lib/audit';
 import { base64UrlEncode } from '../utils/encoding';
@@ -91,6 +91,59 @@ versionRoutes.get('/', async (c) => {
     .bind(...args)
     .all<VersionRow>();
   return c.json((rows.results ?? []).map(versionDto));
+});
+
+interface AccessibleRow extends VersionRow {
+  project_code: string;
+  project_name: string;
+  customer_id: number;
+  customer_code: string;
+  customer_name: string;
+}
+
+function accessibleDto(r: AccessibleRow) {
+  return {
+    ...versionDto(r),
+    projectCode: r.project_code,
+    projectName: r.project_name,
+    customerId: r.customer_id,
+    customerCode: r.customer_code,
+    customerName: r.customer_name,
+  };
+}
+
+// Cross-project catalog — every ready version in every project the caller can
+// access, in one call ("all the files I'm allowed to download"). Uses the same
+// membership visibility as GET /api/projects. Registered before '/:id' so the
+// literal path wins.
+versionRoutes.get('/accessible', async (c) => {
+  const user = c.get('user')!;
+  const includeArchived = c.req.query('includeArchived') === '1';
+  const visible = await visibleProjectIds(c.env.DB, user); // null = super_admin → all
+
+  const where: string[] = [includeArchived ? `v.status != 'pending'` : `v.status = 'ready'`];
+  const args: unknown[] = [];
+  if (visible !== null) {
+    if (visible.length === 0) return c.json([]);
+    where.push(`v.project_id IN (${visible.map(() => '?').join(',')})`);
+    args.push(...visible);
+  }
+  const rows = await c.env.DB.prepare(
+    `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size,
+            v.sha256, v.content_type, v.notes, v.is_mandatory, v.min_version, v.max_version,
+            v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug,
+            v.uploaded_by, v.created_at, v.updated_at,
+            p.code AS project_code, p.name AS project_name,
+            c.id AS customer_id, c.code AS customer_code, c.name AS customer_name
+       FROM versions v
+       JOIN projects p ON p.id = v.project_id
+       JOIN customers c ON c.id = p.customer_id
+      WHERE ${where.join(' AND ')}
+      ORDER BY c.name ASC, p.name ASC, v.created_at DESC`,
+  )
+    .bind(...args)
+    .all<AccessibleRow>();
+  return c.json((rows.results ?? []).map(accessibleDto));
 });
 
 versionRoutes.get('/:id', async (c) => {

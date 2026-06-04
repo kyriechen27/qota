@@ -172,6 +172,70 @@ downloadRoutes.get('/device/latest', async (c) => {
   return redirectOrJson(c, row, ttl);
 });
 
+// List every ready version this token can pull (its project, honoring the
+// token's channel pin). Lets a device/CI enumerate all available files, then
+// fetch any via /device/version/:id. Bearer <api_token>.
+downloadRoutes.get('/device/list', async (c) => {
+  const dev = await authDevice(c);
+  const qChannel = c.req.query('channel');
+  if (dev.channel && qChannel && dev.channel !== qChannel) throw forbidden('channel not allowed for this token');
+  const effChannel = dev.channel ?? qChannel ?? null;
+
+  const where = ['project_id = ?', `status = 'ready'`];
+  const args: unknown[] = [dev.projectId];
+  if (effChannel) {
+    where.push('release_channel = ?');
+    args.push(effChannel);
+  }
+  const rows = await c.env.DB.prepare(
+    `SELECT id, version, release_channel, filename, size, sha256, content_type, is_mandatory, created_at
+       FROM versions WHERE ${where.join(' AND ')} ORDER BY created_at DESC`,
+  )
+    .bind(...args)
+    .all<{
+      id: number;
+      version: string;
+      release_channel: string;
+      filename: string;
+      size: number;
+      sha256: string | null;
+      content_type: string | null;
+      is_mandatory: number;
+      created_at: number;
+    }>();
+  const proj = await c.env.DB.prepare(
+    `SELECT p.code AS p_code, p.name AS p_name, c.code AS c_code, c.name AS c_name
+       FROM projects p JOIN customers c ON c.id = p.customer_id WHERE p.id = ?`,
+  )
+    .bind(dev.projectId)
+    .first<{ p_code: string; p_name: string; c_code: string; c_name: string }>();
+
+  const versions = (rows.results ?? []).map((r) => ({
+    id: r.id,
+    version: r.version,
+    channel: r.release_channel,
+    filename: r.filename,
+    size: r.size,
+    sha256: r.sha256,
+    contentType: r.content_type,
+    isMandatory: !!r.is_mandatory,
+    createdAt: r.created_at,
+    download: `/api/download/device/version/${r.id}`,
+  }));
+  return c.json({
+    project: {
+      id: dev.projectId,
+      code: proj?.p_code ?? null,
+      name: proj?.p_name ?? null,
+      customerCode: proj?.c_code ?? null,
+      customerName: proj?.c_name ?? null,
+    },
+    channel: effChannel,
+    count: versions.length,
+    versions,
+  });
+});
+
 downloadRoutes.get('/device/version/:id', async (c) => {
   const id = Number(c.req.param('id'));
   if (!Number.isFinite(id)) throw badRequest('invalid id');

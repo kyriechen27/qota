@@ -20,6 +20,9 @@ export default function Layout({ children }: { children: ReactNode }) {
         <NavLink to="/projects" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
           {t('nav.projects')}
         </NavLink>
+        <NavLink to="/files" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
+          {t('nav.files')}
+        </NavLink>
         {user.role === 'super_admin' && (
           <>
             <NavLink to="/users" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>

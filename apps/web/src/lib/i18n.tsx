@@ -41,6 +41,7 @@ const zh: Dict = {
   'nav.dashboard': '仪表盘',
   'nav.customers': '客户',
   'nav.projects': '项目',
+  'nav.files': '全部文件',
   'nav.users': '用户',
   'nav.memberships': '成员授权',
   'nav.account': '账户',
@@ -188,6 +189,14 @@ const zh: Dict = {
   'pd.confirmDisablePublic': '关闭后该链接和二维码将立即失效。确定关闭公开访问？',
   'pd.publicReadyOnly': '仅“就绪”状态的版本可开启公开访问。',
 
+  // all files (cross-project catalog)
+  'files.title': '全部文件',
+  'files.search': '搜索客户 / 项目 / 版本 / 文件名…',
+  'files.count': '共 {count} 个文件',
+  'files.colCustomer': '客户',
+  'files.colProject': '项目',
+  'files.empty': '没有可访问的文件。',
+
   // memberships
   'mem.title': '成员授权',
   'mem.allCustomers': '全部客户',
@@ -258,6 +267,7 @@ const en: Dict = {
   'nav.dashboard': 'Dashboard',
   'nav.customers': 'Customers',
   'nav.projects': 'Projects',
+  'nav.files': 'All files',
   'nav.users': 'Users',
   'nav.memberships': 'Memberships',
   'nav.account': 'Account',
@@ -398,6 +408,13 @@ const en: Dict = {
   'pd.openLink': 'Open',
   'pd.confirmDisablePublic': 'Disabling immediately invalidates this link and QR code. Disable public access?',
   'pd.publicReadyOnly': 'Only "ready" versions can be made public.',
+
+  'files.title': 'All files',
+  'files.search': 'Search customer / project / version / filename…',
+  'files.count': '{count} file(s)',
+  'files.colCustomer': 'Customer',
+  'files.colProject': 'Project',
+  'files.empty': 'No accessible files.',
 
   'mem.title': 'Memberships',
   'mem.allCustomers': 'All customers',

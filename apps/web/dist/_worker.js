@@ -27914,6 +27914,42 @@ versionRoutes.get("/", async (c) => {
   ).bind(...args).all();
   return c.json((rows.results ?? []).map(versionDto));
 });
+function accessibleDto(r) {
+  return {
+    ...versionDto(r),
+    projectCode: r.project_code,
+    projectName: r.project_name,
+    customerId: r.customer_id,
+    customerCode: r.customer_code,
+    customerName: r.customer_name
+  };
+}
+versionRoutes.get("/accessible", async (c) => {
+  const user = c.get("user");
+  const includeArchived = c.req.query("includeArchived") === "1";
+  const visible = await visibleProjectIds(c.env.DB, user);
+  const where = [includeArchived ? `v.status != 'pending'` : `v.status = 'ready'`];
+  const args = [];
+  if (visible !== null) {
+    if (visible.length === 0) return c.json([]);
+    where.push(`v.project_id IN (${visible.map(() => "?").join(",")})`);
+    args.push(...visible);
+  }
+  const rows = await c.env.DB.prepare(
+    `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size,
+            v.sha256, v.content_type, v.notes, v.is_mandatory, v.min_version, v.max_version,
+            v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug,
+            v.uploaded_by, v.created_at, v.updated_at,
+            p.code AS project_code, p.name AS project_name,
+            c.id AS customer_id, c.code AS customer_code, c.name AS customer_name
+       FROM versions v
+       JOIN projects p ON p.id = v.project_id
+       JOIN customers c ON c.id = p.customer_id
+      WHERE ${where.join(" AND ")}
+      ORDER BY c.name ASC, p.name ASC, v.created_at DESC`
+  ).bind(...args).all();
+  return c.json((rows.results ?? []).map(accessibleDto));
+});
 versionRoutes.get("/:id", async (c) => {
   const id = Number(c.req.param("id"));
   if (!Number.isFinite(id)) throw badRequest("invalid id");
@@ -28300,6 +28336,50 @@ downloadRoutes.get("/device/latest", async (c) => {
   if (!row) throw notFound("no ready versions in this channel");
   const ttl = Number(c.env.DOWNLOAD_URL_TTL_SECONDS) || 300;
   return redirectOrJson(c, row, ttl);
+});
+downloadRoutes.get("/device/list", async (c) => {
+  const dev = await authDevice(c);
+  const qChannel = c.req.query("channel");
+  if (dev.channel && qChannel && dev.channel !== qChannel) throw forbidden("channel not allowed for this token");
+  const effChannel = dev.channel ?? qChannel ?? null;
+  const where = ["project_id = ?", `status = 'ready'`];
+  const args = [dev.projectId];
+  if (effChannel) {
+    where.push("release_channel = ?");
+    args.push(effChannel);
+  }
+  const rows = await c.env.DB.prepare(
+    `SELECT id, version, release_channel, filename, size, sha256, content_type, is_mandatory, created_at
+       FROM versions WHERE ${where.join(" AND ")} ORDER BY created_at DESC`
+  ).bind(...args).all();
+  const proj = await c.env.DB.prepare(
+    `SELECT p.code AS p_code, p.name AS p_name, c.code AS c_code, c.name AS c_name
+       FROM projects p JOIN customers c ON c.id = p.customer_id WHERE p.id = ?`
+  ).bind(dev.projectId).first();
+  const versions = (rows.results ?? []).map((r) => ({
+    id: r.id,
+    version: r.version,
+    channel: r.release_channel,
+    filename: r.filename,
+    size: r.size,
+    sha256: r.sha256,
+    contentType: r.content_type,
+    isMandatory: !!r.is_mandatory,
+    createdAt: r.created_at,
+    download: `/api/download/device/version/${r.id}`
+  }));
+  return c.json({
+    project: {
+      id: dev.projectId,
+      code: proj?.p_code ?? null,
+      name: proj?.p_name ?? null,
+      customerCode: proj?.c_code ?? null,
+      customerName: proj?.c_name ?? null
+    },
+    channel: effChannel,
+    count: versions.length,
+    versions
+  });
 });
 downloadRoutes.get("/device/version/:id", async (c) => {
   const id = Number(c.req.param("id"));

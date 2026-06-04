@@ -1,4 +1,5 @@
 import type {
+  AccessibleVersion,
   ApiToken,
   AuditLog,
   Customer,
@@ -127,6 +128,9 @@ export const api = {
     request<{ ok: true }>(`/api/memberships/${id}?scope=${scope}`, { method: 'DELETE' }),
 
   // Versions
+  // Cross-project catalog of everything the logged-in user may download.
+  listAccessibleVersions: (opts?: { includeArchived?: boolean }) =>
+    request<AccessibleVersion[]>(`/api/versions/accessible${opts?.includeArchived ? '?includeArchived=1' : ''}`),
   listVersions: (projectId: number, opts?: { includePending?: boolean; channel?: string }) => {
     const qs = new URLSearchParams();
     qs.set('projectId', String(projectId));

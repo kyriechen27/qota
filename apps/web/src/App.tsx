@@ -6,6 +6,7 @@ import Dashboard from './pages/Dashboard';
 import Customers from './pages/Customers';
 import Projects from './pages/Projects';
 import ProjectDetail from './pages/ProjectDetail';
+import Files from './pages/Files';
 import Users from './pages/Users';
 import Permissions from './pages/Permissions';
 import Account from './pages/Account';
@@ -43,6 +44,7 @@ export default function App() {
           <Route path="/customers" element={<Customers />} />
           <Route path="/projects" element={<Projects />} />
           <Route path="/projects/:id" element={<ProjectDetail />} />
+          <Route path="/files" element={<Files />} />
           {user.role === 'super_admin' && (
             <>
               <Route path="/users" element={<Users />} />

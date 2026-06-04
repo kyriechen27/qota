@@ -74,6 +74,16 @@ export interface Version {
   updatedAt: number;
 }
 
+/** A version plus its project/customer context — returned by the cross-project
+ *  "everything I can access" catalog (GET /api/versions/accessible). */
+export interface AccessibleVersion extends Version {
+  projectCode: string;
+  projectName: string;
+  customerId: number;
+  customerCode: string;
+  customerName: string;
+}
+
 export interface Membership {
   id: number;
   userId: number;
