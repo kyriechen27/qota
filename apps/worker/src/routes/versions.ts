@@ -9,6 +9,7 @@ import { badRequest, notFound } from '../utils/errors';
 import { requireProjectAccess } from '../lib/memberships';
 import { makeStorage } from '../lib/s3';
 import { audit } from '../lib/audit';
+import { base64UrlEncode } from '../utils/encoding';
 
 export const versionRoutes = new Hono<AppEnv>();
 
@@ -32,6 +33,7 @@ interface VersionRow {
   rollout_percentage: number;
   device_group_id: number | null;
   download_count: number;
+  public_slug: string | null;
   uploaded_by: number;
   created_at: number;
   updated_at: number;
@@ -56,6 +58,7 @@ export function versionDto(r: VersionRow) {
     rolloutPercentage: r.rollout_percentage,
     deviceGroupId: r.device_group_id,
     downloadCount: r.download_count,
+    publicSlug: r.public_slug,
     uploadedBy: r.uploaded_by,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
@@ -82,7 +85,7 @@ versionRoutes.get('/', async (c) => {
   }
   const rows = await c.env.DB.prepare(
     `SELECT id, project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
-            is_mandatory, min_version, max_version, rollout_percentage, device_group_id, download_count, uploaded_by, created_at, updated_at
+            is_mandatory, min_version, max_version, rollout_percentage, device_group_id, download_count, public_slug, uploaded_by, created_at, updated_at
        FROM versions WHERE ${where.join(' AND ')} ORDER BY created_at DESC`,
   )
     .bind(...args)
@@ -96,7 +99,7 @@ versionRoutes.get('/:id', async (c) => {
   const user = c.get('user')!;
   const row = await c.env.DB.prepare(
     `SELECT id, project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
-            is_mandatory, min_version, max_version, rollout_percentage, device_group_id, download_count, uploaded_by, created_at, updated_at
+            is_mandatory, min_version, max_version, rollout_percentage, device_group_id, download_count, public_slug, uploaded_by, created_at, updated_at
        FROM versions WHERE id = ?`,
   )
     .bind(id)
@@ -167,12 +170,66 @@ versionRoutes.patch('/:id', async (c) => {
   });
   const row = await c.env.DB.prepare(
     `SELECT id, project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
-            is_mandatory, min_version, max_version, rollout_percentage, device_group_id, download_count, uploaded_by, created_at, updated_at
+            is_mandatory, min_version, max_version, rollout_percentage, device_group_id, download_count, public_slug, uploaded_by, created_at, updated_at
        FROM versions WHERE id = ?`,
   )
     .bind(id)
     .first<VersionRow>();
   return c.json(versionDto(row!));
+});
+
+// Enable token-less public download for a version: mints an unguessable
+// capability slug. Idempotent — returns the existing slug if already public.
+// The slug is consumed by the public route in routes/public.ts.
+versionRoutes.post('/:id/public', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (!Number.isFinite(id)) throw badRequest('invalid id');
+  const user = c.get('user')!;
+  const row = await c.env.DB.prepare('SELECT project_id, public_slug FROM versions WHERE id = ?')
+    .bind(id)
+    .first<{ project_id: number; public_slug: string | null }>();
+  if (!row) throw notFound();
+  const proj = await requireProjectAccess(c.env.DB, user, row.project_id, 'manage_versions');
+  let slug = row.public_slug;
+  if (!slug) {
+    slug = base64UrlEncode(crypto.getRandomValues(new Uint8Array(16)));
+    await c.env.DB.prepare('UPDATE versions SET public_slug = ?, updated_at = ? WHERE id = ?')
+      .bind(slug, Date.now(), id)
+      .run();
+    await audit(c, {
+      action: 'version.public.enable',
+      customerId: proj.customer_id,
+      projectId: row.project_id,
+      targetType: 'version',
+      targetId: id,
+    });
+  }
+  return c.json({ publicSlug: slug });
+});
+
+// Revoke public access — the previously shared link / QR stops working.
+versionRoutes.delete('/:id/public', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (!Number.isFinite(id)) throw badRequest('invalid id');
+  const user = c.get('user')!;
+  const row = await c.env.DB.prepare('SELECT project_id, public_slug FROM versions WHERE id = ?')
+    .bind(id)
+    .first<{ project_id: number; public_slug: string | null }>();
+  if (!row) throw notFound();
+  const proj = await requireProjectAccess(c.env.DB, user, row.project_id, 'manage_versions');
+  if (row.public_slug) {
+    await c.env.DB.prepare('UPDATE versions SET public_slug = NULL, updated_at = ? WHERE id = ?')
+      .bind(Date.now(), id)
+      .run();
+    await audit(c, {
+      action: 'version.public.disable',
+      customerId: proj.customer_id,
+      projectId: row.project_id,
+      targetType: 'version',
+      targetId: id,
+    });
+  }
+  return c.json({ ok: true });
 });
 
 versionRoutes.delete('/:id', async (c) => {

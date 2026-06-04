@@ -67,6 +67,8 @@ export interface Version {
   rolloutPercentage: number;
   deviceGroupId: number | null;
   downloadCount: number;
+  /** Random capability slug for token-less public download; null = not public. */
+  publicSlug: string | null;
   uploadedBy: number;
   createdAt: number;
   updatedAt: number;

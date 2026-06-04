@@ -8,6 +8,7 @@ import { projectRoutes } from './routes/projects';
 import { membershipRoutes } from './routes/memberships';
 import { versionRoutes } from './routes/versions';
 import { downloadRoutes } from './routes/download';
+import { publicRoutes } from './routes/public';
 import { apiTokenRoutes } from './routes/api-tokens';
 import { uploadRoutes } from './routes/upload';
 import { storageRoutes } from './routes/storage';
@@ -55,6 +56,7 @@ app.route('/api/versions', versionRoutes);
 app.route('/api/upload', uploadRoutes);
 app.route('/api/storage', storageRoutes);
 app.route('/api/download', downloadRoutes);
+app.route('/api/public', publicRoutes);
 app.route('/api/api-tokens', apiTokenRoutes);
 app.route('/api/audit', auditRoutes);
 

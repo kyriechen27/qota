@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { useParams } from 'react-router-dom';
+import { QRCodeSVG } from 'qrcode.react';
 import { api } from '../lib/api';
 import { startUpload, type UploadJobHandle } from '../lib/upload';
 import { formatBytes } from '../lib/utils';
@@ -34,6 +35,11 @@ export default function ProjectDetail() {
   const [tokChannel, setTokChannel] = useState('');
   const [newToken, setNewToken] = useState<string | null>(null);
   const [tokenCopied, setTokenCopied] = useState(false);
+
+  // public-access state — the version whose public dialog is open
+  const [publicVer, setPublicVer] = useState<Version | null>(null);
+  const [publicBusy, setPublicBusy] = useState(false);
+  const [linkCopied, setLinkCopied] = useState(false);
 
   // Channels available for this project: the project default + every channel
   // already used by a version. New ones are created inline in the dialogs.
@@ -124,6 +130,59 @@ export default function ProjectDetail() {
     }
   }
 
+  function publicUrlFor(slug: string) {
+    return `${window.location.origin}/api/public/download/${slug}`;
+  }
+
+  function openPublic(v: Version) {
+    setPublicVer(v);
+    setLinkCopied(false);
+  }
+
+  function patchVersion(id: number, patch: Partial<Version>) {
+    setVersions((vs) => vs.map((x) => (x.id === id ? { ...x, ...patch } : x)));
+    setPublicVer((pv) => (pv && pv.id === id ? { ...pv, ...patch } : pv));
+  }
+
+  async function enablePublic() {
+    if (!publicVer) return;
+    setErr(null);
+    setPublicBusy(true);
+    try {
+      const { publicSlug } = await api.enableVersionPublic(publicVer.id);
+      patchVersion(publicVer.id, { publicSlug });
+    } catch (e: any) {
+      setErr(e?.message);
+    } finally {
+      setPublicBusy(false);
+    }
+  }
+
+  async function disablePublic() {
+    if (!publicVer) return;
+    if (!confirm(t('pd.confirmDisablePublic'))) return;
+    setErr(null);
+    setPublicBusy(true);
+    try {
+      await api.disableVersionPublic(publicVer.id);
+      patchVersion(publicVer.id, { publicSlug: null });
+    } catch (e: any) {
+      setErr(e?.message);
+    } finally {
+      setPublicBusy(false);
+    }
+  }
+
+  async function copyPublicLink(url: string) {
+    try {
+      await navigator.clipboard.writeText(url);
+      setLinkCopied(true);
+      setTimeout(() => setLinkCopied(false), 1500);
+    } catch {
+      /* clipboard blocked — the link above is select-all to copy by hand */
+    }
+  }
+
   async function deleteVer(v: Version) {
     if (!confirm(t('pd.confirmDeleteVer', { version: v.version, channel: v.releaseChannel }))) return;
     try {
@@ -193,6 +252,7 @@ export default function ProjectDetail() {
   }
 
   const pct = progress.total > 0 ? Math.round((progress.loaded / progress.total) * 100) : 0;
+  const publicUrl = publicVer?.publicSlug ? publicUrlFor(publicVer.publicSlug) : null;
 
   return (
     <>
@@ -234,6 +294,11 @@ export default function ProjectDetail() {
               <tr key={v.id}>
                 <td>
                   <span className="code">{v.version}</span>
+                  {v.publicSlug && (
+                    <span className="tag" style={{ marginLeft: 6 }}>
+                      {t('pd.publicTag')}
+                    </span>
+                  )}
                 </td>
                 <td>
                   <span
@@ -257,6 +322,15 @@ export default function ProjectDetail() {
                 <td>
                   <button onClick={() => download(v)} style={{ marginRight: 6 }} disabled={v.status !== 'ready'}>
                     {t('pd.download')}
+                  </button>
+                  <button
+                    onClick={() => openPublic(v)}
+                    style={{ marginRight: 6 }}
+                    disabled={v.status !== 'ready' && !v.publicSlug}
+                    className={v.publicSlug ? 'primary' : ''}
+                    title={t('pd.dlgPublic')}
+                  >
+                    {v.publicSlug ? `${t('pd.public')} ✓` : t('pd.public')}
                   </button>
                   {v.status === 'ready' && (
                     <button onClick={() => archiveVer(v)} style={{ marginRight: 6 }}>
@@ -514,6 +588,67 @@ export default function ProjectDetail() {
               </>
             )}
           </form>
+        </div>
+      )}
+
+      {publicVer && (
+        <div className="dialog-backdrop" onClick={() => setPublicVer(null)}>
+          <div className="dialog" onClick={(e) => e.stopPropagation()}>
+            <h3>
+              {t('pd.dlgPublic')}{' '}
+              <span className="muted code" style={{ fontSize: 13 }}>
+                {publicVer.version}
+              </span>
+            </h3>
+            <p className="muted" style={{ marginTop: 0 }}>
+              {t('pd.publicDesc')}
+            </p>
+            {publicUrl ? (
+              <>
+                <label>
+                  <span className="lbl">{t('pd.publicLink')}</span>
+                  <div className="code" style={{ padding: 12, userSelect: 'all', wordBreak: 'break-all' }}>
+                    {publicUrl}
+                  </div>
+                </label>
+                <div
+                  style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8, margin: '12px 0' }}
+                >
+                  <div style={{ background: '#fff', padding: 12, borderRadius: 8, lineHeight: 0 }}>
+                    <QRCodeSVG value={publicUrl} size={200} level="M" />
+                  </div>
+                  <div className="muted">{t('pd.publicScan')}</div>
+                </div>
+                <div className="dialog-actions" style={{ justifyContent: 'space-between' }}>
+                  <button className="danger" onClick={disablePublic} disabled={publicBusy}>
+                    {t('pd.publicDisable')}
+                  </button>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <a className="btn" href={publicUrl} target="_blank" rel="noreferrer">
+                      {t('pd.openLink')}
+                    </a>
+                    <button className="primary" onClick={() => copyPublicLink(publicUrl)}>
+                      {linkCopied ? t('pd.copied') : t('pd.copyLink')}
+                    </button>
+                  </div>
+                </div>
+              </>
+            ) : (
+              <>
+                {publicVer.status !== 'ready' && <p className="error">{t('pd.publicReadyOnly')}</p>}
+                <div className="dialog-actions">
+                  <button onClick={() => setPublicVer(null)}>{t('common.close')}</button>
+                  <button
+                    className="primary"
+                    onClick={enablePublic}
+                    disabled={publicBusy || publicVer.status !== 'ready'}
+                  >
+                    {t('pd.publicEnable')}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
         </div>
       )}
     </>

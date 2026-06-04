@@ -16,6 +16,7 @@ import app from './src/index';
 import type { Bindings } from './src/env';
 import migration0001 from './migrations/0001_init.sql';
 import migration0002 from './migrations/0002_download_count.sql';
+import migration0003 from './migrations/0003_public_versions.sql';
 
 interface PagesEnv extends Bindings {
   ASSETS: Fetcher;
@@ -42,15 +43,34 @@ async function ensureSchema(env: PagesEnv): Promise<void> {
   const existing = await env.DB.prepare(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'users'",
   ).first();
-  if (existing) {
+  if (!existing) {
+    for (const stmt of [...statements(migration0001), ...statements(migration0002), ...statements(migration0003)]) {
+      await env.DB.prepare(stmt).run();
+    }
     schemaReady = true;
+    console.log('[schema] initialized D1 tables on first run');
     return;
   }
-  for (const stmt of [...statements(migration0001), ...statements(migration0002)]) {
-    await env.DB.prepare(stmt).run();
-  }
+  // Existing DB: apply additive post-launch migrations idempotently so a fresh
+  // deploy needs zero CLI (same spirit as the bootstrap above). Each step is a
+  // no-op once its column exists.
+  await ensurePublicSlug(env);
   schemaReady = true;
-  console.log('[schema] initialized D1 tables on first run');
+}
+
+// 0003 — versions.public_slug. ALTER TABLE ADD COLUMN rewrites the table's
+// stored schema in sqlite_master, so the column name appears there afterwards;
+// that's our idempotency check (no PRAGMA, works on D1 + SQLite).
+async function ensurePublicSlug(env: PagesEnv): Promise<void> {
+  const row = await env.DB.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'versions'",
+  ).first<{ sql: string }>();
+  if (row && typeof row.sql === 'string' && !row.sql.includes('public_slug')) {
+    for (const stmt of statements(migration0003)) {
+      await env.DB.prepare(stmt).run();
+    }
+    console.log('[schema] added versions.public_slug');
+  }
 }
 
 export default {

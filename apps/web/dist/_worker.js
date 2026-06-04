@@ -27883,6 +27883,7 @@ function versionDto(r) {
     rolloutPercentage: r.rollout_percentage,
     deviceGroupId: r.device_group_id,
     downloadCount: r.download_count,
+    publicSlug: r.public_slug,
     uploadedBy: r.uploaded_by,
     createdAt: r.created_at,
     updatedAt: r.updated_at
@@ -27908,7 +27909,7 @@ versionRoutes.get("/", async (c) => {
   }
   const rows = await c.env.DB.prepare(
     `SELECT id, project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
-            is_mandatory, min_version, max_version, rollout_percentage, device_group_id, download_count, uploaded_by, created_at, updated_at
+            is_mandatory, min_version, max_version, rollout_percentage, device_group_id, download_count, public_slug, uploaded_by, created_at, updated_at
        FROM versions WHERE ${where.join(" AND ")} ORDER BY created_at DESC`
   ).bind(...args).all();
   return c.json((rows.results ?? []).map(versionDto));
@@ -27919,7 +27920,7 @@ versionRoutes.get("/:id", async (c) => {
   const user = c.get("user");
   const row = await c.env.DB.prepare(
     `SELECT id, project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
-            is_mandatory, min_version, max_version, rollout_percentage, device_group_id, download_count, uploaded_by, created_at, updated_at
+            is_mandatory, min_version, max_version, rollout_percentage, device_group_id, download_count, public_slug, uploaded_by, created_at, updated_at
        FROM versions WHERE id = ?`
   ).bind(id).first();
   if (!row) throw notFound();
@@ -27977,10 +27978,50 @@ versionRoutes.patch("/:id", async (c) => {
   });
   const row = await c.env.DB.prepare(
     `SELECT id, project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
-            is_mandatory, min_version, max_version, rollout_percentage, device_group_id, download_count, uploaded_by, created_at, updated_at
+            is_mandatory, min_version, max_version, rollout_percentage, device_group_id, download_count, public_slug, uploaded_by, created_at, updated_at
        FROM versions WHERE id = ?`
   ).bind(id).first();
   return c.json(versionDto(row));
+});
+versionRoutes.post("/:id/public", async (c) => {
+  const id = Number(c.req.param("id"));
+  if (!Number.isFinite(id)) throw badRequest("invalid id");
+  const user = c.get("user");
+  const row = await c.env.DB.prepare("SELECT project_id, public_slug FROM versions WHERE id = ?").bind(id).first();
+  if (!row) throw notFound();
+  const proj = await requireProjectAccess(c.env.DB, user, row.project_id, "manage_versions");
+  let slug = row.public_slug;
+  if (!slug) {
+    slug = base64UrlEncode(crypto.getRandomValues(new Uint8Array(16)));
+    await c.env.DB.prepare("UPDATE versions SET public_slug = ?, updated_at = ? WHERE id = ?").bind(slug, Date.now(), id).run();
+    await audit(c, {
+      action: "version.public.enable",
+      customerId: proj.customer_id,
+      projectId: row.project_id,
+      targetType: "version",
+      targetId: id
+    });
+  }
+  return c.json({ publicSlug: slug });
+});
+versionRoutes.delete("/:id/public", async (c) => {
+  const id = Number(c.req.param("id"));
+  if (!Number.isFinite(id)) throw badRequest("invalid id");
+  const user = c.get("user");
+  const row = await c.env.DB.prepare("SELECT project_id, public_slug FROM versions WHERE id = ?").bind(id).first();
+  if (!row) throw notFound();
+  const proj = await requireProjectAccess(c.env.DB, user, row.project_id, "manage_versions");
+  if (row.public_slug) {
+    await c.env.DB.prepare("UPDATE versions SET public_slug = NULL, updated_at = ? WHERE id = ?").bind(Date.now(), id).run();
+    await audit(c, {
+      action: "version.public.disable",
+      customerId: proj.customer_id,
+      projectId: row.project_id,
+      targetType: "version",
+      targetId: id
+    });
+  }
+  return c.json({ ok: true });
 });
 versionRoutes.delete("/:id", async (c) => {
   const id = Number(c.req.param("id"));
@@ -28274,6 +28315,50 @@ downloadRoutes.get("/device/version/:id", async (c) => {
   if (dev.channel && dev.channel !== row.release_channel) throw forbidden("channel not allowed");
   const ttl = Number(c.env.DOWNLOAD_URL_TTL_SECONDS) || 300;
   return redirectOrJson(c, row, ttl);
+});
+
+// apps/worker/src/routes/public.ts
+var publicRoutes = new Hono2();
+publicRoutes.get("/download/:slug", async (c) => {
+  const slug = c.req.param("slug");
+  if (!slug) throw notFound();
+  const row = await c.env.DB.prepare(
+    `SELECT id, project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type
+       FROM versions WHERE public_slug = ?`
+  ).bind(slug).first();
+  if (!row || row.status !== "ready") throw notFound();
+  const ttl = Number(c.env.DOWNLOAD_URL_TTL_SECONDS) || 300;
+  const s3 = makeStorage(c.env);
+  const url = await s3.signGetUrl(row.r2_key, ttl, {
+    filename: row.filename,
+    contentType: row.content_type ?? void 0
+  });
+  c.executionCtx.waitUntil(
+    c.env.DB.prepare("UPDATE versions SET download_count = download_count + 1 WHERE id = ?").bind(row.id).run()
+  );
+  const project = await c.env.DB.prepare("SELECT customer_id FROM projects WHERE id = ?").bind(row.project_id).first();
+  await audit(c, {
+    action: "version.download.public",
+    actorType: "system",
+    customerId: project?.customer_id ?? null,
+    projectId: row.project_id,
+    targetType: "version",
+    targetId: row.id,
+    meta: { channel: row.release_channel, version: row.version, slug }
+  });
+  if (c.req.query("format") === "json") {
+    return c.json({
+      url,
+      expiresAt: Math.floor(Date.now() / 1e3) + ttl,
+      versionId: row.id,
+      version: row.version,
+      channel: row.release_channel,
+      filename: row.filename,
+      size: row.size,
+      sha256: row.sha256
+    });
+  }
+  return c.redirect(url, 302);
 });
 
 // apps/worker/src/routes/upload.ts
@@ -28761,6 +28846,7 @@ app.route("/api/versions", versionRoutes);
 app.route("/api/upload", uploadRoutes);
 app.route("/api/storage", storageRoutes);
 app.route("/api/download", downloadRoutes);
+app.route("/api/public", publicRoutes);
 app.route("/api/api-tokens", apiTokenRoutes);
 app.route("/api/audit", auditRoutes);
 app.onError((err, c) => {
@@ -29003,6 +29089,9 @@ CREATE INDEX idx_audit_action   ON audit_logs(action, ts DESC);
 // apps/worker/migrations/0002_download_count.sql
 var download_count_default = "-- Track how many times each version has been downloaded (user grants + device pulls).\nALTER TABLE versions ADD COLUMN download_count INTEGER NOT NULL DEFAULT 0;\n";
 
+// apps/worker/migrations/0003_public_versions.sql
+var public_versions_default = "-- Public, token-less download links (per version).\n-- A random, unguessable slug acts as a capability URL: anyone who has it can\n-- download the artifact (never upload), and access is revoked by clearing the\n-- slug. NULL = not public. SQLite treats NULLs as distinct, so many versions\n-- can be non-public under this UNIQUE index simultaneously.\nALTER TABLE versions ADD COLUMN public_slug TEXT;\nCREATE UNIQUE INDEX IF NOT EXISTS idx_versions_public_slug ON versions(public_slug);\n";
+
 // apps/worker/pages-entry.ts
 function statements(sql) {
   return sql.replace(/--[^\n]*/g, "").split(";").map((s) => s.trim()).filter((s) => s.length > 0 && !/^PRAGMA/i.test(s));
@@ -29013,15 +29102,27 @@ async function ensureSchema(env) {
   const existing = await env.DB.prepare(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'users'"
   ).first();
-  if (existing) {
+  if (!existing) {
+    for (const stmt of [...statements(init_default), ...statements(download_count_default), ...statements(public_versions_default)]) {
+      await env.DB.prepare(stmt).run();
+    }
     schemaReady = true;
+    console.log("[schema] initialized D1 tables on first run");
     return;
   }
-  for (const stmt of [...statements(init_default), ...statements(download_count_default)]) {
-    await env.DB.prepare(stmt).run();
-  }
+  await ensurePublicSlug(env);
   schemaReady = true;
-  console.log("[schema] initialized D1 tables on first run");
+}
+async function ensurePublicSlug(env) {
+  const row = await env.DB.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'versions'"
+  ).first();
+  if (row && typeof row.sql === "string" && !row.sql.includes("public_slug")) {
+    for (const stmt of statements(public_versions_default)) {
+      await env.DB.prepare(stmt).run();
+    }
+    console.log("[schema] added versions.public_slug");
+  }
 }
 var pages_entry_default = {
   async fetch(request, env, ctx) {

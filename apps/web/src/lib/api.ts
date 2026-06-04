@@ -146,6 +146,11 @@ export const api = {
     },
   ) => request<Version>(`/api/versions/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   deleteVersion: (id: number) => request<{ ok: true }>(`/api/versions/${id}`, { method: 'DELETE' }),
+  // Public, token-less download link (capability slug). Enable is idempotent.
+  enableVersionPublic: (id: number) =>
+    request<{ publicSlug: string }>(`/api/versions/${id}/public`, { method: 'POST' }),
+  disableVersionPublic: (id: number) =>
+    request<{ ok: true }>(`/api/versions/${id}/public`, { method: 'DELETE' }),
 
   // Upload (multipart S3)
   uploadInit: (body: UploadInitRequest) =>
