@@ -154,19 +154,24 @@ npx wrangler d1 create qota-db          # or: dashboard → D1 → Create
 npx wrangler r2 bucket create qota-ota  # or: dashboard → R2 → Create (any name)
 ```
 
-Then **Cloudflare Pages → Create project → Connect to Git**, pick this repo and set:
+Then **Cloudflare Pages → Create project → Connect to Git**, pick this repo. There is
+no `wrangler.toml`, so everything is configured in the dashboard:
 
+**Settings → Build configuration:**
 ```text
 Build command:           (leave EMPTY)
 Build output directory:  apps/web/dist
 ```
 
-In the Pages project **Settings → Bindings / Variables**, add (all in the dashboard,
-like remote-file — nothing goes into the repo):
+**Settings → Runtime:** Compatibility date `2024-11-18`, Compatibility flags `nodejs_compat`.
 
+**Settings → Bindings** (select your resources from the dropdowns — no IDs to copy):
 - **R2 bucket binding** — variable name `BUCKET` → your bucket
-- **D1 database binding** — variable name `DB` → `qota-db`
-- **Secret** — `JWT_SECRET` (required); optional `ADMIN_PASSWORD` (defaults to `admin12345`)
+- **D1 database binding** — variable name `DB` → your database (e.g. `qota-db`)
+
+**Settings → Variables and Secrets:**
+- **Secret** `JWT_SECRET` (required; `openssl rand -hex 32`); optional `ADMIN_PASSWORD`
+  (defaults to `admin12345`). Other vars have built-in defaults — nothing else needed.
 
 Deploy. **On first request the API auto-creates the D1 schema and the admin user**
 (`ADMIN_EMAIL` / `ADMIN_PASSWORD`, default `admin@example.com` / `admin12345` —
