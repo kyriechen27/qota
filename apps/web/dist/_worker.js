@@ -27644,9 +27644,97 @@ function guessServiceRegion(url, headers) {
   return [HOST_SERVICES[service] || service, region || ""];
 }
 
+// apps/worker/src/lib/r2-binding.ts
+var PART_PATH = "/api/storage/part";
+var BLOB_PATH = "/api/storage/blob";
+var TEXT = new TextEncoder();
+async function hmacHex(secret, data) {
+  const key = await crypto.subtle.importKey("raw", TEXT.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, TEXT.encode(data));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+function canonical(path, params) {
+  const q = Object.keys(params).filter((k) => k !== "sig").sort().map((k) => `${k}=${params[k]}`).join("&");
+  return `${path}
+${q}`;
+}
+function makeR2Storage(env) {
+  const bucket = env.BUCKET;
+  const secret = env.JWT_SECRET;
+  if (!secret) {
+    throw new HttpError(503, "jwt_secret_missing", "JWT_SECRET \u672A\u914D\u7F6E(R2 \u5B58\u50A8\u94FE\u63A5\u7B7E\u540D\u9700\u8981)\u3002");
+  }
+  async function signedUrl(path, params, ttlSeconds) {
+    const withExp = { ...params, exp: String(Math.floor(Date.now() / 1e3) + ttlSeconds) };
+    const sig = await hmacHex(secret, canonical(path, withExp));
+    return `${path}?${new URLSearchParams({ ...withExp, sig }).toString()}`;
+  }
+  async function verify(urlString) {
+    const u = new URL(urlString, "http://local");
+    const params = Object.fromEntries(u.searchParams.entries());
+    const expect = await hmacHex(secret, canonical(u.pathname, params));
+    if (!constantTimeEqual(params.sig || "", expect)) throw new HttpError(403, "bad_signature", "invalid storage token");
+    if (!params.exp || Number(params.exp) * 1e3 < Date.now()) throw new HttpError(403, "expired", "storage token expired");
+    return params;
+  }
+  return {
+    bucket: "r2",
+    endpoint: "r2-binding",
+    objectUrl: (key) => key,
+    async createMultipartUpload(key, contentType) {
+      const up = await bucket.createMultipartUpload(key, contentType ? { httpMetadata: { contentType } } : void 0);
+      return up.uploadId;
+    },
+    signPartUrl(key, uploadId, partNumber, ttlSeconds) {
+      return signedUrl(PART_PATH, { key, uploadId, part: String(partNumber) }, ttlSeconds);
+    },
+    signGetUrl(key, ttlSeconds, opts) {
+      const params = { key };
+      if (opts?.filename) params.filename = opts.filename;
+      if (opts?.contentType) params.ct = opts.contentType;
+      return signedUrl(BLOB_PATH, params, ttlSeconds);
+    },
+    async completeMultipartUpload(key, uploadId, parts) {
+      const up = bucket.resumeMultipartUpload(key, uploadId);
+      const sorted = [...parts].sort((a, b) => a.partNumber - b.partNumber).map((p) => ({ partNumber: p.partNumber, etag: p.etag.replace(/^"|"$/g, "") }));
+      const obj = await up.complete(sorted);
+      return { etag: obj.etag };
+    },
+    async abortMultipartUpload(key, uploadId) {
+      try {
+        await bucket.resumeMultipartUpload(key, uploadId).abort();
+      } catch {
+      }
+    },
+    async headObject(key) {
+      const o = await bucket.head(key);
+      if (!o) return null;
+      return { size: o.size, etag: o.etag, contentType: o.httpMetadata?.contentType };
+    },
+    async deleteObject(key) {
+      await bucket.delete(key);
+    },
+    // ---- byte handlers (invoked by /api/storage/* routes) ------------------
+    async writePart(urlString, body) {
+      const { key, uploadId, part } = await verify(urlString);
+      if (!key || !uploadId || !part) throw new HttpError(400, "bad_request", "missing key/uploadId/part");
+      const uploaded = await bucket.resumeMultipartUpload(key, uploadId).uploadPart(Number(part), body);
+      return { etag: uploaded.etag };
+    },
+    async readBlob(urlString) {
+      const { key, filename, ct } = await verify(urlString);
+      if (!key) throw new HttpError(400, "bad_request", "missing key");
+      const obj = await bucket.get(key);
+      if (!obj) return null;
+      return { stream: obj.body, size: obj.size, contentType: ct || obj.httpMetadata?.contentType, filename };
+    }
+  };
+}
+
 // apps/worker/src/lib/s3.ts
 function makeStorage(env) {
   if (env.STORAGE) return env.STORAGE;
+  if (env.BUCKET) return makeR2Storage(env);
   return makeS3(env);
 }
 function makeS3(env) {
@@ -27664,6 +27752,7 @@ function makeS3(env) {
   }
   const aws = new AwsClient({
     accessKeyId: env.R2_ACCESS_KEY_ID,
+    // guaranteed by the missing-check above
     secretAccessKey: env.R2_SECRET_ACCESS_KEY,
     service: "s3",
     region: env.S3_REGION || "auto"
@@ -27671,7 +27760,7 @@ function makeS3(env) {
   const r2Default = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
   const endpoint = (env.S3_ENDPOINT || r2Default).replace(/\/+$/, "");
   const publicEndpoint = (env.S3_PUBLIC_ENDPOINT || env.S3_ENDPOINT || r2Default).replace(/\/+$/, "");
-  const bucket = env.R2_BUCKET_NAME;
+  const bucket = env.R2_BUCKET_NAME || "qota-ota";
   function buildUrl(base, key) {
     const encoded = key.split("/").map(encodeURIComponent).join("/");
     return `${base}/${bucket}/${encoded}`;
@@ -28500,15 +28589,15 @@ uploadRoutes.get("/sessions/:id", async (c) => {
 // apps/worker/src/routes/storage.ts
 var storageRoutes = new Hono2();
 storageRoutes.put("/part", async (c) => {
-  const store = c.env.STORAGE;
-  if (!store?.writePart) throw notFound();
+  const store = makeStorage(c.env);
+  if (!store.writePart) throw notFound();
   const body = await c.req.arrayBuffer();
   const { etag } = await store.writePart(c.req.url, body);
   return new Response(null, { status: 200, headers: { ETag: etag } });
 });
 storageRoutes.get("/blob", async (c) => {
-  const store = c.env.STORAGE;
-  if (!store?.readBlob) throw notFound();
+  const store = makeStorage(c.env);
+  if (!store.readBlob) throw notFound();
   const blob = await store.readBlob(c.req.url);
   if (!blob) throw notFound();
   const headers = {

@@ -8,13 +8,14 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../env';
 import { notFound } from '../utils/errors';
+import { makeStorage } from '../lib/s3';
 
 export const storageRoutes = new Hono<AppEnv>();
 
-// PUT /api/storage/part?uploadId=..&part=..&exp=..&sig=..
+// PUT /api/storage/part?key=..&uploadId=..&part=..&exp=..&sig=..
 storageRoutes.put('/part', async (c) => {
-  const store = c.env.STORAGE;
-  if (!store?.writePart) throw notFound();
+  const store = makeStorage(c.env);
+  if (!store.writePart) throw notFound();
   const body = await c.req.arrayBuffer();
   const { etag } = await store.writePart(c.req.url, body);
   // Clients read the ETag header back to confirm the part (same-origin here, so
@@ -24,8 +25,8 @@ storageRoutes.put('/part', async (c) => {
 
 // GET /api/storage/blob?key=..&filename=..&ct=..&exp=..&sig=..
 storageRoutes.get('/blob', async (c) => {
-  const store = c.env.STORAGE;
-  if (!store?.readBlob) throw notFound();
+  const store = makeStorage(c.env);
+  if (!store.readBlob) throw notFound();
   const blob = await store.readBlob(c.req.url);
   if (!blob) throw notFound();
   const headers: Record<string, string> = {

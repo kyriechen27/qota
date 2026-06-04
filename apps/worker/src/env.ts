@@ -1,13 +1,17 @@
-import type { D1Database } from '@cloudflare/workers-types';
+import type { D1Database, R2Bucket } from '@cloudflare/workers-types';
 import type { StorageBackend } from './lib/s3';
 
 export interface Bindings {
   // D1
   DB: D1Database;
 
-  // Object storage backend. Normally built from the S3/R2 vars below by
-  // makeStorage(). The Node runtime can inject a local-filesystem backend here
-  // (see apps/worker/node/server.mjs); unused/undefined on Cloudflare.
+  // Native R2 binding (Cloudflare). When present, makeStorage() uses it directly
+  // — no R2_ACCOUNT_ID / S3 keys / presigned URLs needed (see lib/r2-binding.ts).
+  BUCKET?: R2Bucket;
+
+  // Object storage backend. Normally built by makeStorage() from BUCKET (R2
+  // binding) or the S3/R2 vars below. The Node runtime can inject a
+  // local-filesystem backend here (see apps/worker/node/server.mjs).
   STORAGE?: StorageBackend;
 
   // Plain vars
@@ -15,8 +19,10 @@ export interface Bindings {
   JWT_TTL_SECONDS: string;
   DOWNLOAD_URL_TTL_SECONDS: string;
   UPLOAD_PART_URL_TTL_SECONDS: string;
-  R2_ACCOUNT_ID: string;
-  R2_BUCKET_NAME: string;
+  // R2/S3 via the S3 API — only needed when NOT using the BUCKET binding
+  // (e.g. self-hosted S3/MinIO). Optional otherwise.
+  R2_ACCOUNT_ID?: string;
+  R2_BUCKET_NAME?: string;
 
   // First-run admin auto-seed (used only when the users table is empty;
   // see lib/bootstrap.ts). All optional — sensible defaults apply.
@@ -37,8 +43,8 @@ export interface Bindings {
 
   // Secrets
   JWT_SECRET: string;
-  R2_ACCESS_KEY_ID: string;
-  R2_SECRET_ACCESS_KEY: string;
+  R2_ACCESS_KEY_ID?: string;
+  R2_SECRET_ACCESS_KEY?: string;
 }
 
 export type GlobalRole = 'super_admin' | 'developer';

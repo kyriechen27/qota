@@ -140,13 +140,16 @@ bundled by [`apps/worker/pages-entry.ts`](apps/worker/pages-entry.ts), Cloudflar
 > git add -A && git commit && git push
 > ```
 
+Storage uses the **native R2 binding** (`env.BUCKET`), like remote-file — no
+`R2_ACCOUNT_ID`, no S3 access keys, no presigned URLs, no R2 CORS. The worker streams
+bytes to/from R2 through `/api/storage/*` (same origin).
+
 ### One-time setup
 
 ```bash
 npx wrangler login
-npx wrangler d1 create qota-db          # → put the database_id into the root wrangler.toml
-npx wrangler r2 bucket create qota-ota  # → put your account id into R2_ACCOUNT_ID
-# create an R2 S3 API token (Dashboard → R2 → Manage API Tokens) for the keys below
+npx wrangler d1 create qota-db          # → put the database_id into apps/worker/wrangler.toml
+npx wrangler r2 bucket create qota-ota  # any bucket name; the binding maps it to BUCKET
 npm run d1:migrate:remote               # apply schema to the remote D1
 ```
 
@@ -157,21 +160,17 @@ Build command:           (leave EMPTY)
 Build output directory:  apps/web/dist
 ```
 
-In the Pages project settings add:
+In the Pages project **Settings → Bindings / Variables**, add (all in the dashboard):
 
-- **D1 database binding** — variable name `DB` → database `qota-db` (also declared in
-  [`wrangler.toml`](wrangler.toml))
-- **Secrets / vars** — `JWT_SECRET` (required), `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`
-  (required); optional `ADMIN_PASSWORD` (defaults to `admin12345`)
+- **R2 bucket binding** — variable name `BUCKET` → your bucket (e.g. `qota-ota`)
+- **D1 database binding** — variable name `DB` → database `qota-db`
+- **Secret** — `JWT_SECRET` (required); optional `ADMIN_PASSWORD` (defaults to `admin12345`)
 
 Deploy. On first request the API auto-creates the admin (`ADMIN_EMAIL` / `ADMIN_PASSWORD`,
 default `admin@example.com` / `admin12345` — **change it immediately**).
 
 **After that, every `git push` deploys the committed `apps/web/dist`.** Remember to run
 `npm run pages:build` first (above). New D1 migrations also need `npm run d1:migrate:remote`.
-
-> R2 is required on Cloudflare (no local disk). Browsers/devices transfer bytes directly
-> to R2 via presigned URLs, so set **R2 CORS** to allow your Pages domain (and device origins).
 
 ### Local preview of the Pages build
 

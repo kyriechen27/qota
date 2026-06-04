@@ -5,6 +5,7 @@
 import { AwsClient } from 'aws4fetch';
 import type { Bindings } from '../env';
 import { HttpError } from '../utils/errors';
+import { makeR2Storage } from './r2-binding';
 
 export interface StorageBackend {
   bucket: string;
@@ -32,11 +33,13 @@ export interface StorageBackend {
   ): Promise<{ stream: ReadableStream; size: number; contentType?: string; filename?: string } | null>;
 }
 
-// Picks the storage backend for a request. A Node-runtime local-filesystem
-// backend can be injected via env.STORAGE (see apps/worker/node/server.mjs);
-// on Cloudflare there's no filesystem, so this is always the S3/R2 client.
+// Picks the storage backend for a request:
+//   1. env.STORAGE — Node-runtime local-filesystem backend (apps/worker/node).
+//   2. env.BUCKET  — native R2 binding on Cloudflare (no S3 keys; like remote-file).
+//   3. else        — S3 API client (R2 via account id + keys, or self-hosted S3).
 export function makeStorage(env: Bindings): StorageBackend {
   if (env.STORAGE) return env.STORAGE;
+  if (env.BUCKET) return makeR2Storage(env);
   return makeS3(env);
 }
 
@@ -58,8 +61,8 @@ export function makeS3(env: Bindings): StorageBackend {
   }
 
   const aws = new AwsClient({
-    accessKeyId: env.R2_ACCESS_KEY_ID,
-    secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+    accessKeyId: env.R2_ACCESS_KEY_ID!, // guaranteed by the missing-check above
+    secretAccessKey: env.R2_SECRET_ACCESS_KEY!,
     service: 's3',
     region: env.S3_REGION || 'auto',
   });
@@ -70,7 +73,7 @@ export function makeS3(env: Bindings): StorageBackend {
   // vs localhost:9000 for the browser). Both default to the R2 endpoint.
   const endpoint = (env.S3_ENDPOINT || r2Default).replace(/\/+$/, '');
   const publicEndpoint = (env.S3_PUBLIC_ENDPOINT || env.S3_ENDPOINT || r2Default).replace(/\/+$/, '');
-  const bucket = env.R2_BUCKET_NAME;
+  const bucket = env.R2_BUCKET_NAME || 'qota-ota';
 
   function buildUrl(base: string, key: string): string {
     // Path-style: <endpoint>/<bucket>/<key>. Key path-segments are encoded
