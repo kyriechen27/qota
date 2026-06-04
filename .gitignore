@@ -7,6 +7,12 @@ dist-node
 build
 *.tsbuildinfo
 
+# Cloudflare Pages deploy artifacts ARE committed (empty-build-command deploy,
+# like remote-file). Rebuilt by `npm run pages:build`. Source maps stay ignored.
+!apps/web/dist/
+!apps/web/dist/**
+apps/web/dist/**/*.map
+
 # Cloudflare Wrangler / Miniflare
 .wrangler
 .miniflare

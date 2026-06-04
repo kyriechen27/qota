@@ -160,10 +160,11 @@ npm run typecheck
 
 ## 部署到 Cloudflare
 
-> **推荐:Cloudflare Pages + 连 Git 自动部署。** 项目已配好单一 Pages 项目模式——
-> 前端静态资源 + `functions/api/[[route]].ts`(把现有 Hono API 跑成 Pages Functions)
-> **同域**,在 Pages 控制台「连接 Git 仓库」后 **每次 push 自动部署**,首次访问自动建管理员。
-> 完整步骤见 [DEPLOY.md](DEPLOY.md) 的 *Option B*。下面是「独立 Worker + Pages」的手动方式(Option C)。
+> **推荐:Cloudflare Pages + 连 Git 自动部署(空构建命令,和 remote-file 一样)。**
+> 构建产物(`apps/web/dist`:静态前端 + 把整个 Hono API 打包成的 `_worker.js`)**直接提交进仓库**,
+> Cloudflare 用**空构建命令**直接服务,无需在云端 `npm install`/构建。前端与 API **同域**,首次访问自动建管理员。
+> 代价:改动代码后 push 前要先跑 `npm run pages:build` 重新生成并提交产物。完整步骤见 [DEPLOY.md](DEPLOY.md) 的 *Option B*;
+> 「独立 Worker + Pages」手动方式见 *Option C*。
 
 ### 1. 远端 R2 桶(若还没)
 

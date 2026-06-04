@@ -123,15 +123,22 @@ JWT_SECRET=... S3_ENDPOINT=https://s3.example.com S3_ACCESS_KEY_ID=... S3_SECRET
 
 ---
 
-## Option B — Cloudflare Pages (recommended: connect Git → auto-deploy)
+## Option B — Cloudflare Pages (connect Git → auto-deploy, no build command)
 
-qota deploys as a single **Cloudflare Pages** project: the built SPA is served as
-static assets and the Hono API runs as **Pages Functions** (`functions/api/[[route]].ts`)
-on the **same origin** — so the front-end's relative `/api/...` calls work with no
-cross-domain config. Connect the repo once and every push auto-deploys.
+qota deploys as a single **Cloudflare Pages** project, the same way as the
+`remote-file` project: the **build output is committed to the repo**, so Cloudflare
+serves it directly with an **EMPTY build command** — no `npm install` / build runs on
+Cloudflare. `apps/web/dist` holds the static SPA plus `_worker.js` (the whole Hono API
+bundled by [`apps/worker/pages-entry.ts`](apps/worker/pages-entry.ts), Cloudflare Pages
+"advanced mode"). The API and SPA share one origin, so the front-end's relative
+`/api/...` calls work with no cross-domain config.
 
-Config is the root [`wrangler.toml`](wrangler.toml) (`pages_build_output_dir`, the D1
-binding, vars).
+> **The one trade-off:** because the artifacts are committed, you must rebuild and commit
+> them before pushing whenever the app or web changes:
+> ```bash
+> npm run pages:build        # builds apps/web/dist + bundles _worker.js
+> git add -A && git commit && git push
+> ```
 
 ### One-time setup
 
@@ -146,22 +153,22 @@ npm run d1:migrate:remote               # apply schema to the remote D1
 Then **Cloudflare Pages → Create project → Connect to Git**, pick this repo and set:
 
 ```text
-Build command:           npm install && npm run build
+Build command:           (leave EMPTY)
 Build output directory:  apps/web/dist
 ```
 
 In the Pages project settings add:
 
-- **D1 database binding** — variable name `DB` → database `qota-db`
+- **D1 database binding** — variable name `DB` → database `qota-db` (also declared in
+  [`wrangler.toml`](wrangler.toml))
 - **Secrets / vars** — `JWT_SECRET` (required), `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`
   (required); optional `ADMIN_PASSWORD` (defaults to `admin12345`)
 
 Deploy. On first request the API auto-creates the admin (`ADMIN_EMAIL` / `ADMIN_PASSWORD`,
 default `admin@example.com` / `admin12345` — **change it immediately**).
 
-**After that, every `git push` to the connected branch auto-builds and deploys.** The
-only thing git can't automate is applying *new* D1 migrations — run `npm run d1:migrate:remote`
-whenever you add one.
+**After that, every `git push` deploys the committed `apps/web/dist`.** Remember to run
+`npm run pages:build` first (above). New D1 migrations also need `npm run d1:migrate:remote`.
 
 > R2 is required on Cloudflare (no local disk). Browsers/devices transfer bytes directly
 > to R2 via presigned URLs, so set **R2 CORS** to allow your Pages domain (and device origins).
@@ -171,13 +178,13 @@ whenever you add one.
 ```bash
 echo 'JWT_SECRET="dev-secret"' > .dev.vars   # gitignored; local-only
 npm run d1:migrate:local
-npm run pages:dev                            # wrangler pages dev (http://localhost:8788)
+npm run pages:dev                            # builds + wrangler pages dev (http://localhost:8788)
 ```
 
 ### CLI deploy (no Git integration)
 
 ```bash
-npm run pages:deploy   # builds the SPA + deploys Pages (Functions included)
+npm run pages:deploy   # rebuilds, then `wrangler pages deploy apps/web/dist`
 ```
 
 ## Option C — Standalone Worker + Pages (the original split)
