@@ -33,6 +33,7 @@ export default function ProjectDetail() {
   const [tokScope, setTokScope] = useState<'download' | 'upload' | 'full'>('download');
   const [tokChannel, setTokChannel] = useState('');
   const [newToken, setNewToken] = useState<string | null>(null);
+  const [tokenCopied, setTokenCopied] = useState(false);
 
   // Channels available for this project: the project default + every channel
   // already used by a version. New ones are created inline in the dialogs.
@@ -437,9 +438,26 @@ export default function ProjectDetail() {
                 </div>
                 <div className="dialog-actions">
                   <button
+                    type="button"
+                    className="primary"
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(newToken);
+                        setTokenCopied(true);
+                        setTimeout(() => setTokenCopied(false), 1500);
+                      } catch {
+                        /* clipboard blocked — the text above is select-all to copy by hand */
+                      }
+                    }}
+                  >
+                    {tokenCopied ? t('pd.copied') : t('pd.copyToken')}
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => {
                       setShowTokenDlg(false);
                       setNewToken(null);
+                      setTokenCopied(false);
                     }}
                   >
                     {t('common.done')}
