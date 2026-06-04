@@ -144,13 +144,14 @@ Storage uses the **native R2 binding** (`env.BUCKET`), like remote-file — no
 `R2_ACCOUNT_ID`, no S3 access keys, no presigned URLs, no R2 CORS. The worker streams
 bytes to/from R2 through `/api/storage/*` (same origin).
 
-### One-time setup
+### One-time setup — 100% in the dashboard, nothing hardcoded
+
+Create the two resources (Cloudflare dashboard, or CLI), a D1 database and an R2 bucket:
 
 ```bash
 npx wrangler login
-npx wrangler d1 create qota-db          # → put the database_id into apps/worker/wrangler.toml
-npx wrangler r2 bucket create qota-ota  # any bucket name; the binding maps it to BUCKET
-npm run d1:migrate:remote               # apply schema to the remote D1
+npx wrangler d1 create qota-db          # or: dashboard → D1 → Create
+npx wrangler r2 bucket create qota-ota  # or: dashboard → R2 → Create (any name)
 ```
 
 Then **Cloudflare Pages → Create project → Connect to Git**, pick this repo and set:
@@ -160,25 +161,34 @@ Build command:           (leave EMPTY)
 Build output directory:  apps/web/dist
 ```
 
-In the Pages project **Settings → Bindings / Variables**, add (all in the dashboard):
+In the Pages project **Settings → Bindings / Variables**, add (all in the dashboard,
+like remote-file — nothing goes into the repo):
 
-- **R2 bucket binding** — variable name `BUCKET` → your bucket (e.g. `qota-ota`)
-- **D1 database binding** — variable name `DB` → database `qota-db`
+- **R2 bucket binding** — variable name `BUCKET` → your bucket
+- **D1 database binding** — variable name `DB` → `qota-db`
 - **Secret** — `JWT_SECRET` (required); optional `ADMIN_PASSWORD` (defaults to `admin12345`)
 
-Deploy. On first request the API auto-creates the admin (`ADMIN_EMAIL` / `ADMIN_PASSWORD`,
-default `admin@example.com` / `admin12345` — **change it immediately**).
+Deploy. **On first request the API auto-creates the D1 schema and the admin user**
+(`ADMIN_EMAIL` / `ADMIN_PASSWORD`, default `admin@example.com` / `admin12345` —
+**change it immediately**). No CLI migration needed for the initial setup.
 
-**After that, every `git push` deploys the committed `apps/web/dist`.** Remember to run
-`npm run pages:build` first (above). New D1 migrations also need `npm run d1:migrate:remote`.
+> Because the deployed app reads everything from the bindings/secrets above, anyone
+> reusing this project just sets their own three bindings — nothing is baked into the build.
+
+**After that, every `git push` deploys the committed `apps/web/dist`** (run
+`npm run pages:build` first). If you later *add* a migration to `apps/worker/migrations/`,
+apply it once with `npm run d1:migrate:remote` (needs the `database_id` in
+`apps/worker/wrangler.toml`).
 
 ### Local preview of the Pages build
 
 ```bash
 echo 'JWT_SECRET="dev-secret"' > .dev.vars   # gitignored; local-only
-npm run d1:migrate:local
-npm run pages:dev                            # builds + wrangler pages dev (http://localhost:8788)
+npm run pages:dev                            # builds + wrangler pages dev with local D1 + R2
 ```
+
+The local D1 starts empty; the schema + admin are auto-created on the first `/api`
+request, same as in production.
 
 ### CLI deploy (no Git integration)
 
