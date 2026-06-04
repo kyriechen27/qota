@@ -17,6 +17,7 @@ import type { Bindings } from './src/env';
 import migration0001 from './migrations/0001_init.sql';
 import migration0002 from './migrations/0002_download_count.sql';
 import migration0003 from './migrations/0003_public_versions.sql';
+import migration0004 from './migrations/0004_api_token_secret.sql';
 
 interface PagesEnv extends Bindings {
   ASSETS: Fetcher;
@@ -44,7 +45,12 @@ async function ensureSchema(env: PagesEnv): Promise<void> {
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'users'",
   ).first();
   if (!existing) {
-    for (const stmt of [...statements(migration0001), ...statements(migration0002), ...statements(migration0003)]) {
+    for (const stmt of [
+      ...statements(migration0001),
+      ...statements(migration0002),
+      ...statements(migration0003),
+      ...statements(migration0004),
+    ]) {
       await env.DB.prepare(stmt).run();
     }
     schemaReady = true;
@@ -54,22 +60,22 @@ async function ensureSchema(env: PagesEnv): Promise<void> {
   // Existing DB: apply additive post-launch migrations idempotently so a fresh
   // deploy needs zero CLI (same spirit as the bootstrap above). Each step is a
   // no-op once its column exists.
-  await ensurePublicSlug(env);
+  await ensureColumn(env, 'versions', 'public_slug', statements(migration0003));
+  await ensureColumn(env, 'api_tokens', 'token_enc', statements(migration0004));
   schemaReady = true;
 }
 
-// 0003 — versions.public_slug. ALTER TABLE ADD COLUMN rewrites the table's
-// stored schema in sqlite_master, so the column name appears there afterwards;
-// that's our idempotency check (no PRAGMA, works on D1 + SQLite).
-async function ensurePublicSlug(env: PagesEnv): Promise<void> {
-  const row = await env.DB.prepare(
-    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'versions'",
-  ).first<{ sql: string }>();
-  if (row && typeof row.sql === 'string' && !row.sql.includes('public_slug')) {
-    for (const stmt of statements(migration0003)) {
-      await env.DB.prepare(stmt).run();
-    }
-    console.log('[schema] added versions.public_slug');
+// Apply an additive column-migration only if the column is missing. ALTER TABLE
+// ADD COLUMN rewrites the table's stored schema in sqlite_master, so the column
+// name appears there afterwards — that's our idempotency check (no PRAGMA; works
+// on D1 + SQLite).
+async function ensureColumn(env: PagesEnv, table: string, column: string, stmts: string[]): Promise<void> {
+  const row = await env.DB.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+    .bind(table)
+    .first<{ sql: string }>();
+  if (row && typeof row.sql === 'string' && !row.sql.includes(column)) {
+    for (const stmt of stmts) await env.DB.prepare(stmt).run();
+    console.log(`[schema] added ${table}.${column}`);
   }
 }
 

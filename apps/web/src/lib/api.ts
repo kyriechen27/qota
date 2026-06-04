@@ -204,6 +204,8 @@ export const api = {
     request<{ ok: true }>(`/api/api-tokens/${id}/revoke`, { method: 'POST' }),
   deleteApiToken: (id: number) =>
     request<{ ok: true }>(`/api/api-tokens/${id}`, { method: 'DELETE' }),
+  revealApiToken: (id: number) =>
+    request<{ token: string }>(`/api/api-tokens/${id}/reveal`),
 
   // Audit
   listAudit: (opts?: { customerId?: number; projectId?: number; action?: string; before?: number; limit?: number }) => {

@@ -35,6 +35,7 @@ export default function ProjectDetail() {
   const [tokChannel, setTokChannel] = useState('');
   const [newToken, setNewToken] = useState<string | null>(null);
   const [tokenCopied, setTokenCopied] = useState(false);
+  const [copiedTokenId, setCopiedTokenId] = useState<number | null>(null);
 
   // public-access state — the version whose public dialog is open
   const [publicVer, setPublicVer] = useState<Version | null>(null);
@@ -241,6 +242,37 @@ export default function ProjectDetail() {
     }
   }
 
+  async function deleteToken(tk: ApiToken) {
+    if (!confirm(t('pd.confirmDeleteToken', { name: tk.name }))) return;
+    try {
+      await api.deleteApiToken(tk.id);
+      await load();
+    } catch (e: any) {
+      setErr(e?.message);
+    }
+  }
+
+  async function copyTokenSecret(tk: ApiToken) {
+    setErr(null);
+    let token: string;
+    try {
+      ({ token } = await api.revealApiToken(tk.id));
+    } catch (e: any) {
+      setErr(e?.message);
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(token);
+      setCopiedTokenId(tk.id);
+      setTimeout(() => setCopiedTokenId((id) => (id === tk.id ? null : id)), 1500);
+    } catch {
+      // Clipboard blocked (no gesture / insecure context) — show the token in the
+      // dialog (select-all) so it can still be copied by hand.
+      setNewToken(token);
+      setShowTokenDlg(true);
+    }
+  }
+
   if (!project) {
     return (
       <>
@@ -405,11 +437,24 @@ export default function ProjectDetail() {
                 <td className="muted">{tk.lastUsedAt ? new Date(tk.lastUsedAt).toLocaleString() : '—'}</td>
                 <td>{tk.revokedAt ? <span className="error">{t('pd.revoked')}</span> : <span className="success">{t('pd.tokenActive')}</span>}</td>
                 <td>
+                  {!tk.revokedAt &&
+                    (tk.hasSecret ? (
+                      <button onClick={() => copyTokenSecret(tk)} style={{ marginRight: 6 }}>
+                        {copiedTokenId === tk.id ? t('pd.copied') : t('pd.copyToken')}
+                      </button>
+                    ) : (
+                      <button disabled style={{ marginRight: 6 }} title={t('pd.copyUnavailable')}>
+                        {t('pd.copyToken')}
+                      </button>
+                    ))}
                   {!tk.revokedAt && (
-                    <button className="danger" onClick={() => revokeToken(tk)}>
+                    <button onClick={() => revokeToken(tk)} style={{ marginRight: 6 }}>
                       {t('common.revoke')}
                     </button>
                   )}
+                  <button className="danger" onClick={() => deleteToken(tk)}>
+                    {t('common.delete')}
+                  </button>
                 </td>
               </tr>
             ))}

@@ -119,6 +119,9 @@ export interface ApiToken {
   lastUsedIp: string | null;
   revokedAt: number | null;
   createdAt: number;
+  /** Whether the full token can be re-revealed/copied from the dashboard
+   *  (false for tokens issued before encrypted-at-rest storage existed). */
+  hasSecret: boolean;
 }
 
 export type UploadSessionStatus = 'in_progress' | 'completed' | 'aborted' | 'failed';

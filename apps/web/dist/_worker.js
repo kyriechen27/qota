@@ -28091,6 +28091,33 @@ async function sha256Hex(data) {
   return bytesToHex(digest);
 }
 
+// apps/worker/src/utils/crypto.ts
+async function aesKey(secret) {
+  const keyBytes = await crypto.subtle.digest("SHA-256", toBytes(secret));
+  return crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+async function encryptSecret(plaintext, secret) {
+  const key = await aesKey(secret);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, toBytes(plaintext));
+  const out = new Uint8Array(iv.length + ct.byteLength);
+  out.set(iv, 0);
+  out.set(new Uint8Array(ct), iv.length);
+  return base64UrlEncode(out);
+}
+async function decryptSecret(enc2, secret) {
+  try {
+    const raw2 = base64UrlDecode(enc2);
+    const iv = raw2.slice(0, 12);
+    const ct = raw2.slice(12);
+    const key = await aesKey(secret);
+    const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct);
+    return fromBytes(pt);
+  } catch {
+    return null;
+  }
+}
+
 // apps/worker/src/routes/api-tokens.ts
 var apiTokenRoutes = new Hono2();
 apiTokenRoutes.use("*", requireUser);
@@ -28108,7 +28135,10 @@ function dto5(r) {
     lastUsedAt: r.last_used_at,
     lastUsedIp: r.last_used_ip,
     revokedAt: r.revoked_at,
-    createdAt: r.created_at
+    createdAt: r.created_at,
+    // Whether the full token can be re-revealed/copied (false for tokens issued
+    // before token_enc existed). Never expose the ciphertext itself.
+    hasSecret: !!r.token_enc
   };
 }
 function generateToken(kind) {
@@ -28125,7 +28155,7 @@ apiTokenRoutes.get("/", async (c) => {
   await requireProjectAccess(c.env.DB, user, projectId, "manage_tokens");
   const rows = await c.env.DB.prepare(
     `SELECT id, project_id, name, token_prefix, kind, scope, channel, created_by, expires_at,
-            last_used_at, last_used_ip, revoked_at, created_at
+            last_used_at, last_used_ip, revoked_at, created_at, token_enc
        FROM api_tokens WHERE project_id = ? ORDER BY id DESC`
   ).bind(projectId).all();
   return c.json((rows.results ?? []).map(dto5));
@@ -28142,15 +28172,17 @@ apiTokenRoutes.post("/", async (c) => {
   }
   const token = generateToken(kind);
   const tokenHash = await sha256Hex(token);
+  const tokenEnc = await encryptSecret(token, c.env.JWT_SECRET);
   const prefix = token.slice(0, 12);
   const now = Date.now();
   const r = await c.env.DB.prepare(
-    `INSERT INTO api_tokens (project_id, name, token_hash, token_prefix, kind, scope, channel, created_by, expires_at, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO api_tokens (project_id, name, token_hash, token_enc, token_prefix, kind, scope, channel, created_by, expires_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     body.projectId,
     body.name,
     tokenHash,
+    tokenEnc,
     prefix,
     kind,
     scope,
@@ -28162,7 +28194,7 @@ apiTokenRoutes.post("/", async (c) => {
   const id = Number(r.meta.last_row_id);
   const row = await c.env.DB.prepare(
     `SELECT id, project_id, name, token_prefix, kind, scope, channel, created_by, expires_at,
-            last_used_at, last_used_ip, revoked_at, created_at
+            last_used_at, last_used_ip, revoked_at, created_at, token_enc
        FROM api_tokens WHERE id = ?`
   ).bind(id).first();
   await audit(c, {
@@ -28174,6 +28206,27 @@ apiTokenRoutes.post("/", async (c) => {
     meta: { kind, scope, channel: body.channel ?? null, name: body.name }
   });
   return c.json({ ...dto5(row), token }, 201);
+});
+apiTokenRoutes.get("/:id/reveal", async (c) => {
+  const id = Number(c.req.param("id"));
+  if (!Number.isFinite(id)) throw badRequest("invalid id");
+  const me = c.get("user");
+  const row = await c.env.DB.prepare("SELECT project_id, token_enc FROM api_tokens WHERE id = ?").bind(id).first();
+  if (!row) throw notFound();
+  const proj = await requireProjectAccess(c.env.DB, me, row.project_id, "manage_tokens");
+  if (!row.token_enc) {
+    throw notFound("token secret not stored (issued before copy was enabled) \u2014 re-issue the token");
+  }
+  const token = await decryptSecret(row.token_enc, c.env.JWT_SECRET);
+  if (!token) throw new HttpError(500, "decrypt_failed", "failed to decrypt token");
+  await audit(c, {
+    action: "api_token.reveal",
+    customerId: proj.customer_id,
+    projectId: row.project_id,
+    targetType: "api_token",
+    targetId: id
+  });
+  return c.json({ token });
 });
 apiTokenRoutes.post("/:id/revoke", async (c) => {
   const id = Number(c.req.param("id"));
@@ -29172,6 +29225,9 @@ var download_count_default = "-- Track how many times each version has been down
 // apps/worker/migrations/0003_public_versions.sql
 var public_versions_default = "-- Public, token-less download links (per version).\n-- A random, unguessable slug acts as a capability URL: anyone who has it can\n-- download the artifact (never upload), and access is revoked by clearing the\n-- slug. NULL = not public. SQLite treats NULLs as distinct, so many versions\n-- can be non-public under this UNIQUE index simultaneously.\nALTER TABLE versions ADD COLUMN public_slug TEXT;\nCREATE UNIQUE INDEX IF NOT EXISTS idx_versions_public_slug ON versions(public_slug);\n";
 
+// apps/worker/migrations/0004_api_token_secret.sql
+var api_token_secret_default = "-- Store the API token encrypted at rest (AES-256-GCM, key derived from\n-- JWT_SECRET) so it can be re-copied from the dashboard at any time. The hash\n-- (token_hash) is still what authentication looks up; token_enc is only for\n-- display/copy. NULL for tokens issued before this column existed \u2014 those can\n-- only be copied at creation time, and must be re-issued to enable copy.\nALTER TABLE api_tokens ADD COLUMN token_enc TEXT;\n";
+
 // apps/worker/pages-entry.ts
 function statements(sql) {
   return sql.replace(/--[^\n]*/g, "").split(";").map((s) => s.trim()).filter((s) => s.length > 0 && !/^PRAGMA/i.test(s));
@@ -29183,25 +29239,27 @@ async function ensureSchema(env) {
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'users'"
   ).first();
   if (!existing) {
-    for (const stmt of [...statements(init_default), ...statements(download_count_default), ...statements(public_versions_default)]) {
+    for (const stmt of [
+      ...statements(init_default),
+      ...statements(download_count_default),
+      ...statements(public_versions_default),
+      ...statements(api_token_secret_default)
+    ]) {
       await env.DB.prepare(stmt).run();
     }
     schemaReady = true;
     console.log("[schema] initialized D1 tables on first run");
     return;
   }
-  await ensurePublicSlug(env);
+  await ensureColumn(env, "versions", "public_slug", statements(public_versions_default));
+  await ensureColumn(env, "api_tokens", "token_enc", statements(api_token_secret_default));
   schemaReady = true;
 }
-async function ensurePublicSlug(env) {
-  const row = await env.DB.prepare(
-    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'versions'"
-  ).first();
-  if (row && typeof row.sql === "string" && !row.sql.includes("public_slug")) {
-    for (const stmt of statements(public_versions_default)) {
-      await env.DB.prepare(stmt).run();
-    }
-    console.log("[schema] added versions.public_slug");
+async function ensureColumn(env, table, column, stmts) {
+  const row = await env.DB.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").bind(table).first();
+  if (row && typeof row.sql === "string" && !row.sql.includes(column)) {
+    for (const stmt of stmts) await env.DB.prepare(stmt).run();
+    console.log(`[schema] added ${table}.${column}`);
   }
 }
 var pages_entry_default = {

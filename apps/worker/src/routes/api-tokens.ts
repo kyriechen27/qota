@@ -4,10 +4,11 @@
 import { Hono, type Context } from 'hono';
 import type { AppEnv, AuthedApiToken } from '../env';
 import { requireUser } from '../middleware/auth';
-import { badRequest, notFound, unauthorized } from '../utils/errors';
+import { badRequest, HttpError, notFound, unauthorized } from '../utils/errors';
 import { requireProjectAccess } from '../lib/memberships';
 import { sha256Hex } from '../utils/sha';
 import { bytesToHex } from '../utils/encoding';
+import { encryptSecret, decryptSecret } from '../utils/crypto';
 import { audit } from '../lib/audit';
 
 export const apiTokenRoutes = new Hono<AppEnv>();
@@ -28,6 +29,7 @@ interface TokenRow {
   last_used_ip: string | null;
   revoked_at: number | null;
   created_at: number;
+  token_enc: string | null;
 }
 
 function dto(r: TokenRow) {
@@ -45,6 +47,9 @@ function dto(r: TokenRow) {
     lastUsedIp: r.last_used_ip,
     revokedAt: r.revoked_at,
     createdAt: r.created_at,
+    // Whether the full token can be re-revealed/copied (false for tokens issued
+    // before token_enc existed). Never expose the ciphertext itself.
+    hasSecret: !!r.token_enc,
   };
 }
 
@@ -63,7 +68,7 @@ apiTokenRoutes.get('/', async (c) => {
   await requireProjectAccess(c.env.DB, user, projectId, 'manage_tokens');
   const rows = await c.env.DB.prepare(
     `SELECT id, project_id, name, token_prefix, kind, scope, channel, created_by, expires_at,
-            last_used_at, last_used_ip, revoked_at, created_at
+            last_used_at, last_used_ip, revoked_at, created_at, token_enc
        FROM api_tokens WHERE project_id = ? ORDER BY id DESC`,
   )
     .bind(projectId)
@@ -91,16 +96,18 @@ apiTokenRoutes.post('/', async (c) => {
   }
   const token = generateToken(kind);
   const tokenHash = await sha256Hex(token);
+  const tokenEnc = await encryptSecret(token, c.env.JWT_SECRET);
   const prefix = token.slice(0, 12);
   const now = Date.now();
   const r = await c.env.DB.prepare(
-    `INSERT INTO api_tokens (project_id, name, token_hash, token_prefix, kind, scope, channel, created_by, expires_at, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO api_tokens (project_id, name, token_hash, token_enc, token_prefix, kind, scope, channel, created_by, expires_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       body.projectId,
       body.name,
       tokenHash,
+      tokenEnc,
       prefix,
       kind,
       scope,
@@ -113,7 +120,7 @@ apiTokenRoutes.post('/', async (c) => {
   const id = Number(r.meta.last_row_id);
   const row = await c.env.DB.prepare(
     `SELECT id, project_id, name, token_prefix, kind, scope, channel, created_by, expires_at,
-            last_used_at, last_used_ip, revoked_at, created_at
+            last_used_at, last_used_ip, revoked_at, created_at, token_enc
        FROM api_tokens WHERE id = ?`,
   )
     .bind(id)
@@ -127,6 +134,33 @@ apiTokenRoutes.post('/', async (c) => {
     meta: { kind, scope, channel: body.channel ?? null, name: body.name },
   });
   return c.json({ ...dto(row!), token }, 201);
+});
+
+// Reveal (decrypt) the full token so it can be re-copied from the dashboard.
+// Requires manage_tokens, and is audited. 404 for tokens issued before token_enc
+// existed (only their hash is known) — those must be re-issued to enable copy.
+apiTokenRoutes.get('/:id/reveal', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (!Number.isFinite(id)) throw badRequest('invalid id');
+  const me = c.get('user')!;
+  const row = await c.env.DB.prepare('SELECT project_id, token_enc FROM api_tokens WHERE id = ?')
+    .bind(id)
+    .first<{ project_id: number; token_enc: string | null }>();
+  if (!row) throw notFound();
+  const proj = await requireProjectAccess(c.env.DB, me, row.project_id, 'manage_tokens');
+  if (!row.token_enc) {
+    throw notFound('token secret not stored (issued before copy was enabled) — re-issue the token');
+  }
+  const token = await decryptSecret(row.token_enc, c.env.JWT_SECRET);
+  if (!token) throw new HttpError(500, 'decrypt_failed', 'failed to decrypt token');
+  await audit(c, {
+    action: 'api_token.reveal',
+    customerId: proj.customer_id,
+    projectId: row.project_id,
+    targetType: 'api_token',
+    targetId: id,
+  });
+  return c.json({ token });
 });
 
 apiTokenRoutes.post('/:id/revoke', async (c) => {
