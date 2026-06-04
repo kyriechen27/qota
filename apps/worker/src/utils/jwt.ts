@@ -1,4 +1,5 @@
 import { base64UrlDecode, base64UrlEncode, constantTimeEqual, toBytes, fromBytes } from './encoding';
+import { HttpError } from './errors';
 
 interface JwtHeader {
   alg: 'HS256';
@@ -6,6 +7,15 @@ interface JwtHeader {
 }
 
 async function getKey(secret: string): Promise<CryptoKey> {
+  // Fail clearly instead of with an opaque WebCrypto "HMAC key length (0)" error
+  // when the secret is missing (e.g. JWT_SECRET not set on Cloudflare).
+  if (!secret) {
+    throw new HttpError(
+      503,
+      'jwt_secret_missing',
+      'JWT_SECRET 未配置。请设置它：Cloudflare 用 `wrangler pages secret put JWT_SECRET`(或在 Pages 控制台加密钥),本地用根目录 .dev.vars。',
+    );
+  }
   return crypto.subtle.importKey(
     'raw',
     toBytes(secret),

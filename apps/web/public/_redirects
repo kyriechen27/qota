@@ -1,0 +1,3 @@
+# SPA fallback for client-side routing (react-router). /api/* is handled by
+# Pages Functions first, so this only catches real front-end routes.
+/*    /index.html   200

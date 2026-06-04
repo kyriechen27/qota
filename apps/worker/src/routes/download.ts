@@ -17,7 +17,7 @@ import type { AppEnv } from '../env';
 import { requireUser } from '../middleware/auth';
 import { badRequest, forbidden, notFound, unauthorized } from '../utils/errors';
 import { requireProjectAccess } from '../lib/memberships';
-import { makeS3 } from '../lib/s3';
+import { makeStorage } from '../lib/s3';
 import { audit } from '../lib/audit';
 import { resolveApiToken } from './api-tokens';
 
@@ -56,7 +56,7 @@ downloadRoutes.post('/grant', requireUser, async (c) => {
   const proj = await requireProjectAccess(c.env.DB, me, row.project_id, 'download');
 
   const ttl = Number(c.env.DOWNLOAD_URL_TTL_SECONDS) || 300;
-  const s3 = makeS3(c.env);
+  const s3 = makeStorage(c.env);
   const url = await s3.signGetUrl(row.r2_key, ttl, {
     filename: row.filename,
     contentType: row.content_type ?? undefined,
@@ -101,7 +101,7 @@ async function authDevice(c: Context<AppEnv>) {
 }
 
 async function redirectOrJson(c: Context<AppEnv>, row: VersionRow, ttl: number) {
-  const s3 = makeS3(c.env);
+  const s3 = makeStorage(c.env);
   const url = await s3.signGetUrl(row.r2_key, ttl, {
     filename: row.filename,
     contentType: row.content_type ?? undefined,

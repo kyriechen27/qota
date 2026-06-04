@@ -1,0 +1,40 @@
+# Cloudflare Pages deployment for qota.
+#
+# Connect THIS repo in the Cloudflare Pages dashboard (Build command:
+# `npm install && npm run build`, Build output directory: `apps/web/dist`) and
+# every push auto-deploys. The SPA is served as static assets; the Hono API runs
+# as Pages Functions from functions/api/[[route]].ts on the SAME origin.
+#
+# The standalone Worker target lives separately in apps/worker/wrangler.toml.
+
+name = "qota"
+compatibility_date = "2024-11-18"
+compatibility_flags = ["nodejs_compat"]
+pages_build_output_dir = "apps/web/dist"
+
+[vars]
+# Same-origin now, so "*" is fine; tighten to your Pages domain if you like.
+ALLOWED_ORIGINS = "*"
+JWT_TTL_SECONDS = "43200"
+DOWNLOAD_URL_TTL_SECONDS = "300"
+UPLOAD_PART_URL_TTL_SECONDS = "600"
+# R2 (S3-compatible) — account id + bucket are safe in plaintext; keys are secrets.
+R2_ACCOUNT_ID = "REPLACE_WITH_YOUR_ACCOUNT_ID"
+R2_BUCKET_NAME = "qota-ota"
+# First-run admin email (auto-created when the users table is empty).
+# Password defaults to admin12345 — override ADMIN_PASSWORD as a secret in prod.
+ADMIN_EMAIL = "admin@example.com"
+
+# === Secrets (set via `wrangler pages secret put <NAME>` or the dashboard) ===
+#   JWT_SECRET            — required, random 32+ bytes (openssl rand -hex 32)
+#   R2_ACCESS_KEY_ID      — required, from Cloudflare R2 API token
+#   R2_SECRET_ACCESS_KEY  — required, paired with the access key id
+#   ADMIN_PASSWORD        — recommended, the first admin's password
+# Optional non-R2 S3 overrides: S3_ENDPOINT, S3_PUBLIC_ENDPOINT, S3_REGION
+
+# === D1 database binding (same DB the Worker target uses) ===
+[[d1_databases]]
+binding = "DB"
+database_name = "qota-db"
+database_id = "REPLACE_WITH_D1_ID_AFTER_CREATE"
+migrations_dir = "apps/worker/migrations"

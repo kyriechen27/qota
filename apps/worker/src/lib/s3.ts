@@ -6,7 +6,7 @@ import { AwsClient } from 'aws4fetch';
 import type { Bindings } from '../env';
 import { HttpError } from '../utils/errors';
 
-export interface S3Client {
+export interface StorageBackend {
   bucket: string;
   endpoint: string;
   objectUrl(key: string): string;
@@ -22,9 +22,25 @@ export interface S3Client {
   abortMultipartUpload(key: string, uploadId: string): Promise<void>;
   headObject(key: string): Promise<{ size: number; etag: string; contentType?: string } | null>;
   deleteObject(key: string): Promise<void>;
+
+  // Local-filesystem backend only (Node runtime). With S3/R2 these stay
+  // undefined: clients transfer bytes directly to object storage via presigned
+  // URLs, so the worker never serves them. See apps/worker/node/local-storage.mjs.
+  writePart?(url: string, body: ArrayBuffer): Promise<{ etag: string }>;
+  readBlob?(
+    url: string,
+  ): Promise<{ stream: ReadableStream; size: number; contentType?: string; filename?: string } | null>;
 }
 
-export function makeS3(env: Bindings): S3Client {
+// Picks the storage backend for a request. A Node-runtime local-filesystem
+// backend can be injected via env.STORAGE (see apps/worker/node/server.mjs);
+// on Cloudflare there's no filesystem, so this is always the S3/R2 client.
+export function makeStorage(env: Bindings): StorageBackend {
+  if (env.STORAGE) return env.STORAGE;
+  return makeS3(env);
+}
+
+export function makeS3(env: Bindings): StorageBackend {
   // Fail loudly (and clearly) when object storage isn't configured, instead of
   // letting a bogus endpoint surface as an opaque "internal server error".
   const accountConfigured = !!env.R2_ACCOUNT_ID && !env.R2_ACCOUNT_ID.includes('REPLACE');
@@ -36,7 +52,8 @@ export function makeS3(env: Bindings): S3Client {
     throw new HttpError(
       503,
       'storage_not_configured',
-      `对象存储未配置：缺少 ${missing.join('、')}。请在 .dev.vars/.env 配置 R2/S3 凭据，或使用 docker compose 自带的 MinIO。`,
+      `对象存储未配置：缺少 ${missing.join('、')}。Cloudflare/wrangler 运行时没有本地磁盘，必须配置 R2/S3 凭据；` +
+        `若是本地或自托管，改用 Node 运行时（npm run dev:node / docker compose），默认即用本地文件夹存储。`,
     );
   }
 

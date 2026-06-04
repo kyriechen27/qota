@@ -3,6 +3,10 @@
 OTA 升级包多租户版本管理平台,部署到 Cloudflare Workers + Pages,文件存 R2(走 S3
 兼容端点直传 / 短期 presigned 下载),元数据存 D1。完整审计日志。
 
+> **自托管 / 本地无需对象存储**:同一套代码也能跑在 Node 运行时(`npm run dev:node`、
+> Docker),默认把文件存到**本地文件夹**,不需要 MinIO/S3——见 [DEPLOY.md](DEPLOY.md)。
+> 配了 S3/R2 就自动切换为对象桶;Cloudflare 部署始终用 R2 桶。
+
 ## 角色 & 权限模型
 
 **全局角色**(users.role)
@@ -84,8 +88,12 @@ npm install
 ```bash
 cp apps/worker/.dev.vars.example apps/worker/.dev.vars
 # 编辑 .dev.vars,填入 JWT_SECRET (openssl rand -hex 32) 和你的 R2 S3 keys。
-# 本地开发也连真的 R2 桶 — 因为本地 wrangler 不能模拟 R2 multipart S3 endpoint。
+# 注意:这套 .dev.vars 用于 `npm run dev`(wrangler)——它模拟 Cloudflare、没有本地磁盘,
+# 所以必须连真的 R2 桶(本地 wrangler 不能模拟 R2 multipart S3 endpoint)。
 # 推荐另起一个开发用桶,如 qota-ota-dev,wrangler.toml 里改 R2_BUCKET_NAME。
+#
+# 想零依赖本地开发?用 `npm run dev:node`(Node 运行时),不填 S3 即默认用本地文件夹,
+# 完全不需要 R2/MinIO。详见 DEPLOY.md。
 ```
 
 ### 2. R2 桶 + S3 凭据
@@ -151,6 +159,11 @@ npm run typecheck
 ```
 
 ## 部署到 Cloudflare
+
+> **推荐:Cloudflare Pages + 连 Git 自动部署。** 项目已配好单一 Pages 项目模式——
+> 前端静态资源 + `functions/api/[[route]].ts`(把现有 Hono API 跑成 Pages Functions)
+> **同域**,在 Pages 控制台「连接 Git 仓库」后 **每次 push 自动部署**,首次访问自动建管理员。
+> 完整步骤见 [DEPLOY.md](DEPLOY.md) 的 *Option B*。下面是「独立 Worker + Pages」的手动方式(Option C)。
 
 ### 1. 远端 R2 桶(若还没)
 

@@ -231,7 +231,9 @@ async function api(path, init = {}) {
   return res.json();
 }
 async function putPart(url, buf) {
-  const res = await fetch(url, {
+  // S3/R2 hand back absolute presigned URLs; the local-folder backend hands back
+  // relative ones (/api/storage/part?…) — resolve those against the API base.
+  const res = await fetch(new URL(url, apiBase), {
     method: 'PUT',
     body: buf,
     headers: { 'content-length': String(buf.length) },

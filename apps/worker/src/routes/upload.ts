@@ -14,7 +14,7 @@ import type { AppEnv } from '../env';
 import { requireUser } from '../middleware/auth';
 import { badRequest, conflict, notFound } from '../utils/errors';
 import { requireProjectAccess } from '../lib/memberships';
-import { makeS3 } from '../lib/s3';
+import { makeStorage } from '../lib/s3';
 import { audit } from '../lib/audit';
 import { versionDto } from './versions';
 
@@ -154,7 +154,7 @@ uploadRoutes.post('/init', async (c) => {
   if (partCount > MAX_PARTS) throw badRequest('too many parts; increase partSizeHint');
 
   const key = r2KeyFor(customer.code, project.code, channel, body.version, body.filename);
-  const s3 = makeS3(c.env);
+  const s3 = makeStorage(c.env);
   const uploadId = await s3.createMultipartUpload(key, body.contentType || 'application/octet-stream');
 
   const now = Date.now();
@@ -236,7 +236,7 @@ uploadRoutes.post('/sign-part', async (c) => {
     throw badRequest(`partNumber must be 1..${partCount}`);
   }
   const ttl = Number(c.env.UPLOAD_PART_URL_TTL_SECONDS) || 600;
-  const s3 = makeS3(c.env);
+  const s3 = makeStorage(c.env);
   const url = await s3.signPartUrl(session.r2_key, session.upload_id, body.partNumber, ttl);
   return c.json({ url, expiresAt: Math.floor(Date.now() / 1000) + ttl });
 });
@@ -270,7 +270,7 @@ uploadRoutes.post('/complete', async (c) => {
     throw badRequest('sha256 mismatch with init expectedSha256');
   }
 
-  const s3 = makeS3(c.env);
+  const s3 = makeStorage(c.env);
   let completeRes: { etag: string };
   try {
     completeRes = await s3.completeMultipartUpload(
@@ -390,7 +390,7 @@ uploadRoutes.post('/abort', async (c) => {
   if (!session) throw notFound();
   const proj = await requireProjectAccess(c.env.DB, me, session.project_id, 'upload');
   if (session.status === 'in_progress') {
-    const s3 = makeS3(c.env);
+    const s3 = makeStorage(c.env);
     try {
       await s3.abortMultipartUpload(session.r2_key, session.upload_id);
     } catch (e) {

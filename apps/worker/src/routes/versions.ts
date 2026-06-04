@@ -7,7 +7,7 @@ import type { AppEnv } from '../env';
 import { requireUser } from '../middleware/auth';
 import { badRequest, notFound } from '../utils/errors';
 import { requireProjectAccess } from '../lib/memberships';
-import { makeS3 } from '../lib/s3';
+import { makeStorage } from '../lib/s3';
 import { audit } from '../lib/audit';
 
 export const versionRoutes = new Hono<AppEnv>();
@@ -184,7 +184,7 @@ versionRoutes.delete('/:id', async (c) => {
     .first<{ project_id: number; r2_key: string }>();
   if (!row) throw notFound();
   const proj = await requireProjectAccess(c.env.DB, me, row.project_id, 'manage_versions');
-  const s3 = makeS3(c.env);
+  const s3 = makeStorage(c.env);
   try {
     await s3.deleteObject(row.r2_key);
   } catch (e) {

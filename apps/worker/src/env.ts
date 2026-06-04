@@ -1,8 +1,14 @@
 import type { D1Database } from '@cloudflare/workers-types';
+import type { StorageBackend } from './lib/s3';
 
 export interface Bindings {
   // D1
   DB: D1Database;
+
+  // Object storage backend. Normally built from the S3/R2 vars below by
+  // makeStorage(). The Node runtime can inject a local-filesystem backend here
+  // (see apps/worker/node/server.mjs); unused/undefined on Cloudflare.
+  STORAGE?: StorageBackend;
 
   // Plain vars
   ALLOWED_ORIGINS: string;
@@ -11,6 +17,12 @@ export interface Bindings {
   UPLOAD_PART_URL_TTL_SECONDS: string;
   R2_ACCOUNT_ID: string;
   R2_BUCKET_NAME: string;
+
+  // First-run admin auto-seed (used only when the users table is empty;
+  // see lib/bootstrap.ts). All optional — sensible defaults apply.
+  ADMIN_EMAIL?: string;
+  ADMIN_PASSWORD?: string;
+  ADMIN_NAME?: string;
 
   // Optional S3 endpoint overrides for non-Cloudflare deployments
   // (e.g. self-hosted MinIO behind Docker). When unset, the client falls

@@ -3,6 +3,15 @@
 
 JWT_SECRET="change-me-to-a-long-random-string-32bytes-min"
 
+# ─── Storage ──────────────────────────────────────────────────────────────────
+# `wrangler dev` emulates Cloudflare and has no local disk, so it ALWAYS needs a
+# bucket — fill in the R2 (or S3) credentials below.
+#
+# Local Node dev (`npm run dev:node`) does NOT need these: with them blank, qota
+# stores files in a local folder (apps/worker/data/blobs) by default. To point
+# Node dev at MinIO/S3 instead, set S3_ENDPOINT + S3_ACCESS_KEY_ID +
+# S3_SECRET_ACCESS_KEY (see DEPLOY.md).
+
 # Cloudflare R2 S3-compatible credentials. Create them under:
 #   Cloudflare dashboard → R2 → Manage R2 API Tokens → Create API token
 # Permission: Object Read & Write, scoped to bucket qota-ota.

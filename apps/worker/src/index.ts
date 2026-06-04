@@ -10,7 +10,9 @@ import { versionRoutes } from './routes/versions';
 import { downloadRoutes } from './routes/download';
 import { apiTokenRoutes } from './routes/api-tokens';
 import { uploadRoutes } from './routes/upload';
+import { storageRoutes } from './routes/storage';
 import { auditRoutes } from './routes/audit';
+import { ensureAdminSeed } from './lib/bootstrap';
 
 const app = new Hono<AppEnv>();
 
@@ -35,6 +37,13 @@ app.use('*', async (c, next) => {
   c.res.headers.set('vary', 'origin');
 });
 
+// First-run admin seed (idempotent; a no-op once any user exists). Runs on real
+// requests only — the CORS handler above returns early for OPTIONS preflight.
+app.use('*', async (c, next) => {
+  await ensureAdminSeed(c.env);
+  await next();
+});
+
 app.get('/api/health', (c) => c.json({ ok: true, time: Date.now(), service: 'qota-api' }));
 
 app.route('/api/auth', authRoutes);
@@ -44,6 +53,7 @@ app.route('/api/projects', projectRoutes);
 app.route('/api/memberships', membershipRoutes);
 app.route('/api/versions', versionRoutes);
 app.route('/api/upload', uploadRoutes);
+app.route('/api/storage', storageRoutes);
 app.route('/api/download', downloadRoutes);
 app.route('/api/api-tokens', apiTokenRoutes);
 app.route('/api/audit', auditRoutes);

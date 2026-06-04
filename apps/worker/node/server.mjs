@@ -15,6 +15,7 @@ import { pbkdf2Sync, randomBytes } from 'node:crypto';
 import apiApp from '../src/index.ts';
 import { createSqliteD1 } from './d1-sqlite.mjs';
 import { runMigrations } from './migrate.mjs';
+import { makeLocalStorage } from './local-storage.mjs';
 
 // ---- load .env / .dev.vars (so dev:node reuses the same config as wrangler) -
 // Looks in cwd (apps/worker) and the repo root. Existing process.env wins.
@@ -57,15 +58,35 @@ const db = createSqliteD1(SQLITE_PATH);
 runMigrations(db, MIGRATIONS_DIR);
 seedAdmin(db);
 
+// ---- storage backend ------------------------------------------------------
+// Default to a local folder (zero external deps — no S3/MinIO required). If
+// S3/R2 is configured (or STORAGE_DRIVER=s3) the worker uses the S3 client and
+// presigned URLs instead. STORAGE_DRIVER=local forces the folder even when S3
+// vars are present. (On Cloudflare there's no filesystem, so a bucket is
+// always required there — see apps/worker/src/lib/s3.ts.)
+const STORAGE_DIR = resolve(process.env.STORAGE_DIR || './data/blobs');
+const s3Configured =
+  !!process.env.S3_ENDPOINT ||
+  (!!process.env.R2_ACCOUNT_ID && !process.env.R2_ACCOUNT_ID.includes('REPLACE'));
+const STORAGE_DRIVER = (process.env.STORAGE_DRIVER || (s3Configured ? 's3' : 'local')).toLowerCase();
+const BUCKET = process.env.S3_BUCKET || process.env.R2_BUCKET_NAME || 'qota-ota';
+
+let storage; // undefined → the app falls back to the S3/R2 client via makeStorage()
+if (STORAGE_DRIVER === 'local') {
+  mkdirSync(STORAGE_DIR, { recursive: true });
+  storage = makeLocalStorage({ baseDir: STORAGE_DIR, bucket: BUCKET, secret: JWT_SECRET });
+}
+
 // ---- env passed to the Hono app as c.env ----------------------------------
 const env = {
   DB: db,
+  STORAGE: storage,
   ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS || '*',
   JWT_TTL_SECONDS: process.env.JWT_TTL_SECONDS || '43200',
   DOWNLOAD_URL_TTL_SECONDS: process.env.DOWNLOAD_URL_TTL_SECONDS || '300',
   UPLOAD_PART_URL_TTL_SECONDS: process.env.UPLOAD_PART_URL_TTL_SECONDS || '600',
   R2_ACCOUNT_ID: process.env.R2_ACCOUNT_ID || '',
-  R2_BUCKET_NAME: process.env.S3_BUCKET || process.env.R2_BUCKET_NAME || 'qota-ota',
+  R2_BUCKET_NAME: BUCKET,
   JWT_SECRET,
   R2_ACCESS_KEY_ID: process.env.S3_ACCESS_KEY_ID || process.env.R2_ACCESS_KEY_ID || '',
   R2_SECRET_ACCESS_KEY: process.env.S3_SECRET_ACCESS_KEY || process.env.R2_SECRET_ACCESS_KEY || '',
@@ -134,7 +155,11 @@ serve({ fetch: root.fetch, port: PORT }, (info) => {
   console.log(`qota listening on http://0.0.0.0:${info.port}`);
   console.log(`  db:         ${SQLITE_PATH}`);
   console.log(`  web:        ${hasWeb ? WEB_DIST : '(none)'}`);
-  console.log(`  s3 endpoint:${env.S3_ENDPOINT || `r2:${env.R2_ACCOUNT_ID}`}`);
+  console.log(
+    `  storage:    ${
+      STORAGE_DRIVER === 'local' ? `local folder (${STORAGE_DIR})` : `s3 (${env.S3_ENDPOINT || `r2:${env.R2_ACCOUNT_ID}`})`
+    }`,
+  );
 });
 
 // ---- first-run admin seed -------------------------------------------------
