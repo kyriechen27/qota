@@ -142,6 +142,15 @@ export default function ProjectDetail() {
     }
   }
 
+  async function restoreVer(v: Version) {
+    try {
+      await api.updateVersion(v.id, { status: 'ready' });
+      await load();
+    } catch (e: any) {
+      setErr(e?.message);
+    }
+  }
+
   async function createToken(e: FormEvent) {
     e.preventDefault();
     setErr(null);
@@ -251,6 +260,11 @@ export default function ProjectDetail() {
                   {v.status === 'ready' && (
                     <button onClick={() => archiveVer(v)} style={{ marginRight: 6 }}>
                       {t('pd.archive')}
+                    </button>
+                  )}
+                  {v.status === 'archived' && (
+                    <button onClick={() => restoreVer(v)} style={{ marginRight: 6 }}>
+                      {t('pd.restore')}
                     </button>
                   )}
                   <button className="danger" onClick={() => deleteVer(v)}>

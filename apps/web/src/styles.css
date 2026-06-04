@@ -223,7 +223,10 @@ tr:hover td { background: #1a1f2a; }
 .progress > div { height: 100%; background: var(--accent); transition: width 0.2s; }
 
 @media (max-width: 800px) {
-  .app { grid-template-columns: 1fr; }
+  /* Stack into a top bar + content. Without explicit rows the two auto rows
+     get stretched equally (grid align-content defaults to stretch) and the
+     top bar balloons to ~half the viewport. auto/1fr keeps it compact. */
+  .app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
   .sidebar { border-right: none; border-bottom: 1px solid var(--border); flex-direction: row; flex-wrap: wrap; align-items: center; }
   .brand { border-bottom: none; padding: 0 12px 0 0; margin: 0 12px 0 0; }
   .sidebar .spacer { display: none; }
