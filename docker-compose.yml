@@ -1,0 +1,57 @@
+# Self-hosted qota: app (API + web) + MinIO (S3-compatible) + SQLite volume.
+# Copy .env.example to .env and set JWT_SECRET before `docker compose up`.
+
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-qotaadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-qotasecret123}
+    ports:
+      - "9000:9000"   # S3 API (also used by browser/device presigned URLs)
+      - "9001:9001"   # MinIO console
+    volumes:
+      - minio-data:/data
+    restart: unless-stopped
+
+  # One-shot: create the bucket on first boot.
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 ${S3_ACCESS_KEY_ID:-qotaadmin} ${S3_SECRET_ACCESS_KEY:-qotasecret123}; do echo 'waiting for minio...'; sleep 2; done;
+      mc mb -p local/${S3_BUCKET:-qota-ota} || true;
+      echo 'bucket ready';
+      "
+
+  app:
+    build: .
+    depends_on:
+      - minio
+      - createbuckets
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (openssl rand -hex 32)}
+      ALLOWED_ORIGINS: "*"
+      # Storage — internal endpoint for the server, public endpoint for clients.
+      S3_ENDPOINT: http://minio:9000
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost:9000}
+      S3_REGION: us-east-1
+      S3_BUCKET: ${S3_BUCKET:-qota-ota}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-qotaadmin}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-qotasecret123}
+      # First-run admin (created only if the users table is empty).
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin12345}
+    volumes:
+      - qota-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  minio-data:
+  qota-data:

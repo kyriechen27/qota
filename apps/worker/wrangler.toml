@@ -1,0 +1,42 @@
+name = "qota-api"
+main = "src/index.ts"
+compatibility_date = "2024-11-12"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# Allowed origins for the web admin (CORS). Comma-separated.
+ALLOWED_ORIGINS = "http://localhost:5173"
+
+# JWT lifetime for browser sessions (seconds). 12h default.
+JWT_TTL_SECONDS = "43200"
+
+# Presigned download URL lifetime (seconds). 5min per spec.
+DOWNLOAD_URL_TTL_SECONDS = "300"
+
+# Presigned upload-part URL lifetime (seconds). 10min default.
+UPLOAD_PART_URL_TTL_SECONDS = "600"
+
+# R2 S3-compatible endpoint config. ACCOUNT_ID and BUCKET_NAME are
+# safe to keep in plaintext; the secret access keys are in secrets.
+R2_ACCOUNT_ID = "REPLACE_WITH_YOUR_ACCOUNT_ID"
+R2_BUCKET_NAME = "qota-ota"
+
+# === Secrets (set via `wrangler secret put` in production) ===
+# JWT_SECRET             — required, random 32+ bytes
+# R2_ACCESS_KEY_ID       — required, from Cloudflare > R2 > Manage API Tokens
+# R2_SECRET_ACCESS_KEY   — required, paired with the access key id
+#
+# Locally, put these in apps/worker/.dev.vars (see .dev.vars.example).
+
+# === D1 database binding ===
+[[d1_databases]]
+binding = "DB"
+database_name = "qota-db"
+database_id = "REPLACE_WITH_D1_ID_AFTER_CREATE"
+migrations_dir = "migrations"
+
+# NOTE: We deliberately do NOT bind R2 to the worker via [[r2_buckets]].
+# All R2 access goes through the S3 endpoint with aws4fetch, so the worker
+# can issue presigned URLs for browser/device direct transfer. If you also
+# want fallback direct-bucket operations, you can add an [[r2_buckets]]
+# binding here without conflict.

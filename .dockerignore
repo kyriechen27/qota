@@ -1,0 +1,13 @@
+node_modules
+**/node_modules
+**/dist
+**/dist-node
+**/.wrangler
+.git
+.gitignore
+**/*.log
+apps/worker/data
+data
+*.local
+**/.dev.vars
+.env

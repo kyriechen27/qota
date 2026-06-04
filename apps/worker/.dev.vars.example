@@ -1,0 +1,10 @@
+# Copy to `.dev.vars` for local `wrangler dev`. Do NOT commit `.dev.vars`.
+# Generate JWT_SECRET via:  openssl rand -hex 32
+
+JWT_SECRET="change-me-to-a-long-random-string-32bytes-min"
+
+# Cloudflare R2 S3-compatible credentials. Create them under:
+#   Cloudflare dashboard → R2 → Manage R2 API Tokens → Create API token
+# Permission: Object Read & Write, scoped to bucket qota-ota.
+R2_ACCESS_KEY_ID="REPLACE_ME"
+R2_SECRET_ACCESS_KEY="REPLACE_ME"

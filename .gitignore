@@ -1,0 +1,42 @@
+# Dependencies
+node_modules
+
+# Build / compilation output
+dist
+dist-node
+build
+*.tsbuildinfo
+
+# Cloudflare Wrangler / Miniflare
+.wrangler
+.miniflare
+
+# Local runtime data (D1 / SQLite)
+apps/worker/data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+
+# Secrets & local env
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.env
+.env.*
+!.env.example
+
+# Caches & coverage
+.cache
+coverage
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+
+# Editors
+.vscode/*
+!.vscode/extensions.json
+.idea
