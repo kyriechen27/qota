@@ -51,7 +51,7 @@ const zh: Dict = {
 
   // login
   'login.subtitle': 'OTA 版本管理平台',
-  'login.email': '邮箱',
+  'login.email': '邮箱或用户名',
   'login.password': '密码',
   'login.signin': '登录',
   'login.signingin': '登录中…',
@@ -294,7 +294,7 @@ const en: Dict = {
   'nav.signout': 'Sign out',
 
   'login.subtitle': 'OTA Version Manager',
-  'login.email': 'Email',
+  'login.email': 'Email or username',
   'login.password': 'Password',
   'login.signin': 'Sign in',
   'login.signingin': 'Signing in…',

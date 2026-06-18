@@ -7,7 +7,7 @@ export default function Login() {
   const { login } = useAuth();
   const { t } = useI18n();
   const nav = useNavigate();
-  const [email, setEmail] = useState('');
+  const [identifier, setIdentifier] = useState('');
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -17,7 +17,7 @@ export default function Login() {
     setBusy(true);
     setErr(null);
     try {
-      await login(email.trim(), password);
+      await login(identifier.trim(), password);
       nav('/');
     } catch (e: any) {
       setErr(e?.message ?? t('login.failed'));
@@ -34,9 +34,9 @@ export default function Login() {
         <label>
           <span className="lbl">{t('login.email')}</span>
           <input
-            type="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
+            type="text"
+            value={identifier}
+            onChange={(e) => setIdentifier(e.target.value)}
             autoComplete="username"
             required
             style={{ width: '100%' }}

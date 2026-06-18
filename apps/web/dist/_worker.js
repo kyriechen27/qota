@@ -2320,23 +2320,37 @@ function dto(r) {
 }
 authRoutes.post("/login", async (c) => {
   const body = await c.req.json().catch(() => ({}));
-  const email = body.email?.trim().toLowerCase();
+  const identifier = body.email?.trim();
   const password = body.password;
-  if (!email || !password) throw badRequest("email and password required");
-  const row = await c.env.DB.prepare(
-    `SELECT u.id, u.email, u.password_hash, u.display_name, ${EFFECTIVE_GLOBAL_ROLE_SQL} AS role,
+  if (!identifier || !password) throw badRequest("email or username and password required");
+  const userSelectSql = `SELECT u.id, u.email, u.password_hash, u.display_name, ${EFFECTIVE_GLOBAL_ROLE_SQL} AS role,
             u.is_active, u.created_at, u.updated_at
        FROM users u
-       LEFT JOIN user_global_roles ugr ON ugr.user_id = u.id
+       LEFT JOIN user_global_roles ugr ON ugr.user_id = u.id`;
+  const email = identifier.toLowerCase();
+  const emailRow = await c.env.DB.prepare(
+    `${userSelectSql}
       WHERE u.email = ?`
   ).bind(email).first();
-  if (!row || !row.is_active) {
-    await audit(c, { actorType: "system", action: "auth.login.failed", meta: { email } });
-    throw unauthorized("invalid credentials");
+  const candidates = emailRow ? [emailRow] : (await c.env.DB.prepare(
+    `${userSelectSql}
+            WHERE LOWER(u.display_name) = LOWER(?)
+            ORDER BY u.id ASC`
+  ).bind(identifier).all()).results;
+  let row = null;
+  for (const candidate of candidates) {
+    if (!candidate.is_active) continue;
+    if (await verifyPassword(password, candidate.password_hash)) {
+      row = candidate;
+      break;
+    }
   }
-  const ok = await verifyPassword(password, row.password_hash);
-  if (!ok) {
-    await audit(c, { actorType: "system", action: "auth.login.failed", meta: { email, userId: row.id } });
+  if (!row) {
+    await audit(c, {
+      actorType: "system",
+      action: "auth.login.failed",
+      meta: { identifier, userId: candidates[0]?.id }
+    });
     throw unauthorized("invalid credentials");
   }
   const ttl = Number(c.env.JWT_TTL_SECONDS) || 43200;

@@ -65,8 +65,11 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 export const api = {
   // Auth
-  login: (email: string, password: string) =>
-    request<LoginResponse>('/api/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }),
+  login: (identifier: string, password: string) =>
+    request<LoginResponse>('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email: identifier, password }),
+    }),
   me: () => request<User>('/api/auth/me'),
   changePassword: (oldPassword: string, newPassword: string) =>
     request<{ ok: true }>('/api/auth/change-password', {
