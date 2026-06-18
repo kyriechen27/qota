@@ -18,6 +18,8 @@ import migration0001 from './migrations/0001_init.sql';
 import migration0002 from './migrations/0002_download_count.sql';
 import migration0003 from './migrations/0003_public_versions.sql';
 import migration0004 from './migrations/0004_api_token_secret.sql';
+import migration0005 from './migrations/0005_current_version.sql';
+import migration0006 from './migrations/0006_global_roles.sql';
 
 interface PagesEnv extends Bindings {
   ASSETS: Fetcher;
@@ -50,6 +52,7 @@ async function ensureSchema(env: PagesEnv): Promise<void> {
       ...statements(migration0002),
       ...statements(migration0003),
       ...statements(migration0004),
+      ...statements(migration0005),
     ]) {
       await env.DB.prepare(stmt).run();
     }
@@ -62,6 +65,8 @@ async function ensureSchema(env: PagesEnv): Promise<void> {
   // no-op once its column exists.
   await ensureColumn(env, 'versions', 'public_slug', statements(migration0003));
   await ensureColumn(env, 'api_tokens', 'token_enc', statements(migration0004));
+  await ensureColumn(env, 'projects', 'current_version', statements(migration0005));
+  await ensureGlobalRoles(env, statements(migration0006));
   schemaReady = true;
 }
 
@@ -76,6 +81,16 @@ async function ensureColumn(env: PagesEnv, table: string, column: string, stmts:
   if (row && typeof row.sql === 'string' && !row.sql.includes(column)) {
     for (const stmt of stmts) await env.DB.prepare(stmt).run();
     console.log(`[schema] added ${table}.${column}`);
+  }
+}
+
+async function ensureGlobalRoles(env: PagesEnv, stmts: string[]): Promise<void> {
+  const row = await env.DB.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'user_global_roles'",
+  ).first();
+  if (!row) {
+    for (const stmt of stmts) await env.DB.prepare(stmt).run();
+    console.log('[schema] added user_global_roles');
   }
 }
 

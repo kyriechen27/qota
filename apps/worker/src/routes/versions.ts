@@ -28,6 +28,7 @@ interface VersionRow {
   content_type: string | null;
   notes: string | null;
   is_mandatory: number;
+  current_version: string | null;
   min_version: string | null;
   max_version: string | null;
   rollout_percentage: number;
@@ -53,6 +54,7 @@ export function versionDto(r: VersionRow) {
     contentType: r.content_type,
     notes: r.notes,
     isMandatory: !!r.is_mandatory,
+    isCurrent: r.current_version === r.version,
     minVersion: r.min_version,
     maxVersion: r.max_version,
     rolloutPercentage: r.rollout_percentage,
@@ -74,19 +76,21 @@ versionRoutes.get('/', async (c) => {
   await requireProjectAccess(c.env.DB, user, projectId, 'view');
   const includePending = c.req.query('includePending') === '1';
   const channel = c.req.query('channel');
-  const where: string[] = ['project_id = ?'];
+  const where: string[] = ['v.project_id = ?'];
   const args: unknown[] = [projectId];
   if (!includePending) {
-    where.push(`status != 'pending'`);
+    where.push(`v.status != 'pending'`);
   }
   if (channel) {
-    where.push('release_channel = ?');
+    where.push('v.release_channel = ?');
     args.push(channel);
   }
   const rows = await c.env.DB.prepare(
-    `SELECT id, project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
-            is_mandatory, min_version, max_version, rollout_percentage, device_group_id, download_count, public_slug, uploaded_by, created_at, updated_at
-       FROM versions WHERE ${where.join(' AND ')} ORDER BY created_at DESC`,
+    `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type, v.notes,
+            v.is_mandatory, p.current_version, v.min_version, v.max_version, v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug, v.uploaded_by, v.created_at, v.updated_at
+       FROM versions v
+       JOIN projects p ON p.id = v.project_id
+      WHERE ${where.join(' AND ')} ORDER BY v.created_at DESC`,
   )
     .bind(...args)
     .all<VersionRow>();
@@ -130,7 +134,7 @@ versionRoutes.get('/accessible', async (c) => {
   }
   const rows = await c.env.DB.prepare(
     `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size,
-            v.sha256, v.content_type, v.notes, v.is_mandatory, v.min_version, v.max_version,
+            v.sha256, v.content_type, v.notes, v.is_mandatory, p.current_version, v.min_version, v.max_version,
             v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug,
             v.uploaded_by, v.created_at, v.updated_at,
             p.code AS project_code, p.name AS project_name,
@@ -151,9 +155,11 @@ versionRoutes.get('/:id', async (c) => {
   if (!Number.isFinite(id)) throw badRequest('invalid id');
   const user = c.get('user')!;
   const row = await c.env.DB.prepare(
-    `SELECT id, project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
-            is_mandatory, min_version, max_version, rollout_percentage, device_group_id, download_count, public_slug, uploaded_by, created_at, updated_at
-       FROM versions WHERE id = ?`,
+    `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type, v.notes,
+            v.is_mandatory, p.current_version, v.min_version, v.max_version, v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug, v.uploaded_by, v.created_at, v.updated_at
+       FROM versions v
+       JOIN projects p ON p.id = v.project_id
+      WHERE v.id = ?`,
   )
     .bind(id)
     .first<VersionRow>();
@@ -166,9 +172,9 @@ versionRoutes.patch('/:id', async (c) => {
   const id = Number(c.req.param('id'));
   if (!Number.isFinite(id)) throw badRequest('invalid id');
   const user = c.get('user')!;
-  const existing = await c.env.DB.prepare('SELECT project_id FROM versions WHERE id = ?')
+  const existing = await c.env.DB.prepare('SELECT project_id, version, status FROM versions WHERE id = ?')
     .bind(id)
-    .first<{ project_id: number }>();
+    .first<{ project_id: number; version: string; status: VersionRow['status'] }>();
   if (!existing) throw notFound();
   const proj = await requireProjectAccess(c.env.DB, user, existing.project_id, 'manage_versions');
   type PatchBody = {
@@ -177,6 +183,7 @@ versionRoutes.patch('/:id', async (c) => {
     minVersion?: string | null;
     maxVersion?: string | null;
     rolloutPercentage?: number;
+    isCurrent?: boolean;
     status?: 'ready' | 'archived';
   };
   const body = (await c.req.json<PatchBody>().catch(() => ({} as PatchBody))) as PatchBody;
@@ -208,11 +215,48 @@ versionRoutes.patch('/:id', async (c) => {
     sets.push('status = ?');
     args.push(body.status);
   }
-  if (sets.length === 0) return c.json({ ok: true });
+  if (body.isCurrent !== undefined) {
+    const nextStatus = body.status ?? existing.status;
+    if (body.isCurrent && nextStatus !== 'ready') throw badRequest('only ready versions can be current');
+  }
+  const now = Date.now();
+  if (body.isCurrent) {
+    await c.env.DB.prepare('UPDATE projects SET current_version = ?, updated_at = ? WHERE id = ?')
+      .bind(existing.version, now, existing.project_id)
+      .run();
+  } else if (body.isCurrent === false) {
+    await c.env.DB.prepare('UPDATE projects SET current_version = NULL, updated_at = ? WHERE id = ? AND current_version = ?')
+      .bind(now, existing.project_id, existing.version)
+      .run();
+  }
+  if (sets.length === 0) {
+    const row = await c.env.DB.prepare(
+      `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type, v.notes,
+              v.is_mandatory, p.current_version, v.min_version, v.max_version, v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug, v.uploaded_by, v.created_at, v.updated_at
+         FROM versions v
+         JOIN projects p ON p.id = v.project_id
+        WHERE v.id = ?`,
+    )
+      .bind(id)
+      .first<VersionRow>();
+    return c.json(versionDto(row!));
+  }
   sets.push('updated_at = ?');
-  args.push(Date.now());
+  args.push(now);
   args.push(id);
   await c.env.DB.prepare(`UPDATE versions SET ${sets.join(', ')} WHERE id = ?`).bind(...args).run();
+  if (body.status === 'archived') {
+    const remaining = await c.env.DB.prepare(
+      `SELECT id FROM versions WHERE project_id = ? AND version = ? AND status = 'ready' LIMIT 1`,
+    )
+      .bind(existing.project_id, existing.version)
+      .first<{ id: number }>();
+    if (!remaining) {
+      await c.env.DB.prepare('UPDATE projects SET current_version = NULL, updated_at = ? WHERE id = ? AND current_version = ?')
+        .bind(now, existing.project_id, existing.version)
+        .run();
+    }
+  }
   await audit(c, {
     action: 'version.update',
     customerId: proj.customer_id,
@@ -222,9 +266,11 @@ versionRoutes.patch('/:id', async (c) => {
     meta: { fields: Object.keys(body) },
   });
   const row = await c.env.DB.prepare(
-    `SELECT id, project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
-            is_mandatory, min_version, max_version, rollout_percentage, device_group_id, download_count, public_slug, uploaded_by, created_at, updated_at
-       FROM versions WHERE id = ?`,
+    `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type, v.notes,
+            v.is_mandatory, p.current_version, v.min_version, v.max_version, v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug, v.uploaded_by, v.created_at, v.updated_at
+       FROM versions v
+       JOIN projects p ON p.id = v.project_id
+      WHERE v.id = ?`,
   )
     .bind(id)
     .first<VersionRow>();
@@ -289,9 +335,9 @@ versionRoutes.delete('/:id', async (c) => {
   const id = Number(c.req.param('id'));
   if (!Number.isFinite(id)) throw badRequest('invalid id');
   const me = c.get('user')!;
-  const row = await c.env.DB.prepare('SELECT project_id, r2_key FROM versions WHERE id = ?')
+  const row = await c.env.DB.prepare('SELECT project_id, version, r2_key FROM versions WHERE id = ?')
     .bind(id)
-    .first<{ project_id: number; r2_key: string }>();
+    .first<{ project_id: number; version: string; r2_key: string }>();
   if (!row) throw notFound();
   const proj = await requireProjectAccess(c.env.DB, me, row.project_id, 'manage_versions');
   const s3 = makeStorage(c.env);
@@ -301,6 +347,16 @@ versionRoutes.delete('/:id', async (c) => {
     console.warn('[versions.delete] R2 delete failed (will still drop metadata):', e);
   }
   await c.env.DB.prepare('DELETE FROM versions WHERE id = ?').bind(id).run();
+  const remaining = await c.env.DB.prepare(
+    `SELECT id FROM versions WHERE project_id = ? AND version = ? AND status = 'ready' LIMIT 1`,
+  )
+    .bind(row.project_id, row.version)
+    .first<{ id: number }>();
+  if (!remaining) {
+    await c.env.DB.prepare('UPDATE projects SET current_version = NULL, updated_at = ? WHERE id = ? AND current_version = ?')
+      .bind(Date.now(), row.project_id, row.version)
+      .run();
+  }
   await audit(c, {
     action: 'version.delete',
     customerId: proj.customer_id,

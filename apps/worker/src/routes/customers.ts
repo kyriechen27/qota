@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../env';
-import { requireUser, requireSuperAdmin } from '../middleware/auth';
+import { requireUser, requireAdmin } from '../middleware/auth';
 import { badRequest, conflict, notFound } from '../utils/errors';
 import {
   visibleCustomerIds,
@@ -69,8 +69,8 @@ customerRoutes.get('/:id', async (c) => {
   return c.json(dto(full!));
 });
 
-// Only super_admin can mint a new customer (tenancy bootstrap).
-customerRoutes.post('/', requireSuperAdmin, async (c) => {
+// Global admins can mint a new customer (tenancy bootstrap).
+customerRoutes.post('/', requireAdmin, async (c) => {
   type CreateBody = { code?: string; name?: string; description?: string };
   const body = (await c.req.json<CreateBody>().catch(() => ({} as CreateBody))) as CreateBody;
   if (!body.name) throw badRequest('name required');
@@ -133,7 +133,7 @@ customerRoutes.patch('/:id', async (c) => {
   return c.json(dto(row!));
 });
 
-customerRoutes.delete('/:id', requireSuperAdmin, async (c) => {
+customerRoutes.delete('/:id', requireAdmin, async (c) => {
   const id = Number(c.req.param('id'));
   if (!Number.isFinite(id)) throw badRequest('invalid id');
   const r = await c.env.DB.prepare('DELETE FROM customers WHERE id = ?').bind(id).run();

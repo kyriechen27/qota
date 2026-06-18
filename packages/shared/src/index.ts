@@ -1,20 +1,28 @@
-export type GlobalRole = 'super_admin' | 'developer';
+export type GlobalRole = 'super_admin' | 'admin' | 'developer' | 'observer';
 export type CustomerRole = 'customer_admin' | 'developer' | 'viewer';
 
 // Global role hierarchy (higher number = more privileged).
 export const GLOBAL_ROLE_RANK: Record<GlobalRole, number> = {
-  developer: 1,
-  super_admin: 2,
+  observer: 1,
+  developer: 2,
+  admin: 3,
+  super_admin: 4,
 };
+export const GLOBAL_ROLES: GlobalRole[] = ['super_admin', 'admin', 'developer', 'observer'];
 
 // Roles an operator may assign when switching another user's role.
 // The top role (super_admin) may assign its own level and below; any other
 // role may assign only roles strictly below its own.
 export function assignableGlobalRoles(actorRole: GlobalRole): GlobalRole[] {
-  const all: GlobalRole[] = ['super_admin', 'developer'];
   const mine = GLOBAL_ROLE_RANK[actorRole];
   const isTop = mine >= GLOBAL_ROLE_RANK.super_admin;
-  return all.filter((r) => (isTop ? GLOBAL_ROLE_RANK[r] <= mine : GLOBAL_ROLE_RANK[r] < mine));
+  return GLOBAL_ROLES.filter((r) => (isTop ? GLOBAL_ROLE_RANK[r] <= mine : GLOBAL_ROLE_RANK[r] < mine));
+}
+
+export function canManageGlobalRole(actorRole: GlobalRole, targetRole: GlobalRole): boolean {
+  const mine = GLOBAL_ROLE_RANK[actorRole];
+  const isTop = mine >= GLOBAL_ROLE_RANK.super_admin;
+  return isTop ? GLOBAL_ROLE_RANK[targetRole] <= mine : GLOBAL_ROLE_RANK[targetRole] < mine;
 }
 
 export interface User {
@@ -43,6 +51,7 @@ export interface Project {
   name: string;
   description: string | null;
   defaultChannel: string;
+  currentVersion: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -62,6 +71,7 @@ export interface Version {
   contentType: string | null;
   notes: string | null;
   isMandatory: boolean;
+  isCurrent: boolean;
   minVersion: string | null;
   maxVersion: string | null;
   rolloutPercentage: number;
@@ -193,6 +203,8 @@ export interface UploadInitRequest {
   minVersion?: string | null;
   maxVersion?: string | null;
   rolloutPercentage?: number;
+  /** Replace the existing row when (project, version, releaseChannel) already exists. */
+  overwriteExisting?: boolean;
   /** Hex SHA-256, client-computed. Will be re-verified on complete if provided. */
   expectedSha256?: string;
   /** Suggested by client; clamped to [5MB, 64MB] on server. */

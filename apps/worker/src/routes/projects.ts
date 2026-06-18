@@ -21,6 +21,7 @@ interface ProjectRow {
   name: string;
   description: string | null;
   default_channel: string;
+  current_version: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -33,6 +34,7 @@ function dto(r: ProjectRow) {
     name: r.name,
     description: r.description,
     defaultChannel: r.default_channel,
+    currentVersion: r.current_version,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -40,6 +42,7 @@ function dto(r: ProjectRow) {
 
 const CODE_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const CHANNEL_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+const VERSION_RE = /^[A-Za-z0-9._+-]{1,64}$/;
 
 projectRoutes.get('/', async (c) => {
   const user = c.get('user')!;
@@ -61,7 +64,7 @@ projectRoutes.get('/', async (c) => {
   }
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   const rows = await c.env.DB.prepare(
-    `SELECT id, customer_id, code, name, description, default_channel, created_at, updated_at FROM projects ${where} ORDER BY name ASC`,
+    `SELECT id, customer_id, code, name, description, default_channel, current_version, created_at, updated_at FROM projects ${where} ORDER BY name ASC`,
   )
     .bind(...args)
     .all<ProjectRow>();
@@ -74,7 +77,7 @@ projectRoutes.get('/:id', async (c) => {
   const user = c.get('user')!;
   await requireProjectAccess(c.env.DB, user, id, 'view');
   const row = await c.env.DB.prepare(
-    'SELECT id, customer_id, code, name, description, default_channel, created_at, updated_at FROM projects WHERE id = ?',
+    'SELECT id, customer_id, code, name, description, default_channel, current_version, created_at, updated_at FROM projects WHERE id = ?',
   )
     .bind(id)
     .first<ProjectRow>();
@@ -128,7 +131,7 @@ projectRoutes.post('/', async (c) => {
     .run();
   const id = Number(r.meta.last_row_id);
   const row = await c.env.DB.prepare(
-    'SELECT id, customer_id, code, name, description, default_channel, created_at, updated_at FROM projects WHERE id = ?',
+    'SELECT id, customer_id, code, name, description, default_channel, current_version, created_at, updated_at FROM projects WHERE id = ?',
   )
     .bind(id)
     .first<ProjectRow>();
@@ -147,13 +150,20 @@ projectRoutes.patch('/:id', async (c) => {
   const id = Number(c.req.param('id'));
   if (!Number.isFinite(id)) throw badRequest('invalid id');
   const user = c.get('user')!;
-  const proj = await requireProjectAccess(c.env.DB, user, id, 'manage_projects');
   type PatchBody = {
     name?: string;
     description?: string | null;
     defaultChannel?: string;
+    currentVersion?: string | null;
   };
   const body = (await c.req.json<PatchBody>().catch(() => ({} as PatchBody))) as PatchBody;
+  const projectFields = body.name !== undefined || body.description !== undefined || body.defaultChannel !== undefined;
+  const proj = await requireProjectAccess(
+    c.env.DB,
+    user,
+    id,
+    projectFields ? 'manage_projects' : 'manage_versions',
+  );
   const sets: string[] = [];
   const args: unknown[] = [];
   if (body.name !== undefined) {
@@ -169,13 +179,26 @@ projectRoutes.patch('/:id', async (c) => {
     sets.push('default_channel = ?');
     args.push(body.defaultChannel);
   }
+  if (body.currentVersion !== undefined) {
+    if (body.currentVersion !== null) {
+      if (!VERSION_RE.test(body.currentVersion)) throw badRequest('currentVersion invalid');
+      const ready = await c.env.DB.prepare(
+        `SELECT id FROM versions WHERE project_id = ? AND version = ? AND status = 'ready' LIMIT 1`,
+      )
+        .bind(id, body.currentVersion)
+        .first<{ id: number }>();
+      if (!ready) throw badRequest('currentVersion must match a ready version');
+    }
+    sets.push('current_version = ?');
+    args.push(body.currentVersion);
+  }
   if (sets.length === 0) return c.json({ ok: true });
   sets.push('updated_at = ?');
   args.push(Date.now());
   args.push(id);
   await c.env.DB.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE id = ?`).bind(...args).run();
   const row = await c.env.DB.prepare(
-    'SELECT id, customer_id, code, name, description, default_channel, created_at, updated_at FROM projects WHERE id = ?',
+    'SELECT id, customer_id, code, name, description, default_channel, current_version, created_at, updated_at FROM projects WHERE id = ?',
   )
     .bind(id)
     .first<ProjectRow>();

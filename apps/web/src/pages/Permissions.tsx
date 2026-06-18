@@ -13,6 +13,20 @@ type Row =
 
 const ROLES: CustomerRole[] = ['customer_admin', 'developer', 'viewer'];
 
+function userLabel(u: User): string {
+  const name = u.displayName?.trim();
+  return name ? `${name} (${u.email})` : u.email;
+}
+
+function customerLabel(c: Customer): string {
+  return `${c.name} (${c.code})`;
+}
+
+function projectLabel(p: Project, customer?: Customer): string {
+  const label = `${p.name} (${p.code})`;
+  return customer ? `${label} / ${customerLabel(customer)}` : label;
+}
+
 export default function Memberships() {
   const { t } = useI18n();
   const [users, setUsers] = useState<User[]>([]);
@@ -64,10 +78,10 @@ export default function Memberships() {
   function scopeLabel(r: Row): string {
     if (r.scope === 'customer') {
       const c = custMap.get(r.customerId);
-      return c ? `${c.code} (${c.name})` : `#${r.customerId}`;
+      return c ? customerLabel(c) : `#${r.customerId}`;
     }
     const p = projMap.get(r.projectId);
-    return p ? `${p.code} (${p.name})` : `#${r.projectId}`;
+    return p ? projectLabel(p, custMap.get(p.customerId)) : `#${r.projectId}`;
   }
 
   async function grant(e: FormEvent) {
@@ -117,14 +131,14 @@ export default function Memberships() {
         <select value={filterCustomer} onChange={(e) => { setFilterCustomer(e.target.value ? Number(e.target.value) : ''); setFilterProject(''); }}>
           <option value="">{t('mem.allCustomers')}</option>
           {customers.map((c) => (
-            <option key={c.id} value={c.id}>{c.code} — {c.name}</option>
+            <option key={c.id} value={c.id}>{customerLabel(c)}</option>
           ))}
         </select>
         <select value={filterProject} onChange={(e) => { setFilterProject(e.target.value ? Number(e.target.value) : ''); }}>
           <option value="">{t('mem.projectFilter')}</option>
           {projects.map((p) => (
             <option key={p.id} value={p.id}>
-              {custMap.get(p.customerId)?.code ?? '?'} / {p.code}
+              {projectLabel(p, custMap.get(p.customerId))}
             </option>
           ))}
         </select>
@@ -150,7 +164,7 @@ export default function Memberships() {
             const u = userMap.get(r.userId);
             return (
               <tr key={`${r.scope}-${r.id}`}>
-                <td>{u ? u.email : `#${r.userId}`}</td>
+                <td>{u ? userLabel(u) : `#${r.userId}`}</td>
                 <td><span className="tag">{t(`mscope.${r.scope}`)}</span></td>
                 <td><span className="code">{scopeLabel(r)}</span></td>
                 <td>
@@ -189,7 +203,7 @@ export default function Memberships() {
               >
                 <option value={0} disabled>{t('common.select')}</option>
                 {users.map((u) => (
-                  <option key={u.id} value={u.id}>{u.email}</option>
+                  <option key={u.id} value={u.id}>{userLabel(u)}</option>
                 ))}
               </select>
             </label>
@@ -215,11 +229,11 @@ export default function Memberships() {
                 <option value={0} disabled>{t('common.select')}</option>
                 {form.scope === 'customer'
                   ? customers.map((c) => (
-                      <option key={c.id} value={c.id}>{c.code} — {c.name}</option>
+                      <option key={c.id} value={c.id}>{customerLabel(c)}</option>
                     ))
                   : projects.map((p) => (
                       <option key={p.id} value={p.id}>
-                        {custMap.get(p.customerId)?.code ?? '?'} / {p.code} — {p.name}
+                        {projectLabel(p, custMap.get(p.customerId))}
                       </option>
                     ))}
               </select>

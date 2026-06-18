@@ -2,7 +2,13 @@ import { useEffect, useState, type FormEvent } from 'react';
 import { api } from '../lib/api';
 import { useAuth } from '../lib/auth';
 import { useI18n } from '../lib/i18n';
-import { assignableGlobalRoles, type GlobalRole, type User } from '@qota/shared';
+import {
+  GLOBAL_ROLES,
+  assignableGlobalRoles,
+  canManageGlobalRole,
+  type GlobalRole,
+  type User,
+} from '@qota/shared';
 
 export default function Users() {
   const { t } = useI18n();
@@ -17,6 +23,7 @@ export default function Users() {
     role: 'developer',
   });
   const [busy, setBusy] = useState(false);
+  const createRoleOptions = me ? assignableGlobalRoles(me.role) : [];
 
   async function load() {
     try {
@@ -94,7 +101,15 @@ export default function Users() {
     <>
       <h2 className="page-title">{t('users.title')}</h2>
       <div className="page-actions">
-        <button className="primary" onClick={() => setOpen(true)}>{t('users.new')}</button>
+        <button
+          className="primary"
+          onClick={() => {
+            setForm((cur) => ({ ...cur, role: createRoleOptions.includes(cur.role) ? cur.role : (createRoleOptions[0] ?? 'developer') }));
+            setOpen(true);
+          }}
+        >
+          {t('users.new')}
+        </button>
       </div>
       {err && <div className="error" style={{ marginBottom: 12 }}>{err}</div>}
       <table>
@@ -112,8 +127,14 @@ export default function Users() {
           {users.map((u) => {
             const superAdmins = users.filter((x) => x.role === 'super_admin').length;
             const isLastSuperAdmin = u.role === 'super_admin' && superAdmins <= 1;
-            const assignable = me ? assignableGlobalRoles(me.role) : [];
+            const canManageUser = me ? canManageGlobalRole(me.role, u.role) : false;
+            const assignable = me && canManageUser ? assignableGlobalRoles(me.role) : [];
             const roleOptions = assignable.includes(u.role) ? assignable : [u.role, ...assignable];
+            const disabledTitle = isLastSuperAdmin
+              ? t('users.lastSuperAdmin')
+              : !canManageUser
+                ? t('users.roleProtected')
+                : undefined;
             return (
               <tr key={u.id}>
                 <td>{u.id}</td>
@@ -123,8 +144,8 @@ export default function Users() {
                   <select
                     className={`role-select ${u.role}`}
                     value={u.role}
-                    disabled={roleOptions.length <= 1 || isLastSuperAdmin}
-                    title={isLastSuperAdmin ? t('users.lastSuperAdmin') : undefined}
+                    disabled={roleOptions.length <= 1 || isLastSuperAdmin || !canManageUser}
+                    title={disabledTitle}
                     onChange={(e) => changeRole(u, e.target.value as GlobalRole)}
                   >
                     {roleOptions.map((r) => (
@@ -137,17 +158,19 @@ export default function Users() {
                   <button
                     onClick={() => toggle(u)}
                     style={{ marginRight: 6 }}
-                    disabled={u.isActive && isLastSuperAdmin}
-                    title={u.isActive && isLastSuperAdmin ? t('users.lastSuperAdmin') : undefined}
+                    disabled={(u.isActive && isLastSuperAdmin) || !canManageUser}
+                    title={disabledTitle}
                   >
                     {u.isActive ? t('users.disable') : t('users.enable')}
                   </button>
-                  <button onClick={() => resetPassword(u)} style={{ marginRight: 6 }}>{t('users.resetPw')}</button>
+                  <button onClick={() => resetPassword(u)} style={{ marginRight: 6 }} disabled={!canManageUser} title={disabledTitle}>
+                    {t('users.resetPw')}
+                  </button>
                   <button
                     className="danger"
                     onClick={() => remove(u)}
-                    disabled={isLastSuperAdmin}
-                    title={isLastSuperAdmin ? t('users.lastSuperAdmin') : undefined}
+                    disabled={isLastSuperAdmin || !canManageUser}
+                    title={disabledTitle}
                   >
                     {t('common.delete')}
                   </button>
@@ -177,8 +200,11 @@ export default function Users() {
             <label>
               <span className="lbl">{t('users.fldRole')}</span>
               <select value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value as GlobalRole })} style={{ width: '100%' }}>
-                <option value="developer">{t('role.developer')}</option>
-                <option value="super_admin">{t('role.super_admin')}</option>
+                {(createRoleOptions.length ? createRoleOptions : GLOBAL_ROLES).map((role) => (
+                  <option key={role} value={role}>
+                    {t(`role.${role}`)}
+                  </option>
+                ))}
               </select>
             </label>
             <div className="dialog-actions">

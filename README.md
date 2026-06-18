@@ -3,15 +3,17 @@
 OTA 升级包多租户版本管理平台,部署到 Cloudflare Workers + Pages,文件存 R2(走 S3
 兼容端点直传 / 短期 presigned 下载),元数据存 D1。完整审计日志。
 
-> **自托管 / 本地无需对象存储**:同一套代码也能跑在 Node 运行时(`npm run dev:node`、
+> **自托管 / 本地无需对象存储**:同一套代码也能跑在 Node 运行时(`npm run dev`、
 > Docker),默认把文件存到**本地文件夹**,不需要 MinIO/S3——见 [DEPLOY.md](DEPLOY.md)。
 > 配了 S3/R2 就自动切换为对象桶;Cloudflare 部署始终用 R2 桶。
 
 ## 角色 & 权限模型
 
-**全局角色**(users.role)
+**全局角色**
 - `super_admin` — 隐式拥有所有客户/项目的全部权限
+- `admin` — 全局管理,但不能管理超级管理员或同级管理员
 - `developer` — 没有全局权限,所有访问通过 memberships 授权
+- `observer` — 全局只读 + 下载
 
 **租户内角色**(memberships.role / project_memberships.role)
 - `customer_admin` — 该客户/项目的全部权限,可发放/吊销成员、API token、版本
@@ -36,7 +38,7 @@ qota/
 │   │   │   ├── env.ts
 │   │   │   ├── routes/
 │   │   │   │   ├── auth.ts         # login / me / change-password
-│   │   │   │   ├── users.ts        # super_admin user CRUD
+│   │   │   │   ├── users.ts        # super_admin/admin user CRUD
 │   │   │   │   ├── customers.ts    # tenant CRUD
 │   │   │   │   ├── projects.ts     # project CRUD (per customer)
 │   │   │   │   ├── memberships.ts  # role grants (customer + project)
@@ -45,7 +47,7 @@ qota/
 │   │   │   │   ├── upload.ts       # multipart init/sign-part/complete/abort/sessions
 │   │   │   │   ├── download.ts     # user grant + device 302 → R2 presigned
 │   │   │   │   └── audit.ts        # log reader (scope-filtered)
-│   │   │   ├── middleware/auth.ts  # requireUser / requireSuperAdmin
+│   │   │   ├── middleware/auth.ts  # requireUser / requireAdmin
 │   │   │   ├── lib/
 │   │   │   │   ├── memberships.ts  # permission resolver
 │   │   │   │   ├── s3.ts           # R2 S3 client (aws4fetch): multipart + presign
@@ -81,25 +83,38 @@ qota/
 ```bash
 cd ~/workspace/qota
 npm install
+npm run dev
 ```
 
-### 1. Worker 本地凭据
+`npm run dev` 使用 Node 运行时:API 在 http://127.0.0.1:8080,Vite 在
+http://localhost:5173,文件默认存到 `apps/worker/data/blobs`,不需要 R2/MinIO。
+第一次启动如果数据库为空,会自动创建 `ADMIN_EMAIL` / `ADMIN_PASSWORD`
+(默认 `admin@example.com` / `admin12345`)。
+
+### 其他启动方式
+
+```bash
+npm run docker      # Docker Compose,访问 http://localhost:8080
+npm run cloudflare  # Wrangler Pages 本地模拟,访问 wrangler 输出的本地地址
+```
+
+`npm run docker` 需要根目录 `.env` 中设置 `JWT_SECRET`。可以从模板开始:
+
+```bash
+cp .env.example .env
+# 编辑 JWT_SECRET,例如: openssl rand -hex 32
+```
+
+`npm run cloudflare` 使用 Cloudflare Pages/Workers 模拟环境,适合检查 D1/R2
+部署行为。它需要 Cloudflare 绑定和 R2/D1 配置;普通本地开发优先用
+`npm run dev`。
+
+### Cloudflare 本地凭据
 
 ```bash
 cp apps/worker/.dev.vars.example apps/worker/.dev.vars
 # 编辑 .dev.vars,填入 JWT_SECRET (openssl rand -hex 32) 和你的 R2 S3 keys。
-# 注意:这套 .dev.vars 用于 `npm run dev`(wrangler)——它模拟 Cloudflare、没有本地磁盘,
-# 所以必须连真的 R2 桶(本地 wrangler 不能模拟 R2 multipart S3 endpoint)。
-# 推荐另起一个开发用桶,如 qota-ota-dev,wrangler.toml 里改 R2_BUCKET_NAME。
-#
-# 想零依赖本地开发?用 `npm run dev:node`(Node 运行时),不填 S3 即默认用本地文件夹,
-# 完全不需要 R2/MinIO。详见 DEPLOY.md。
-```
 
-### 2. R2 桶 + S3 凭据
-
-```bash
-# 创建桶(若还没建)
 npx wrangler r2 bucket create qota-ota
 
 # 创建 R2 S3 API token:Cloudflare dashboard → R2 → Manage API tokens
@@ -122,19 +137,13 @@ EOF
 npx wrangler r2 bucket cors put qota-ota --rules /tmp/qota-cors.json
 ```
 
-### 3. D1 + 迁移 + 种入第一个 super_admin
+### Cloudflare D1 迁移 + 种入第一个 super_admin
 
 ```bash
 npm run db:migrate:local
 
 ADMIN_EMAIL=admin@example.com ADMIN_PASSWORD='change-me-now' ADMIN_NAME='Root' \
   npm run -w apps/worker seed -- --local
-```
-
-### 4. 启动
-
-```bash
-npm run dev   # Worker 8787 + Vite 5173
 ```
 
 访问 http://localhost:5173,用刚才的邮箱登录。

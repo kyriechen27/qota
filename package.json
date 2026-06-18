@@ -8,10 +8,14 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "npm-run-all -p dev:worker dev:web",
+    "dev": "npm-run-all -p dev:node:worker dev:node:web",
+    "docker": "docker compose up --build",
+    "docker:detached": "docker compose up -d --build",
+    "cloudflare": "npm run pages:dev",
+    "cloudflare:worker": "npm-run-all -p dev:worker dev:web",
     "dev:worker": "npm -w apps/worker run dev",
     "dev:web": "npm -w apps/web run dev",
-    "dev:node": "npm-run-all -p dev:node:worker dev:node:web",
+    "dev:node": "npm run dev",
     "dev:node:worker": "npm -w apps/worker run dev:node",
     "dev:node:web": "VITE_API_PROXY=http://127.0.0.1:8080 npm -w apps/web run dev",
     "build": "npm -w apps/web run build",

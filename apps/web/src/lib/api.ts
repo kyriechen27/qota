@@ -100,7 +100,10 @@ export const api = {
   getProject: (id: number) => request<Project>(`/api/projects/${id}`),
   createProject: (body: { customerId: number; code?: string; name: string; description?: string; defaultChannel?: string }) =>
     request<Project>('/api/projects', { method: 'POST', body: JSON.stringify(body) }),
-  updateProject: (id: number, body: { name?: string; description?: string | null; defaultChannel?: string }) =>
+  updateProject: (
+    id: number,
+    body: { name?: string; description?: string | null; defaultChannel?: string; currentVersion?: string | null },
+  ) =>
     request<Project>(`/api/projects/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   deleteProject: (id: number) => request<{ ok: true }>(`/api/projects/${id}`, { method: 'DELETE' }),
 
@@ -146,6 +149,7 @@ export const api = {
       minVersion?: string | null;
       maxVersion?: string | null;
       rolloutPercentage?: number;
+      isCurrent?: boolean;
       status?: 'ready' | 'archived';
     },
   ) => request<Version>(`/api/versions/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),

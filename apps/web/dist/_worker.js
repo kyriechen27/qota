@@ -2209,6 +2209,31 @@ async function verifyJwt(token, secret) {
   return payload;
 }
 
+// apps/worker/src/lib/global-roles.ts
+var EFFECTIVE_GLOBAL_ROLE_SQL = "COALESCE(ugr.role, u.role)";
+function baseGlobalRoleFor(role) {
+  return role === "super_admin" ? "super_admin" : "developer";
+}
+function usesGlobalRoleOverride(role) {
+  return role !== baseGlobalRoleFor(role);
+}
+async function setUserGlobalRole(db, userId, role, updatedBy) {
+  const now = Date.now();
+  await db.prepare("UPDATE users SET role = ?, updated_at = ? WHERE id = ?").bind(baseGlobalRoleFor(role), now, userId).run();
+  if (!usesGlobalRoleOverride(role)) {
+    await db.prepare("DELETE FROM user_global_roles WHERE user_id = ?").bind(userId).run();
+    return;
+  }
+  await db.prepare(
+    `INSERT INTO user_global_roles (user_id, role, updated_at, updated_by)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_id) DO UPDATE SET
+       role = excluded.role,
+       updated_at = excluded.updated_at,
+       updated_by = excluded.updated_by`
+  ).bind(userId, role, now, updatedBy).run();
+}
+
 // apps/worker/src/middleware/auth.ts
 var requireUser = async (c, next) => {
   const auth = c.req.header("Authorization");
@@ -2218,15 +2243,20 @@ var requireUser = async (c, next) => {
   if (!payload || typeof payload.sub !== "number" || !payload.email || !payload.role) {
     throw unauthorized();
   }
-  const row = await c.env.DB.prepare("SELECT id, email, role, is_active FROM users WHERE id = ?").bind(payload.sub).first();
+  const row = await c.env.DB.prepare(
+    `SELECT u.id, u.email, ${EFFECTIVE_GLOBAL_ROLE_SQL} AS role, u.is_active
+       FROM users u
+       LEFT JOIN user_global_roles ugr ON ugr.user_id = u.id
+      WHERE u.id = ?`
+  ).bind(payload.sub).first();
   if (!row || !row.is_active) throw unauthorized("account disabled");
   c.set("user", { id: row.id, email: row.email, role: row.role });
   await next();
 };
-var requireSuperAdmin = async (c, next) => {
+var requireAdmin = async (c, next) => {
   const user = c.get("user");
   if (!user) throw unauthorized();
-  if (user.role !== "super_admin") throw forbidden("super_admin only");
+  if (user.role !== "super_admin" && user.role !== "admin") throw forbidden("admin only");
   await next();
 };
 
@@ -2294,7 +2324,11 @@ authRoutes.post("/login", async (c) => {
   const password = body.password;
   if (!email || !password) throw badRequest("email and password required");
   const row = await c.env.DB.prepare(
-    "SELECT id, email, password_hash, display_name, role, is_active, created_at, updated_at FROM users WHERE email = ?"
+    `SELECT u.id, u.email, u.password_hash, u.display_name, ${EFFECTIVE_GLOBAL_ROLE_SQL} AS role,
+            u.is_active, u.created_at, u.updated_at
+       FROM users u
+       LEFT JOIN user_global_roles ugr ON ugr.user_id = u.id
+      WHERE u.email = ?`
   ).bind(email).first();
   if (!row || !row.is_active) {
     await audit(c, { actorType: "system", action: "auth.login.failed", meta: { email } });
@@ -2313,7 +2347,11 @@ authRoutes.post("/login", async (c) => {
 authRoutes.get("/me", requireUser, async (c) => {
   const u = c.get("user");
   const row = await c.env.DB.prepare(
-    "SELECT id, email, password_hash, display_name, role, is_active, created_at, updated_at FROM users WHERE id = ?"
+    `SELECT u.id, u.email, u.password_hash, u.display_name, ${EFFECTIVE_GLOBAL_ROLE_SQL} AS role,
+            u.is_active, u.created_at, u.updated_at
+       FROM users u
+       LEFT JOIN user_global_roles ugr ON ugr.user_id = u.id
+      WHERE u.id = ?`
   ).bind(u.id).first();
   if (!row) throw unauthorized();
   return c.json(dto(row));
@@ -2339,7 +2377,11 @@ authRoutes.patch("/profile", requireUser, async (c) => {
     sets.push("display_name = ?");
     args.push(name.length ? name : null);
   }
-  const selectSql = "SELECT id, email, password_hash, display_name, role, is_active, created_at, updated_at FROM users WHERE id = ?";
+  const selectSql = `SELECT u.id, u.email, u.password_hash, u.display_name, ${EFFECTIVE_GLOBAL_ROLE_SQL} AS role,
+            u.is_active, u.created_at, u.updated_at
+       FROM users u
+       LEFT JOIN user_global_roles ugr ON ugr.user_id = u.id
+      WHERE u.id = ?`;
   if (sets.length === 0) {
     const cur = await c.env.DB.prepare(selectSql).bind(u.id).first();
     if (!cur) throw unauthorized();
@@ -2371,15 +2413,25 @@ authRoutes.post("/change-password", requireUser, async (c) => {
 
 // apps/worker/src/routes/users.ts
 var userRoutes = new Hono2();
-userRoutes.use("*", requireUser, requireSuperAdmin);
-var ROLE_RANK = { developer: 1, super_admin: 2 };
+userRoutes.use("*", requireUser, requireAdmin);
+var ROLE_RANK = { observer: 1, developer: 2, admin: 3, super_admin: 4 };
+var ROLES = ["super_admin", "admin", "developer", "observer"];
+function parseRole(role) {
+  return typeof role === "string" && ROLES.includes(role) ? role : "developer";
+}
 function canAssignRole(actorRole, targetRole) {
   const mine = ROLE_RANK[actorRole];
   const isTop = mine >= ROLE_RANK.super_admin;
   return isTop ? ROLE_RANK[targetRole] <= mine : ROLE_RANK[targetRole] < mine;
 }
 async function countSuperAdmins(db, activeOnly = false) {
-  const sql = activeOnly ? "SELECT COUNT(*) AS n FROM users WHERE role = 'super_admin' AND is_active = 1" : "SELECT COUNT(*) AS n FROM users WHERE role = 'super_admin'";
+  const sql = activeOnly ? `SELECT COUNT(*) AS n
+         FROM users u
+         LEFT JOIN user_global_roles ugr ON ugr.user_id = u.id
+        WHERE ${EFFECTIVE_GLOBAL_ROLE_SQL} = 'super_admin' AND u.is_active = 1` : `SELECT COUNT(*) AS n
+         FROM users u
+         LEFT JOIN user_global_roles ugr ON ugr.user_id = u.id
+        WHERE ${EFFECTIVE_GLOBAL_ROLE_SQL} = 'super_admin'`;
   const r = await db.prepare(sql).first();
   return Number(r?.n ?? 0);
 }
@@ -2396,7 +2448,11 @@ function dto2(row) {
 }
 userRoutes.get("/", async (c) => {
   const rows = await c.env.DB.prepare(
-    "SELECT id, email, display_name, role, is_active, created_at, updated_at FROM users ORDER BY id ASC"
+    `SELECT u.id, u.email, u.display_name, ${EFFECTIVE_GLOBAL_ROLE_SQL} AS role,
+            u.is_active, u.created_at, u.updated_at
+       FROM users u
+       LEFT JOIN user_global_roles ugr ON ugr.user_id = u.id
+      ORDER BY u.id ASC`
   ).all();
   return c.json((rows.results ?? []).map(dto2));
 });
@@ -2406,7 +2462,11 @@ userRoutes.post("/", async (c) => {
   if (!email || !body.password || body.password.length < 8) {
     throw badRequest("email and password (>=8 chars) required");
   }
-  const role = body.role === "super_admin" ? "super_admin" : "developer";
+  const role = parseRole(body.role);
+  const me = c.get("user");
+  if (!canAssignRole(me.role, role)) {
+    throw forbidden("cannot assign a role above your own");
+  }
   const exists = await c.env.DB.prepare("SELECT id FROM users WHERE email = ?").bind(email).first();
   if (exists) throw conflict("email already exists");
   const hash2 = await hashPassword(body.password);
@@ -2414,10 +2474,15 @@ userRoutes.post("/", async (c) => {
   const result = await c.env.DB.prepare(
     `INSERT INTO users (email, password_hash, display_name, role, is_active, created_at, updated_at)
      VALUES (?, ?, ?, ?, 1, ?, ?)`
-  ).bind(email, hash2, body.displayName ?? null, role, now, now).run();
+  ).bind(email, hash2, body.displayName ?? null, baseGlobalRoleFor(role), now, now).run();
   const id = result.meta.last_row_id;
+  await setUserGlobalRole(c.env.DB, id, role, me.id);
   const row = await c.env.DB.prepare(
-    "SELECT id, email, display_name, role, is_active, created_at, updated_at FROM users WHERE id = ?"
+    `SELECT u.id, u.email, u.display_name, ${EFFECTIVE_GLOBAL_ROLE_SQL} AS role,
+            u.is_active, u.created_at, u.updated_at
+       FROM users u
+       LEFT JOIN user_global_roles ugr ON ugr.user_id = u.id
+      WHERE u.id = ?`
   ).bind(id).first();
   await audit(c, { action: "user.create", targetType: "user", targetId: id, meta: { email, role } });
   return c.json(dto2(row), 201);
@@ -2427,24 +2492,31 @@ userRoutes.patch("/:id", async (c) => {
   if (!Number.isFinite(id)) throw badRequest("invalid id");
   const body = await c.req.json().catch(() => ({}));
   const me = c.get("user");
-  const existing = await c.env.DB.prepare("SELECT id, role, is_active FROM users WHERE id = ?").bind(id).first();
+  const existing = await c.env.DB.prepare(
+    `SELECT u.id, ${EFFECTIVE_GLOBAL_ROLE_SQL} AS role, u.is_active
+       FROM users u
+       LEFT JOIN user_global_roles ugr ON ugr.user_id = u.id
+      WHERE u.id = ?`
+  ).bind(id).first();
   if (!existing) throw notFound();
+  if (!canAssignRole(me.role, existing.role)) {
+    throw forbidden("cannot manage a role above or equal to your own");
+  }
   const sets = [];
   const args = [];
+  let targetRole = null;
   if (body.displayName !== void 0) {
     sets.push("display_name = ?");
     args.push(body.displayName);
   }
   if (body.role !== void 0) {
-    const targetRole = body.role === "super_admin" ? "super_admin" : "developer";
+    targetRole = parseRole(body.role);
     if (!canAssignRole(me.role, targetRole)) {
       throw forbidden("cannot assign a role above your own");
     }
     if (existing.role === "super_admin" && targetRole !== "super_admin" && await countSuperAdmins(c.env.DB) <= 1) {
       throw badRequest("system must keep at least one super admin");
     }
-    sets.push("role = ?");
-    args.push(targetRole);
   }
   if (body.isActive !== void 0) {
     if (body.isActive === false && existing.role === "super_admin" && existing.is_active === 1 && await countSuperAdmins(c.env.DB, true) <= 1) {
@@ -2458,13 +2530,20 @@ userRoutes.patch("/:id", async (c) => {
     sets.push("password_hash = ?");
     args.push(await hashPassword(body.password));
   }
-  if (sets.length === 0) return c.json({ ok: true });
-  sets.push("updated_at = ?");
-  args.push(Date.now());
-  args.push(id);
-  await c.env.DB.prepare(`UPDATE users SET ${sets.join(", ")} WHERE id = ?`).bind(...args).run();
+  if (sets.length > 0) {
+    sets.push("updated_at = ?");
+    args.push(Date.now());
+    args.push(id);
+    await c.env.DB.prepare(`UPDATE users SET ${sets.join(", ")} WHERE id = ?`).bind(...args).run();
+  }
+  if (targetRole) await setUserGlobalRole(c.env.DB, id, targetRole, me.id);
+  if (sets.length === 0 && !targetRole) return c.json({ ok: true });
   const row = await c.env.DB.prepare(
-    "SELECT id, email, display_name, role, is_active, created_at, updated_at FROM users WHERE id = ?"
+    `SELECT u.id, u.email, u.display_name, ${EFFECTIVE_GLOBAL_ROLE_SQL} AS role,
+            u.is_active, u.created_at, u.updated_at
+       FROM users u
+       LEFT JOIN user_global_roles ugr ON ugr.user_id = u.id
+      WHERE u.id = ?`
   ).bind(id).first();
   await audit(c, { action: "user.update", targetType: "user", targetId: id, meta: { fields: Object.keys(body) } });
   return c.json(dto2(row));
@@ -2474,8 +2553,16 @@ userRoutes.delete("/:id", async (c) => {
   if (!Number.isFinite(id)) throw badRequest("invalid id");
   const me = c.get("user");
   if (me.id === id) throw badRequest("cannot delete self");
-  const target = await c.env.DB.prepare("SELECT role FROM users WHERE id = ?").bind(id).first();
+  const target = await c.env.DB.prepare(
+    `SELECT ${EFFECTIVE_GLOBAL_ROLE_SQL} AS role
+       FROM users u
+       LEFT JOIN user_global_roles ugr ON ugr.user_id = u.id
+      WHERE u.id = ?`
+  ).bind(id).first();
   if (!target) throw notFound();
+  if (!canAssignRole(me.role, target.role)) {
+    throw forbidden("cannot delete a role above or equal to your own");
+  }
   if (target.role === "super_admin" && await countSuperAdmins(c.env.DB) <= 1) {
     throw badRequest("system must keep at least one super admin");
   }
@@ -2506,6 +2593,23 @@ var ROLE_GRANTS = {
   ]),
   viewer: /* @__PURE__ */ new Set(["view", "download"])
 };
+var GLOBAL_ADMIN_ACTIONS = /* @__PURE__ */ new Set([
+  "view",
+  "download",
+  "upload",
+  "manage_versions",
+  "manage_tokens",
+  "manage_members",
+  "manage_projects",
+  "manage_customer"
+]);
+var GLOBAL_OBSERVER_ACTIONS = /* @__PURE__ */ new Set(["view", "download"]);
+function globalRoleHas(user, action) {
+  if (user.role === "super_admin") return true;
+  if (user.role === "admin") return GLOBAL_ADMIN_ACTIONS.has(action);
+  if (user.role === "observer") return GLOBAL_OBSERVER_ACTIONS.has(action);
+  return null;
+}
 function roleHas(role, action) {
   return ROLE_GRANTS[role].has(action);
 }
@@ -2525,12 +2629,14 @@ async function effectiveRoleOnProject(db, userId, projectId) {
   return cust?.role ?? null;
 }
 async function canDoOnCustomer(db, user, customerId, action) {
-  if (user.role === "super_admin") return true;
+  const global = globalRoleHas(user, action);
+  if (global !== null) return global;
   const role = await effectiveRoleOnCustomer(db, user.id, customerId);
   return !!role && roleHas(role, action);
 }
 async function canDoOnProject(db, user, projectId, action) {
-  if (user.role === "super_admin") return true;
+  const global = globalRoleHas(user, action);
+  if (global !== null) return global;
   const role = await effectiveRoleOnProject(db, user.id, projectId);
   return !!role && roleHas(role, action);
 }
@@ -2549,7 +2655,7 @@ async function requireCustomerAccess(db, user, customerId, action) {
   return row;
 }
 async function visibleCustomerIds(db, user) {
-  if (user.role === "super_admin") return null;
+  if (user.role === "super_admin" || user.role === "admin" || user.role === "observer") return null;
   const direct = await db.prepare("SELECT customer_id FROM memberships WHERE user_id = ?").bind(user.id).all();
   const viaProj = await db.prepare(
     `SELECT DISTINCT p.customer_id
@@ -2563,7 +2669,7 @@ async function visibleCustomerIds(db, user) {
   return [...ids];
 }
 async function visibleProjectIds(db, user) {
-  if (user.role === "super_admin") return null;
+  if (user.role === "super_admin" || user.role === "admin" || user.role === "observer") return null;
   const rows = await db.prepare(
     `SELECT DISTINCT p.id FROM projects p
         WHERE EXISTS (SELECT 1 FROM memberships m WHERE m.user_id = ?1 AND m.customer_id = p.customer_id)
@@ -26955,7 +27061,7 @@ customerRoutes.get("/:id", async (c) => {
   ).bind(row.id).first();
   return c.json(dto3(full));
 });
-customerRoutes.post("/", requireSuperAdmin, async (c) => {
+customerRoutes.post("/", requireAdmin, async (c) => {
   const body = await c.req.json().catch(() => ({}));
   if (!body.name) throw badRequest("name required");
   let code;
@@ -27004,7 +27110,7 @@ customerRoutes.patch("/:id", async (c) => {
   await audit(c, { action: "customer.update", customerId: id, targetType: "customer", targetId: id, meta: { fields: Object.keys(body) } });
   return c.json(dto3(row));
 });
-customerRoutes.delete("/:id", requireSuperAdmin, async (c) => {
+customerRoutes.delete("/:id", requireAdmin, async (c) => {
   const id = Number(c.req.param("id"));
   if (!Number.isFinite(id)) throw badRequest("invalid id");
   const r = await c.env.DB.prepare("DELETE FROM customers WHERE id = ?").bind(id).run();
@@ -27024,12 +27130,14 @@ function dto4(r) {
     name: r.name,
     description: r.description,
     defaultChannel: r.default_channel,
+    currentVersion: r.current_version,
     createdAt: r.created_at,
     updatedAt: r.updated_at
   };
 }
 var CODE_RE2 = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 var CHANNEL_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+var VERSION_RE = /^[A-Za-z0-9._+-]{1,64}$/;
 projectRoutes.get("/", async (c) => {
   const user = c.get("user");
   const customerIdQ = c.req.query("customerId");
@@ -27049,7 +27157,7 @@ projectRoutes.get("/", async (c) => {
   }
   const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
   const rows = await c.env.DB.prepare(
-    `SELECT id, customer_id, code, name, description, default_channel, created_at, updated_at FROM projects ${where} ORDER BY name ASC`
+    `SELECT id, customer_id, code, name, description, default_channel, current_version, created_at, updated_at FROM projects ${where} ORDER BY name ASC`
   ).bind(...args).all();
   return c.json((rows.results ?? []).map(dto4));
 });
@@ -27059,7 +27167,7 @@ projectRoutes.get("/:id", async (c) => {
   const user = c.get("user");
   await requireProjectAccess(c.env.DB, user, id, "view");
   const row = await c.env.DB.prepare(
-    "SELECT id, customer_id, code, name, description, default_channel, created_at, updated_at FROM projects WHERE id = ?"
+    "SELECT id, customer_id, code, name, description, default_channel, current_version, created_at, updated_at FROM projects WHERE id = ?"
   ).bind(id).first();
   return c.json(dto4(row));
 });
@@ -27099,7 +27207,7 @@ projectRoutes.post("/", async (c) => {
   ).run();
   const id = Number(r.meta.last_row_id);
   const row = await c.env.DB.prepare(
-    "SELECT id, customer_id, code, name, description, default_channel, created_at, updated_at FROM projects WHERE id = ?"
+    "SELECT id, customer_id, code, name, description, default_channel, current_version, created_at, updated_at FROM projects WHERE id = ?"
   ).bind(id).first();
   await audit(c, {
     action: "project.create",
@@ -27115,8 +27223,14 @@ projectRoutes.patch("/:id", async (c) => {
   const id = Number(c.req.param("id"));
   if (!Number.isFinite(id)) throw badRequest("invalid id");
   const user = c.get("user");
-  const proj = await requireProjectAccess(c.env.DB, user, id, "manage_projects");
   const body = await c.req.json().catch(() => ({}));
+  const projectFields = body.name !== void 0 || body.description !== void 0 || body.defaultChannel !== void 0;
+  const proj = await requireProjectAccess(
+    c.env.DB,
+    user,
+    id,
+    projectFields ? "manage_projects" : "manage_versions"
+  );
   const sets = [];
   const args = [];
   if (body.name !== void 0) {
@@ -27132,13 +27246,24 @@ projectRoutes.patch("/:id", async (c) => {
     sets.push("default_channel = ?");
     args.push(body.defaultChannel);
   }
+  if (body.currentVersion !== void 0) {
+    if (body.currentVersion !== null) {
+      if (!VERSION_RE.test(body.currentVersion)) throw badRequest("currentVersion invalid");
+      const ready = await c.env.DB.prepare(
+        `SELECT id FROM versions WHERE project_id = ? AND version = ? AND status = 'ready' LIMIT 1`
+      ).bind(id, body.currentVersion).first();
+      if (!ready) throw badRequest("currentVersion must match a ready version");
+    }
+    sets.push("current_version = ?");
+    args.push(body.currentVersion);
+  }
   if (sets.length === 0) return c.json({ ok: true });
   sets.push("updated_at = ?");
   args.push(Date.now());
   args.push(id);
   await c.env.DB.prepare(`UPDATE projects SET ${sets.join(", ")} WHERE id = ?`).bind(...args).run();
   const row = await c.env.DB.prepare(
-    "SELECT id, customer_id, code, name, description, default_channel, created_at, updated_at FROM projects WHERE id = ?"
+    "SELECT id, customer_id, code, name, description, default_channel, current_version, created_at, updated_at FROM projects WHERE id = ?"
   ).bind(id).first();
   await audit(c, {
     action: "project.update",
@@ -27170,9 +27295,9 @@ projectRoutes.delete("/:id", async (c) => {
 // apps/worker/src/routes/memberships.ts
 var membershipRoutes = new Hono2();
 membershipRoutes.use("*", requireUser);
-var ROLES = ["customer_admin", "developer", "viewer"];
+var ROLES2 = ["customer_admin", "developer", "viewer"];
 function isRole(s) {
-  return typeof s === "string" && ROLES.includes(s);
+  return typeof s === "string" && ROLES2.includes(s);
 }
 function dtoCust(r) {
   return {
@@ -27878,6 +28003,7 @@ function versionDto(r) {
     contentType: r.content_type,
     notes: r.notes,
     isMandatory: !!r.is_mandatory,
+    isCurrent: r.current_version === r.version,
     minVersion: r.min_version,
     maxVersion: r.max_version,
     rolloutPercentage: r.rollout_percentage,
@@ -27898,19 +28024,21 @@ versionRoutes.get("/", async (c) => {
   await requireProjectAccess(c.env.DB, user, projectId, "view");
   const includePending = c.req.query("includePending") === "1";
   const channel = c.req.query("channel");
-  const where = ["project_id = ?"];
+  const where = ["v.project_id = ?"];
   const args = [projectId];
   if (!includePending) {
-    where.push(`status != 'pending'`);
+    where.push(`v.status != 'pending'`);
   }
   if (channel) {
-    where.push("release_channel = ?");
+    where.push("v.release_channel = ?");
     args.push(channel);
   }
   const rows = await c.env.DB.prepare(
-    `SELECT id, project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
-            is_mandatory, min_version, max_version, rollout_percentage, device_group_id, download_count, public_slug, uploaded_by, created_at, updated_at
-       FROM versions WHERE ${where.join(" AND ")} ORDER BY created_at DESC`
+    `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type, v.notes,
+            v.is_mandatory, p.current_version, v.min_version, v.max_version, v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug, v.uploaded_by, v.created_at, v.updated_at
+       FROM versions v
+       JOIN projects p ON p.id = v.project_id
+      WHERE ${where.join(" AND ")} ORDER BY v.created_at DESC`
   ).bind(...args).all();
   return c.json((rows.results ?? []).map(versionDto));
 });
@@ -27937,7 +28065,7 @@ versionRoutes.get("/accessible", async (c) => {
   }
   const rows = await c.env.DB.prepare(
     `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size,
-            v.sha256, v.content_type, v.notes, v.is_mandatory, v.min_version, v.max_version,
+            v.sha256, v.content_type, v.notes, v.is_mandatory, p.current_version, v.min_version, v.max_version,
             v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug,
             v.uploaded_by, v.created_at, v.updated_at,
             p.code AS project_code, p.name AS project_name,
@@ -27955,9 +28083,11 @@ versionRoutes.get("/:id", async (c) => {
   if (!Number.isFinite(id)) throw badRequest("invalid id");
   const user = c.get("user");
   const row = await c.env.DB.prepare(
-    `SELECT id, project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
-            is_mandatory, min_version, max_version, rollout_percentage, device_group_id, download_count, public_slug, uploaded_by, created_at, updated_at
-       FROM versions WHERE id = ?`
+    `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type, v.notes,
+            v.is_mandatory, p.current_version, v.min_version, v.max_version, v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug, v.uploaded_by, v.created_at, v.updated_at
+       FROM versions v
+       JOIN projects p ON p.id = v.project_id
+      WHERE v.id = ?`
   ).bind(id).first();
   if (!row) throw notFound();
   await requireProjectAccess(c.env.DB, user, row.project_id, "view");
@@ -27967,7 +28097,7 @@ versionRoutes.patch("/:id", async (c) => {
   const id = Number(c.req.param("id"));
   if (!Number.isFinite(id)) throw badRequest("invalid id");
   const user = c.get("user");
-  const existing = await c.env.DB.prepare("SELECT project_id FROM versions WHERE id = ?").bind(id).first();
+  const existing = await c.env.DB.prepare("SELECT project_id, version, status FROM versions WHERE id = ?").bind(id).first();
   if (!existing) throw notFound();
   const proj = await requireProjectAccess(c.env.DB, user, existing.project_id, "manage_versions");
   const body = await c.req.json().catch(() => ({}));
@@ -27999,11 +28129,38 @@ versionRoutes.patch("/:id", async (c) => {
     sets.push("status = ?");
     args.push(body.status);
   }
-  if (sets.length === 0) return c.json({ ok: true });
+  if (body.isCurrent !== void 0) {
+    const nextStatus = body.status ?? existing.status;
+    if (body.isCurrent && nextStatus !== "ready") throw badRequest("only ready versions can be current");
+  }
+  const now = Date.now();
+  if (body.isCurrent) {
+    await c.env.DB.prepare("UPDATE projects SET current_version = ?, updated_at = ? WHERE id = ?").bind(existing.version, now, existing.project_id).run();
+  } else if (body.isCurrent === false) {
+    await c.env.DB.prepare("UPDATE projects SET current_version = NULL, updated_at = ? WHERE id = ? AND current_version = ?").bind(now, existing.project_id, existing.version).run();
+  }
+  if (sets.length === 0) {
+    const row2 = await c.env.DB.prepare(
+      `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type, v.notes,
+              v.is_mandatory, p.current_version, v.min_version, v.max_version, v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug, v.uploaded_by, v.created_at, v.updated_at
+         FROM versions v
+         JOIN projects p ON p.id = v.project_id
+        WHERE v.id = ?`
+    ).bind(id).first();
+    return c.json(versionDto(row2));
+  }
   sets.push("updated_at = ?");
-  args.push(Date.now());
+  args.push(now);
   args.push(id);
   await c.env.DB.prepare(`UPDATE versions SET ${sets.join(", ")} WHERE id = ?`).bind(...args).run();
+  if (body.status === "archived") {
+    const remaining = await c.env.DB.prepare(
+      `SELECT id FROM versions WHERE project_id = ? AND version = ? AND status = 'ready' LIMIT 1`
+    ).bind(existing.project_id, existing.version).first();
+    if (!remaining) {
+      await c.env.DB.prepare("UPDATE projects SET current_version = NULL, updated_at = ? WHERE id = ? AND current_version = ?").bind(now, existing.project_id, existing.version).run();
+    }
+  }
   await audit(c, {
     action: "version.update",
     customerId: proj.customer_id,
@@ -28013,9 +28170,11 @@ versionRoutes.patch("/:id", async (c) => {
     meta: { fields: Object.keys(body) }
   });
   const row = await c.env.DB.prepare(
-    `SELECT id, project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
-            is_mandatory, min_version, max_version, rollout_percentage, device_group_id, download_count, public_slug, uploaded_by, created_at, updated_at
-       FROM versions WHERE id = ?`
+    `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type, v.notes,
+            v.is_mandatory, p.current_version, v.min_version, v.max_version, v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug, v.uploaded_by, v.created_at, v.updated_at
+       FROM versions v
+       JOIN projects p ON p.id = v.project_id
+      WHERE v.id = ?`
   ).bind(id).first();
   return c.json(versionDto(row));
 });
@@ -28063,7 +28222,7 @@ versionRoutes.delete("/:id", async (c) => {
   const id = Number(c.req.param("id"));
   if (!Number.isFinite(id)) throw badRequest("invalid id");
   const me = c.get("user");
-  const row = await c.env.DB.prepare("SELECT project_id, r2_key FROM versions WHERE id = ?").bind(id).first();
+  const row = await c.env.DB.prepare("SELECT project_id, version, r2_key FROM versions WHERE id = ?").bind(id).first();
   if (!row) throw notFound();
   const proj = await requireProjectAccess(c.env.DB, me, row.project_id, "manage_versions");
   const s3 = makeStorage(c.env);
@@ -28073,6 +28232,12 @@ versionRoutes.delete("/:id", async (c) => {
     console.warn("[versions.delete] R2 delete failed (will still drop metadata):", e);
   }
   await c.env.DB.prepare("DELETE FROM versions WHERE id = ?").bind(id).run();
+  const remaining = await c.env.DB.prepare(
+    `SELECT id FROM versions WHERE project_id = ? AND version = ? AND status = 'ready' LIMIT 1`
+  ).bind(row.project_id, row.version).first();
+  if (!remaining) {
+    await c.env.DB.prepare("UPDATE projects SET current_version = NULL, updated_at = ? WHERE id = ? AND current_version = ?").bind(Date.now(), row.project_id, row.version).run();
+  }
   await audit(c, {
     action: "version.delete",
     customerId: proj.customer_id,
@@ -28380,12 +28545,14 @@ downloadRoutes.get("/device/latest", async (c) => {
     if (customerCode && p.c_code !== customerCode) throw forbidden("customer mismatch");
     if (projectCode && p.p_code !== projectCode) throw forbidden("project mismatch");
   }
+  const current = await c.env.DB.prepare("SELECT current_version FROM projects WHERE id = ?").bind(dev.projectId).first();
+  const currentVersion = current?.current_version ?? null;
   const row = await c.env.DB.prepare(
     `SELECT id, project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type
        FROM versions
       WHERE project_id = ? AND release_channel = ? AND status = 'ready'
-      ORDER BY created_at DESC LIMIT 1`
-  ).bind(dev.projectId, channel).first();
+      ORDER BY CASE WHEN version = ? THEN 0 ELSE 1 END, created_at DESC LIMIT 1`
+  ).bind(dev.projectId, channel, currentVersion).first();
   if (!row) throw notFound("no ready versions in this channel");
   const ttl = Number(c.env.DOWNLOAD_URL_TTL_SECONDS) || 300;
   return redirectOrJson(c, row, ttl);
@@ -28395,15 +28562,19 @@ downloadRoutes.get("/device/list", async (c) => {
   const qChannel = c.req.query("channel");
   if (dev.channel && qChannel && dev.channel !== qChannel) throw forbidden("channel not allowed for this token");
   const effChannel = dev.channel ?? qChannel ?? null;
-  const where = ["project_id = ?", `status = 'ready'`];
+  const where = ["v.project_id = ?", `v.status = 'ready'`];
   const args = [dev.projectId];
   if (effChannel) {
-    where.push("release_channel = ?");
+    where.push("v.release_channel = ?");
     args.push(effChannel);
   }
   const rows = await c.env.DB.prepare(
-    `SELECT id, version, release_channel, filename, size, sha256, content_type, is_mandatory, created_at
-       FROM versions WHERE ${where.join(" AND ")} ORDER BY created_at DESC`
+    `SELECT v.id, v.version, v.release_channel, v.filename, v.size, v.sha256, v.content_type, v.is_mandatory,
+            p.current_version, v.created_at
+      FROM versions v
+      JOIN projects p ON p.id = v.project_id
+      WHERE ${where.join(" AND ")}
+      ORDER BY CASE WHEN v.version = p.current_version THEN 0 ELSE 1 END, v.created_at DESC`
   ).bind(...args).all();
   const proj = await c.env.DB.prepare(
     `SELECT p.code AS p_code, p.name AS p_name, c.code AS c_code, c.name AS c_name
@@ -28418,6 +28589,7 @@ downloadRoutes.get("/device/list", async (c) => {
     sha256: r.sha256,
     contentType: r.content_type,
     isMandatory: !!r.is_mandatory,
+    isCurrent: r.current_version === r.version,
     createdAt: r.created_at,
     download: `/api/download/device/version/${r.id}`
   }));
@@ -28497,7 +28669,7 @@ publicRoutes.get("/download/:slug", async (c) => {
 // apps/worker/src/routes/upload.ts
 var uploadRoutes = new Hono2();
 uploadRoutes.use("*", requireUser);
-var VERSION_RE = /^[A-Za-z0-9._+-]{1,64}$/;
+var VERSION_RE2 = /^[A-Za-z0-9._+-]{1,64}$/;
 var CHANNEL_RE2 = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 var SHA256_RE = /^[a-f0-9]{64}$/i;
 var DEFAULT_PART_SIZE = 16 * 1024 * 1024;
@@ -28514,6 +28686,13 @@ function clampPartSize(hint, totalSize) {
 function r2KeyFor(customerCode, projectCode, channel, version, filename) {
   const safe = filename.replace(/[^A-Za-z0-9._+-]/g, "_");
   return `${customerCode}/${projectCode}/${channel}/${version}/${safe}`;
+}
+async function deleteObjectBestEffort(storage, key) {
+  try {
+    await storage.deleteObject(key);
+  } catch (e) {
+    console.warn("[upload.complete] old object delete failed:", e);
+  }
 }
 function sessionDto(r) {
   return {
@@ -28548,7 +28727,7 @@ uploadRoutes.post("/init", async (c) => {
   if (!Number.isFinite(body.totalSize) || (body.totalSize ?? 0) <= 0) {
     throw badRequest("totalSize must be a positive integer");
   }
-  if (!body.version || !VERSION_RE.test(body.version)) {
+  if (!body.version || !VERSION_RE2.test(body.version)) {
     throw badRequest("version must match [A-Za-z0-9._+-], 1-64 chars");
   }
   const channel = body.releaseChannel || "stable";
@@ -28563,10 +28742,10 @@ uploadRoutes.post("/init", async (c) => {
   const project = await requireProjectAccess(c.env.DB, me, body.projectId, "upload");
   const customer = await c.env.DB.prepare("SELECT code FROM customers WHERE id = ?").bind(project.customer_id).first();
   if (!customer) throw notFound("customer not found");
-  const dup = await c.env.DB.prepare(
-    `SELECT id FROM versions WHERE project_id = ? AND version = ? AND release_channel = ?`
+  const existing = await c.env.DB.prepare(
+    `SELECT id, r2_key FROM versions WHERE project_id = ? AND version = ? AND release_channel = ?`
   ).bind(body.projectId, body.version, channel).first();
-  if (dup) throw conflict("version+channel already exists");
+  if (existing && !body.overwriteExisting) throw conflict("version+channel already exists");
   const totalSize = body.totalSize;
   const partSize = clampPartSize(body.partSizeHint, totalSize);
   const partCount = Math.ceil(totalSize / partSize);
@@ -28578,9 +28757,9 @@ uploadRoutes.post("/init", async (c) => {
   const r = await c.env.DB.prepare(
     `INSERT INTO upload_sessions
        (project_id, r2_key, filename, total_size, part_size, upload_id, expected_sha256, release_channel,
-        target_version, content_type, notes, is_mandatory, min_version, max_version, rollout_percentage,
+        target_version, content_type, notes, is_mandatory, min_version, max_version, rollout_percentage, version_id,
         status, initiated_by, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?)`
   ).bind(
     body.projectId,
     key,
@@ -28597,6 +28776,7 @@ uploadRoutes.post("/init", async (c) => {
     body.minVersion ?? null,
     body.maxVersion ?? null,
     body.rolloutPercentage === void 0 ? 100 : Math.floor(body.rolloutPercentage),
+    existing?.id ?? null,
     me.id,
     now
   ).run();
@@ -28607,7 +28787,7 @@ uploadRoutes.post("/init", async (c) => {
     projectId: body.projectId,
     targetType: "upload_session",
     targetId: sessionId,
-    meta: { key, totalSize, partSize, partCount, version: body.version, channel }
+    meta: { key, totalSize, partSize, partCount, version: body.version, channel, overwriteVersionId: existing?.id }
   });
   return c.json({
     sessionId,
@@ -28687,31 +28867,73 @@ uploadRoutes.post("/complete", async (c) => {
   if (head.size !== session.total_size) {
     console.warn("[upload.complete] size mismatch", { expected: session.total_size, actual: head.size });
   }
-  const verRes = await c.env.DB.prepare(
-    `INSERT INTO versions
-       (project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
-        is_mandatory, min_version, max_version, rollout_percentage, device_group_id,
-        uploaded_by, created_at, updated_at)
-     VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
-  ).bind(
-    session.project_id,
-    session.target_version,
-    session.release_channel,
-    session.r2_key,
-    session.filename,
-    session.total_size,
-    body.sha256 ?? session.expected_sha256 ?? null,
-    session.content_type,
-    session.notes,
-    session.is_mandatory,
-    session.min_version,
-    session.max_version,
-    session.rollout_percentage,
-    session.initiated_by,
-    now,
-    now
-  ).run();
-  const versionId = Number(verRes.meta.last_row_id);
+  const sha256 = body.sha256 ?? session.expected_sha256 ?? null;
+  let versionId = session.version_id ?? 0;
+  let oldKey = null;
+  if (session.version_id) {
+    const existing = await c.env.DB.prepare("SELECT r2_key FROM versions WHERE id = ? AND project_id = ?").bind(session.version_id, session.project_id).first();
+    if (!existing) throw conflict("overwrite target version no longer exists");
+    oldKey = existing.r2_key;
+    await c.env.DB.prepare(
+      `UPDATE versions
+          SET status = 'ready',
+              r2_key = ?,
+              filename = ?,
+              size = ?,
+              sha256 = ?,
+              content_type = ?,
+              notes = ?,
+              is_mandatory = ?,
+              min_version = ?,
+              max_version = ?,
+              rollout_percentage = ?,
+              uploaded_by = ?,
+              created_at = ?,
+              updated_at = ?
+        WHERE id = ?`
+    ).bind(
+      session.r2_key,
+      session.filename,
+      session.total_size,
+      sha256,
+      session.content_type,
+      session.notes,
+      session.is_mandatory,
+      session.min_version,
+      session.max_version,
+      session.rollout_percentage,
+      session.initiated_by,
+      now,
+      now,
+      session.version_id
+    ).run();
+  } else {
+    const verRes = await c.env.DB.prepare(
+      `INSERT INTO versions
+         (project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
+          is_mandatory, min_version, max_version, rollout_percentage, device_group_id,
+          uploaded_by, created_at, updated_at)
+       VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
+    ).bind(
+      session.project_id,
+      session.target_version,
+      session.release_channel,
+      session.r2_key,
+      session.filename,
+      session.total_size,
+      sha256,
+      session.content_type,
+      session.notes,
+      session.is_mandatory,
+      session.min_version,
+      session.max_version,
+      session.rollout_percentage,
+      session.initiated_by,
+      now,
+      now
+    ).run();
+    versionId = Number(verRes.meta.last_row_id);
+  }
   await c.env.DB.prepare(
     `UPDATE upload_sessions SET status = 'completed', completed_at = ?, version_id = ? WHERE id = ?`
   ).bind(now, versionId, session.id).run();
@@ -28725,15 +28947,19 @@ uploadRoutes.post("/complete", async (c) => {
       sessionId: session.id,
       key: session.r2_key,
       size: session.total_size,
-      sha256: body.sha256 ?? session.expected_sha256 ?? null,
+      sha256,
       etag: completeRes.etag,
-      parts: body.parts.length
+      parts: body.parts.length,
+      overwritten: !!session.version_id
     }
   });
+  if (oldKey && oldKey !== session.r2_key) void deleteObjectBestEffort(s3, oldKey);
   const ver = await c.env.DB.prepare(
-    `SELECT id, project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
-            is_mandatory, min_version, max_version, rollout_percentage, device_group_id, download_count, uploaded_by, created_at, updated_at
-       FROM versions WHERE id = ?`
+    `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type, v.notes,
+            v.is_mandatory, p.current_version, v.min_version, v.max_version, v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug, v.uploaded_by, v.created_at, v.updated_at
+       FROM versions v
+       JOIN projects p ON p.id = v.project_id
+      WHERE v.id = ?`
   ).bind(versionId).first();
   return c.json(versionDto(ver), 201);
 });
@@ -28832,6 +29058,9 @@ storageRoutes.get("/blob", async (c) => {
 // apps/worker/src/routes/audit.ts
 var auditRoutes = new Hono2();
 auditRoutes.use("*", requireUser);
+function isGlobalVisible(role) {
+  return role === "super_admin" || role === "admin" || role === "observer";
+}
 function dto6(r) {
   let meta = null;
   if (r.meta) {
@@ -28869,7 +29098,7 @@ auditRoutes.get("/", async (c) => {
     const pid = Number(projectIdQ);
     if (!Number.isFinite(pid)) throw badRequest("invalid projectId");
     const ok = await canDoOnProject(c.env.DB, user, pid, "manage_members");
-    if (!ok && user.role !== "super_admin") {
+    if (!ok && !isGlobalVisible(user.role)) {
       where.push("project_id = ? AND actor_type = ? AND actor_id = ?");
       args.push(pid, "user", user.id);
     } else {
@@ -28880,14 +29109,14 @@ auditRoutes.get("/", async (c) => {
     const cid = Number(customerIdQ);
     if (!Number.isFinite(cid)) throw badRequest("invalid customerId");
     const ok = await canDoOnCustomer(c.env.DB, user, cid, "manage_members");
-    if (!ok && user.role !== "super_admin") {
+    if (!ok && !isGlobalVisible(user.role)) {
       where.push("customer_id = ? AND actor_type = ? AND actor_id = ?");
       args.push(cid, "user", user.id);
     } else {
       where.push("customer_id = ?");
       args.push(cid);
     }
-  } else if (user.role !== "super_admin") {
+  } else if (!isGlobalVisible(user.role)) {
     const visibleCust = await visibleCustomerIds(c.env.DB, user);
     const visibleProj = await visibleProjectIds(c.env.DB, user);
     const clauses = ["(actor_type = ? AND actor_id = ?)"];
@@ -29001,6 +29230,8 @@ PRAGMA foreign_keys = ON;
 -- Users (global identity)
 -- role = 'super_admin' grants implicit access to everything.
 -- role = 'developer' has no global rights; access is via memberships.
+-- Additional global roles live in user_global_roles so existing databases do
+-- not need the original users table rebuilt when new roles are added.
 -- (Devices/CI are NOT users \u2014 they live in api_tokens.)
 -- ============================================================
 CREATE TABLE users (
@@ -29013,6 +29244,13 @@ CREATE TABLE users (
   is_active     INTEGER NOT NULL DEFAULT 1,
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL
+);
+
+CREATE TABLE user_global_roles (
+  user_id    INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  role       TEXT    NOT NULL CHECK (role IN ('admin', 'observer')),
+  updated_at INTEGER NOT NULL,
+  updated_by INTEGER REFERENCES users(id)
 );
 
 -- ============================================================
@@ -29228,6 +29466,12 @@ var public_versions_default = "-- Public, token-less download links (per version
 // apps/worker/migrations/0004_api_token_secret.sql
 var api_token_secret_default = "-- Store the API token encrypted at rest (AES-256-GCM, key derived from\n-- JWT_SECRET) so it can be re-copied from the dashboard at any time. The hash\n-- (token_hash) is still what authentication looks up; token_enc is only for\n-- display/copy. NULL for tokens issued before this column existed \u2014 those can\n-- only be copied at creation time, and must be re-issued to enable copy.\nALTER TABLE api_tokens ADD COLUMN token_enc TEXT;\n";
 
+// apps/worker/migrations/0005_current_version.sql
+var current_version_default = "-- Mark one current in-use version label per project. The selected version\n-- applies to every channel artifact under that version number.\nALTER TABLE projects ADD COLUMN current_version TEXT;\n";
+
+// apps/worker/migrations/0006_global_roles.sql
+var global_roles_default = "-- Add extensible global-role overrides without rebuilding the original users\n-- table. Existing users.role remains the compatibility base\n-- ('super_admin'/'developer'); admin and observer are stored here.\nCREATE TABLE IF NOT EXISTS user_global_roles (\n  user_id    INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,\n  role       TEXT    NOT NULL CHECK (role IN ('admin', 'observer')),\n  updated_at INTEGER NOT NULL,\n  updated_by INTEGER REFERENCES users(id)\n);\n\n-- If this migration is applied to a database that was already briefly upgraded\n-- to store admin/observer directly in users.role, preserve those effective roles\n-- in the override table. Fresh/old databases simply insert nothing here.\nINSERT OR REPLACE INTO user_global_roles (user_id, role, updated_at, updated_by)\nSELECT id, role, updated_at, NULL\n  FROM users\n WHERE role IN ('admin', 'observer');\n";
+
 // apps/worker/pages-entry.ts
 function statements(sql) {
   return sql.replace(/--[^\n]*/g, "").split(";").map((s) => s.trim()).filter((s) => s.length > 0 && !/^PRAGMA/i.test(s));
@@ -29243,7 +29487,8 @@ async function ensureSchema(env) {
       ...statements(init_default),
       ...statements(download_count_default),
       ...statements(public_versions_default),
-      ...statements(api_token_secret_default)
+      ...statements(api_token_secret_default),
+      ...statements(current_version_default)
     ]) {
       await env.DB.prepare(stmt).run();
     }
@@ -29253,6 +29498,8 @@ async function ensureSchema(env) {
   }
   await ensureColumn(env, "versions", "public_slug", statements(public_versions_default));
   await ensureColumn(env, "api_tokens", "token_enc", statements(api_token_secret_default));
+  await ensureColumn(env, "projects", "current_version", statements(current_version_default));
+  await ensureGlobalRoles(env, statements(global_roles_default));
   schemaReady = true;
 }
 async function ensureColumn(env, table, column, stmts) {
@@ -29260,6 +29507,15 @@ async function ensureColumn(env, table, column, stmts) {
   if (row && typeof row.sql === "string" && !row.sql.includes(column)) {
     for (const stmt of stmts) await env.DB.prepare(stmt).run();
     console.log(`[schema] added ${table}.${column}`);
+  }
+}
+async function ensureGlobalRoles(env, stmts) {
+  const row = await env.DB.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'user_global_roles'"
+  ).first();
+  if (!row) {
+    for (const stmt of stmts) await env.DB.prepare(stmt).run();
+    console.log("[schema] added user_global_roles");
   }
 }
 var pages_entry_default = {

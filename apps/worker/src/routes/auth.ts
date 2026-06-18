@@ -5,6 +5,7 @@ import { signJwt } from '../utils/jwt';
 import { badRequest, conflict, unauthorized } from '../utils/errors';
 import { requireUser } from '../middleware/auth';
 import { audit } from '../lib/audit';
+import { EFFECTIVE_GLOBAL_ROLE_SQL } from '../lib/global-roles';
 
 export const authRoutes = new Hono<AppEnv>();
 
@@ -39,7 +40,11 @@ authRoutes.post('/login', async (c) => {
   if (!email || !password) throw badRequest('email and password required');
 
   const row = await c.env.DB.prepare(
-    'SELECT id, email, password_hash, display_name, role, is_active, created_at, updated_at FROM users WHERE email = ?',
+    `SELECT u.id, u.email, u.password_hash, u.display_name, ${EFFECTIVE_GLOBAL_ROLE_SQL} AS role,
+            u.is_active, u.created_at, u.updated_at
+       FROM users u
+       LEFT JOIN user_global_roles ugr ON ugr.user_id = u.id
+      WHERE u.email = ?`,
   )
     .bind(email)
     .first<UserRow>();
@@ -62,7 +67,11 @@ authRoutes.post('/login', async (c) => {
 authRoutes.get('/me', requireUser, async (c) => {
   const u = c.get('user')!;
   const row = await c.env.DB.prepare(
-    'SELECT id, email, password_hash, display_name, role, is_active, created_at, updated_at FROM users WHERE id = ?',
+    `SELECT u.id, u.email, u.password_hash, u.display_name, ${EFFECTIVE_GLOBAL_ROLE_SQL} AS role,
+            u.is_active, u.created_at, u.updated_at
+       FROM users u
+       LEFT JOIN user_global_roles ugr ON ugr.user_id = u.id
+      WHERE u.id = ?`,
   )
     .bind(u.id)
     .first<UserRow>();
@@ -99,7 +108,11 @@ authRoutes.patch('/profile', requireUser, async (c) => {
   }
 
   const selectSql =
-    'SELECT id, email, password_hash, display_name, role, is_active, created_at, updated_at FROM users WHERE id = ?';
+    `SELECT u.id, u.email, u.password_hash, u.display_name, ${EFFECTIVE_GLOBAL_ROLE_SQL} AS role,
+            u.is_active, u.created_at, u.updated_at
+       FROM users u
+       LEFT JOIN user_global_roles ugr ON ugr.user_id = u.id
+      WHERE u.id = ?`;
 
   if (sets.length === 0) {
     const cur = await c.env.DB.prepare(selectSql).bind(u.id).first<UserRow>();

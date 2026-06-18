@@ -35,7 +35,7 @@ Two options — both run on your machine, no container needed:
 
 ```bash
 npm install
-npm run dev:node
+npm run dev
 ```
 - Web (Vite + HMR): http://localhost:5173  → proxies `/api` to the Node server on :8080
 - API (Node + SQLite, hot-reload via tsx): http://localhost:8080
@@ -48,10 +48,11 @@ npm run dev:node
 **2. Wrangler (emulates Cloudflare locally: Workers + D1 + R2)**
 
 ```bash
-npm run dev   # wrangler dev on :8787 + Vite on :5173
+npm run cloudflare
 ```
-Needs `apps/worker/.dev.vars` (JWT_SECRET + R2 creds). Use this when you specifically
-want to test Cloudflare behaviour.
+Builds the Pages bundle and runs Wrangler Pages locally. Needs Cloudflare local
+bindings/secrets (`.dev.vars`, D1/R2). Use this when you specifically want to test
+Cloudflare behaviour.
 
 ---
 
@@ -63,7 +64,7 @@ defaults to a local folder — **no MinIO needed**.
 ```bash
 cp .env.example .env
 # edit .env: set JWT_SECRET (openssl rand -hex 32); optionally ADMIN_EMAIL/ADMIN_PASSWORD
-docker compose up -d --build
+npm run docker:detached
 ```
 
 - App: http://localhost:8080

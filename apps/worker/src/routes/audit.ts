@@ -1,5 +1,5 @@
 // Audit log reader. Scoped by caller's visibility:
-//   - super_admin sees everything (optionally filtered)
+//   - super_admin/admin/observer see everything (optionally filtered)
 //   - others see logs for customers/projects they have manage_members rights on
 //     (else they could only see their own actions, which we expose separately)
 
@@ -17,6 +17,10 @@ import {
 export const auditRoutes = new Hono<AppEnv>();
 
 auditRoutes.use('*', requireUser);
+
+function isGlobalVisible(role: string) {
+  return role === 'super_admin' || role === 'admin' || role === 'observer';
+}
 
 interface Row {
   id: number;
@@ -73,7 +77,7 @@ auditRoutes.get('/', async (c) => {
     const pid = Number(projectIdQ);
     if (!Number.isFinite(pid)) throw badRequest('invalid projectId');
     const ok = await canDoOnProject(c.env.DB, user, pid, 'manage_members');
-    if (!ok && user.role !== 'super_admin') {
+    if (!ok && !isGlobalVisible(user.role)) {
       // Fall back to "my own actions on this project"
       where.push('project_id = ? AND actor_type = ? AND actor_id = ?');
       args.push(pid, 'user', user.id);
@@ -85,14 +89,14 @@ auditRoutes.get('/', async (c) => {
     const cid = Number(customerIdQ);
     if (!Number.isFinite(cid)) throw badRequest('invalid customerId');
     const ok = await canDoOnCustomer(c.env.DB, user, cid, 'manage_members');
-    if (!ok && user.role !== 'super_admin') {
+    if (!ok && !isGlobalVisible(user.role)) {
       where.push('customer_id = ? AND actor_type = ? AND actor_id = ?');
       args.push(cid, 'user', user.id);
     } else {
       where.push('customer_id = ?');
       args.push(cid);
     }
-  } else if (user.role !== 'super_admin') {
+  } else if (!isGlobalVisible(user.role)) {
     // No specific scope; restrict to logs the user can see.
     const visibleCust = await visibleCustomerIds(c.env.DB, user);
     const visibleProj = await visibleProjectIds(c.env.DB, user);

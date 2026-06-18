@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { Fragment, useEffect, useMemo, useState, type FormEvent } from 'react';
 import { useParams } from 'react-router-dom';
 import { QRCodeSVG } from 'qrcode.react';
 import { api } from '../lib/api';
@@ -13,6 +13,7 @@ export default function ProjectDetail() {
   const { t } = useI18n();
   const [project, setProject] = useState<Project | null>(null);
   const [versions, setVersions] = useState<Version[]>([]);
+  const [expandedVersionGroups, setExpandedVersionGroups] = useState<Set<string>>(() => new Set());
   const [tokens, setTokens] = useState<ApiToken[]>([]);
   const [err, setErr] = useState<string | null>(null);
 
@@ -26,6 +27,7 @@ export default function ProjectDetail() {
   const [phase, setPhase] = useState<'idle' | 'sha256' | 'upload'>('idle');
   const [progress, setProgress] = useState({ loaded: 0, total: 0 });
   const [job, setJob] = useState<UploadJobHandle | null>(null);
+  const [uploadConflict, setUploadConflict] = useState<Version | null>(null);
 
   // token state
   const [showTokenDlg, setShowTokenDlg] = useState(false);
@@ -51,6 +53,46 @@ export default function ProjectDetail() {
     return [...set].sort();
   }, [project, versions]);
 
+  const versionList = useMemo(() => {
+    const set = new Set<string>();
+    for (const v of versions) set.add(v.version);
+    return [...set].sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+  }, [versions]);
+
+  const versionGroups = useMemo(() => {
+    const groups = new Map<string, Version[]>();
+    for (const v of versions) {
+      const list = groups.get(v.version);
+      if (list) list.push(v);
+      else groups.set(v.version, [v]);
+    }
+
+    return [...groups.entries()].flatMap(([label, items]) => {
+      const [first, ...rest] = items;
+      if (!first) return [];
+      const latest = rest.reduce((best, item) => (item.createdAt > best.createdAt ? item : best), first);
+      const channels = [...new Set(items.map((item) => item.releaseChannel))];
+      const statusCounts = new Map<Version['status'], number>();
+      for (const item of items) statusCounts.set(item.status, (statusCounts.get(item.status) ?? 0) + 1);
+      const sortedItems = [...items].sort(
+        (a, b) => Number(b.isCurrent) - Number(a.isCurrent) || b.createdAt - a.createdAt,
+      );
+      return {
+        label,
+        items: sortedItems,
+        latest,
+        channels,
+        statusCounts,
+        totalSize: items.reduce((sum, item) => sum + item.size, 0),
+        totalDownloads: items.reduce((sum, item) => sum + item.downloadCount, 0),
+        hasMandatory: items.some((item) => item.isMandatory),
+        hasCurrent: items.some((item) => item.isCurrent),
+        hasReady: items.some((item) => item.status === 'ready'),
+        hasPublic: items.some((item) => item.publicSlug),
+      };
+    }).sort((a, b) => Number(b.hasCurrent) - Number(a.hasCurrent) || b.latest.createdAt - a.latest.createdAt);
+  }, [versions]);
+
   async function load() {
     try {
       const p = await api.getProject(projectId);
@@ -71,9 +113,9 @@ export default function ProjectDetail() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId]);
 
-  async function startUploadHandler(e: FormEvent) {
-    e.preventDefault();
+  async function runUpload(overwriteExisting = false) {
     if (!file || !version) return;
+    setUploadConflict(null);
     setErr(null);
     setPhase('sha256');
     setProgress({ loaded: 0, total: file.size });
@@ -84,6 +126,7 @@ export default function ProjectDetail() {
       releaseChannel: channel || 'stable',
       notes: notes || undefined,
       isMandatory: mandatory,
+      overwriteExisting,
       concurrency: 4,
       onProgress: (loaded, total, ph) => {
         setPhase(ph);
@@ -107,6 +150,19 @@ export default function ProjectDetail() {
       setPhase('idle');
       setJob(null);
     }
+  }
+
+  async function startUploadHandler(e: FormEvent) {
+    e.preventDefault();
+    if (!file || !version) return;
+    const releaseChannel = channel || 'stable';
+    const existing = versions.find((v) => v.version === version && v.releaseChannel === releaseChannel);
+    if (existing) {
+      setErr(null);
+      setUploadConflict(existing);
+      return;
+    }
+    await runUpload(false);
   }
 
   async function cancelUpload() {
@@ -143,6 +199,15 @@ export default function ProjectDetail() {
   function patchVersion(id: number, patch: Partial<Version>) {
     setVersions((vs) => vs.map((x) => (x.id === id ? { ...x, ...patch } : x)));
     setPublicVer((pv) => (pv && pv.id === id ? { ...pv, ...patch } : pv));
+  }
+
+  function toggleVersionGroup(versionLabel: string) {
+    setExpandedVersionGroups((cur) => {
+      const next = new Set(cur);
+      if (next.has(versionLabel)) next.delete(versionLabel);
+      else next.add(versionLabel);
+      return next;
+    });
   }
 
   async function enablePublic() {
@@ -206,6 +271,15 @@ export default function ProjectDetail() {
   async function restoreVer(v: Version) {
     try {
       await api.updateVersion(v.id, { status: 'ready' });
+      await load();
+    } catch (e: any) {
+      setErr(e?.message);
+    }
+  }
+
+  async function setCurrentVersion(versionLabel: string) {
+    try {
+      await api.updateProject(projectId, { currentVersion: versionLabel });
       await load();
     } catch (e: any) {
       setErr(e?.message);
@@ -285,6 +359,80 @@ export default function ProjectDetail() {
 
   const pct = progress.total > 0 ? Math.round((progress.loaded / progress.total) * 100) : 0;
   const publicUrl = publicVer?.publicSlug ? publicUrlFor(publicVer.publicSlug) : null;
+  const renderChannelTag = (releaseChannel: string) => (
+    <span className={`tag ${releaseChannel === 'stable' ? 'stable' : releaseChannel === 'beta' ? 'beta' : ''}`}>
+      {releaseChannel}
+    </span>
+  );
+  const statusSummary = (statusCounts: Map<Version['status'], number>) =>
+    [...statusCounts.entries()]
+      .map(([status, count]) => `${t(`status.${status}`)}${count > 1 ? ` x${count}` : ''}`)
+      .join(' / ');
+  const renderVersionActions = (v: Version, showCurrentAction = true) => (
+    <>
+      <button onClick={() => download(v)} style={{ marginRight: 6 }} disabled={v.status !== 'ready'}>
+        {t('pd.download')}
+      </button>
+      <button
+        onClick={() => openPublic(v)}
+        style={{ marginRight: 6 }}
+        disabled={v.status !== 'ready' && !v.publicSlug}
+        className={v.publicSlug ? 'primary' : ''}
+        title={t('pd.dlgPublic')}
+      >
+        {v.publicSlug ? `${t('pd.public')} ✓` : t('pd.public')}
+      </button>
+      {v.status === 'ready' && (
+        <button onClick={() => archiveVer(v)} style={{ marginRight: 6 }}>
+          {t('pd.archive')}
+        </button>
+      )}
+      {showCurrentAction && v.status === 'ready' && (
+        <button onClick={() => setCurrentVersion(v.version)} style={{ marginRight: 6 }} disabled={v.isCurrent}>
+          {v.isCurrent ? t('pd.currentVersion') : t('pd.setCurrent')}
+        </button>
+      )}
+      {v.status === 'archived' && (
+        <button onClick={() => restoreVer(v)} style={{ marginRight: 6 }}>
+          {t('pd.restore')}
+        </button>
+      )}
+      <button className="danger" onClick={() => deleteVer(v)}>
+        {t('common.delete')}
+      </button>
+    </>
+  );
+  const renderVersionRow = (v: Version, grouped = false) => (
+    <tr key={v.id} className={grouped ? 'version-detail-row' : undefined}>
+      <td>
+        <span className="code">{v.version}</span>
+        {!grouped && v.isCurrent && (
+          <span className="tag current" style={{ marginLeft: 6 }}>
+            {t('pd.currentTag')}
+          </span>
+        )}
+        {v.publicSlug && (
+          <span className="tag" style={{ marginLeft: 6 }}>
+            {t('pd.publicTag')}
+          </span>
+        )}
+      </td>
+      <td>{renderChannelTag(v.releaseChannel)}</td>
+      <td>
+        <span className={`tag ${v.status === 'ready' ? 'stable' : ''}`}>{t(`status.${v.status}`)}</span>
+      </td>
+      <td>{formatBytes(v.size)}</td>
+      <td>
+        <span className="code" title={v.sha256 ?? ''}>
+          {v.sha256 ? `${v.sha256.slice(0, 12)}...` : '-'}
+        </span>
+      </td>
+      <td>{v.isMandatory ? '✓' : ''}</td>
+      <td className="muted">{new Date(v.createdAt).toLocaleString()}</td>
+      <td>{v.downloadCount}</td>
+      <td>{renderVersionActions(v, !grouped)}</td>
+    </tr>
+  );
 
   return (
     <>
@@ -322,64 +470,79 @@ export default function ProjectDetail() {
             </tr>
           </thead>
           <tbody>
-            {versions.map((v) => (
-              <tr key={v.id}>
-                <td>
-                  <span className="code">{v.version}</span>
-                  {v.publicSlug && (
-                    <span className="tag" style={{ marginLeft: 6 }}>
-                      {t('pd.publicTag')}
-                    </span>
-                  )}
-                </td>
-                <td>
-                  <span
-                    className={`tag ${v.releaseChannel === 'stable' ? 'stable' : v.releaseChannel === 'beta' ? 'beta' : ''}`}
-                  >
-                    {v.releaseChannel}
-                  </span>
-                </td>
-                <td>
-                  <span className={`tag ${v.status === 'ready' ? 'stable' : ''}`}>{t(`status.${v.status}`)}</span>
-                </td>
-                <td>{formatBytes(v.size)}</td>
-                <td>
-                  <span className="code" title={v.sha256 ?? ''}>
-                    {v.sha256 ? `${v.sha256.slice(0, 12)}…` : '—'}
-                  </span>
-                </td>
-                <td>{v.isMandatory ? '✓' : ''}</td>
-                <td className="muted">{new Date(v.createdAt).toLocaleString()}</td>
-                <td>{v.downloadCount}</td>
-                <td>
-                  <button onClick={() => download(v)} style={{ marginRight: 6 }} disabled={v.status !== 'ready'}>
-                    {t('pd.download')}
-                  </button>
-                  <button
-                    onClick={() => openPublic(v)}
-                    style={{ marginRight: 6 }}
-                    disabled={v.status !== 'ready' && !v.publicSlug}
-                    className={v.publicSlug ? 'primary' : ''}
-                    title={t('pd.dlgPublic')}
-                  >
-                    {v.publicSlug ? `${t('pd.public')} ✓` : t('pd.public')}
-                  </button>
-                  {v.status === 'ready' && (
-                    <button onClick={() => archiveVer(v)} style={{ marginRight: 6 }}>
-                      {t('pd.archive')}
-                    </button>
-                  )}
-                  {v.status === 'archived' && (
-                    <button onClick={() => restoreVer(v)} style={{ marginRight: 6 }}>
-                      {t('pd.restore')}
-                    </button>
-                  )}
-                  <button className="danger" onClick={() => deleteVer(v)}>
-                    {t('common.delete')}
-                  </button>
-                </td>
-              </tr>
-            ))}
+            {versionGroups.map((group) => {
+              const [first] = group.items;
+              if (!first) return null;
+              if (group.items.length === 1) return renderVersionRow(first);
+
+              const expanded = expandedVersionGroups.has(group.label);
+              const onlyStatus = group.statusCounts.size === 1 ? group.latest.status : null;
+              return (
+                <Fragment key={`group-${group.label}`}>
+                  <tr className="version-group-row" onClick={() => toggleVersionGroup(group.label)}>
+                    <td>
+                      <span className="version-group-main">
+                        <button
+                          type="button"
+                          className="version-toggle"
+                          aria-expanded={expanded}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleVersionGroup(group.label);
+                          }}
+                        >
+                          {expanded ? '-' : '+'}
+                        </button>
+                        <span className="code">{group.label}</span>
+                        <span className="tag">{t('pd.channelCount', { count: group.items.length })}</span>
+                        {group.hasCurrent && <span className="tag current">{t('pd.currentTag')}</span>}
+                        {group.hasPublic && <span className="tag">{t('pd.publicTag')}</span>}
+                      </span>
+                    </td>
+                    <td>
+                      <span className="tag-list">{group.channels.map((ch) => <Fragment key={ch}>{renderChannelTag(ch)}</Fragment>)}</span>
+                    </td>
+                    <td>
+                      <span className={`tag ${onlyStatus === 'ready' ? 'stable' : ''}`}>
+                        {statusSummary(group.statusCounts)}
+                      </span>
+                    </td>
+                    <td>{formatBytes(group.totalSize)}</td>
+                    <td>
+                      <span className="muted">-</span>
+                    </td>
+                    <td>{group.hasMandatory ? '✓' : ''}</td>
+                    <td className="muted">{new Date(group.latest.createdAt).toLocaleString()}</td>
+                    <td>{group.totalDownloads}</td>
+                    <td>
+                      {group.hasReady && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void setCurrentVersion(group.label);
+                          }}
+                          disabled={group.hasCurrent}
+                          style={{ marginRight: 6 }}
+                        >
+                          {group.hasCurrent ? t('pd.currentVersion') : t('pd.setCurrent')}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleVersionGroup(group.label);
+                        }}
+                      >
+                        {expanded ? t('pd.collapse') : t('pd.expand')}
+                      </button>
+                    </td>
+                  </tr>
+                  {expanded && group.items.map((v) => renderVersionRow(v, true))}
+                </Fragment>
+              );
+            })}
             {versions.length === 0 && (
               <tr>
                 <td colSpan={9} className="muted" style={{ textAlign: 'center', padding: 24 }}>
@@ -475,7 +638,15 @@ export default function ProjectDetail() {
             <h3>{t('pd.dlgUpload')}</h3>
             <label>
               <span className="lbl">{t('pd.fldFile')}</span>
-              <input type="file" onChange={(e) => setFile(e.target.files?.[0] ?? null)} required disabled={phase !== 'idle'} />
+              <input
+                type="file"
+                onChange={(e) => {
+                  setFile(e.target.files?.[0] ?? null);
+                  setUploadConflict(null);
+                }}
+                required
+                disabled={phase !== 'idle'}
+              />
               {file && (
                 <div className="muted" style={{ marginTop: 4 }}>
                   {file.name} — {formatBytes(file.size)}
@@ -484,18 +655,27 @@ export default function ProjectDetail() {
             </label>
             <label>
               <span className="lbl">{t('pd.fldVersion')}</span>
-              <input
+              <VersionField
                 value={version}
-                onChange={(e) => setVersion(e.target.value)}
-                pattern="^[A-Za-z0-9._+\-]{1,64}$"
-                required
+                onChange={(v) => {
+                  setVersion(v);
+                  setUploadConflict(null);
+                }}
+                options={versionList}
                 disabled={phase !== 'idle'}
-                style={{ width: '100%' }}
               />
             </label>
             <label>
               <span className="lbl">{t('pd.fldChannel')}</span>
-              <ChannelField value={channel} onChange={setChannel} options={channelList} disabled={phase !== 'idle'} />
+              <ChannelField
+                value={channel}
+                onChange={(v) => {
+                  setChannel(v);
+                  setUploadConflict(null);
+                }}
+                options={channelList}
+                disabled={phase !== 'idle'}
+              />
             </label>
             <label>
               <input
@@ -510,6 +690,27 @@ export default function ProjectDetail() {
               <span className="lbl">{t('pd.fldNotes')}</span>
               <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} disabled={phase !== 'idle'} style={{ width: '100%' }} />
             </label>
+            {uploadConflict && phase === 'idle' && (
+              <div className="inline-warning">
+                <strong>{t('pd.uploadConflictTitle')}</strong>
+                <div className="muted">
+                  {t('pd.uploadConflictBody', {
+                    version,
+                    channel: channel || 'stable',
+                    existing: uploadConflict.filename,
+                    current: file?.name ?? '',
+                  })}
+                </div>
+                <div className="dialog-actions" style={{ marginTop: 10 }}>
+                  <button type="button" onClick={() => setUploadConflict(null)}>
+                    {t('pd.renameUpload')}
+                  </button>
+                  <button type="button" className="primary" onClick={() => void runUpload(true)}>
+                    {t('pd.overwriteUpload')}
+                  </button>
+                </div>
+              </div>
+            )}
             {phase !== 'idle' && (
               <div style={{ margin: '12px 0' }}>
                 <div className="muted" style={{ marginBottom: 4 }}>
@@ -714,8 +915,78 @@ function ChannelField({
   disabled?: boolean;
 }) {
   const { t } = useI18n();
+  return (
+    <SelectOrCreateField
+      value={value}
+      onChange={onChange}
+      options={options}
+      allowAny={allowAny}
+      disabled={disabled}
+      pattern="^[a-z0-9][a-z0-9_\-]{0,31}$"
+      anyLabel={t('pd.tokenChannelAny')}
+      newLabel={t('pd.channelNew')}
+      backLabel={t('pd.channelBack')}
+      fallbackValue={options[0] ?? 'stable'}
+    />
+  );
+}
+
+function VersionField({
+  value,
+  onChange,
+  options,
+  disabled = false,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  options: string[];
+  disabled?: boolean;
+}) {
+  const { t } = useI18n();
+  return (
+    <SelectOrCreateField
+      value={value}
+      onChange={onChange}
+      options={options}
+      disabled={disabled}
+      pattern="^[A-Za-z0-9._+\-]{1,64}$"
+      required
+      emptyLabel={t('pd.versionPick')}
+      newLabel={t('pd.versionNew')}
+      backLabel={t('pd.versionBack')}
+    />
+  );
+}
+
+function SelectOrCreateField({
+  value,
+  onChange,
+  options,
+  allowAny = false,
+  disabled = false,
+  pattern,
+  required = false,
+  anyLabel,
+  emptyLabel,
+  newLabel,
+  backLabel,
+  fallbackValue,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  options: string[];
+  allowAny?: boolean;
+  disabled?: boolean;
+  pattern?: string;
+  required?: boolean;
+  anyLabel?: string;
+  emptyLabel?: string;
+  newLabel: string;
+  backLabel: string;
+  fallbackValue?: string;
+}) {
   const NEW = '__new__';
-  // Start in "create" mode if the current value is a channel not in the list.
+  // Start in "create" mode if the current value is not in the existing choices.
   const [creating, setCreating] = useState(() => value !== '' && !options.includes(value));
 
   if (creating) {
@@ -724,7 +995,8 @@ function ChannelField({
         <input
           value={value}
           onChange={(e) => onChange(e.target.value)}
-          pattern="^[a-z0-9][a-z0-9_\-]{0,31}$"
+          pattern={pattern}
+          required={required}
           disabled={disabled}
           autoFocus
           style={{ width: '100%' }}
@@ -734,20 +1006,23 @@ function ChannelField({
           disabled={disabled}
           onClick={() => {
             setCreating(false);
-            onChange(allowAny ? '' : options[0] ?? 'stable');
+            onChange(allowAny ? '' : fallbackValue ?? options[0] ?? '');
           }}
           style={{ justifySelf: 'start' }}
         >
-          {t('pd.channelBack')}
+          {backLabel}
         </button>
       </div>
     );
   }
 
+  const selectValue = value === '' || options.includes(value) ? value : NEW;
+
   return (
     <select
-      value={allowAny && value === '' ? '' : value}
+      value={selectValue}
       disabled={disabled}
+      required={required}
       onChange={(e) => {
         if (e.target.value === NEW) {
           setCreating(true);
@@ -758,13 +1033,18 @@ function ChannelField({
       }}
       style={{ width: '100%' }}
     >
-      {allowAny && <option value="">{t('pd.tokenChannelAny')}</option>}
+      {allowAny && <option value="">{anyLabel}</option>}
+      {!allowAny && emptyLabel && (
+        <option value="" disabled>
+          {emptyLabel}
+        </option>
+      )}
       {options.map((o) => (
         <option key={o} value={o}>
           {o}
         </option>
       ))}
-      <option value={NEW}>{t('pd.channelNew')}</option>
+      <option value={NEW}>{newLabel}</option>
     </select>
   );
 }

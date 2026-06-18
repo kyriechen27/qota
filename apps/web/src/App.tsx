@@ -45,7 +45,7 @@ export default function App() {
           <Route path="/projects" element={<Projects />} />
           <Route path="/projects/:id" element={<ProjectDetail />} />
           <Route path="/files" element={<Files />} />
-          {user.role === 'super_admin' && (
+          {(user.role === 'super_admin' || user.role === 'admin') && (
             <>
               <Route path="/users" element={<Users />} />
               <Route path="/permissions" element={<Permissions />} />

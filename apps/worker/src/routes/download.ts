@@ -158,13 +158,17 @@ downloadRoutes.get('/device/latest', async (c) => {
     if (projectCode && p.p_code !== projectCode) throw forbidden('project mismatch');
   }
 
+  const current = await c.env.DB.prepare('SELECT current_version FROM projects WHERE id = ?')
+    .bind(dev.projectId)
+    .first<{ current_version: string | null }>();
+  const currentVersion = current?.current_version ?? null;
   const row = await c.env.DB.prepare(
     `SELECT id, project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type
        FROM versions
       WHERE project_id = ? AND release_channel = ? AND status = 'ready'
-      ORDER BY created_at DESC LIMIT 1`,
+      ORDER BY CASE WHEN version = ? THEN 0 ELSE 1 END, created_at DESC LIMIT 1`,
   )
-    .bind(dev.projectId, channel)
+    .bind(dev.projectId, channel, currentVersion)
     .first<VersionRow>();
   if (!row) throw notFound('no ready versions in this channel');
 
@@ -181,15 +185,19 @@ downloadRoutes.get('/device/list', async (c) => {
   if (dev.channel && qChannel && dev.channel !== qChannel) throw forbidden('channel not allowed for this token');
   const effChannel = dev.channel ?? qChannel ?? null;
 
-  const where = ['project_id = ?', `status = 'ready'`];
+  const where = ['v.project_id = ?', `v.status = 'ready'`];
   const args: unknown[] = [dev.projectId];
   if (effChannel) {
-    where.push('release_channel = ?');
+    where.push('v.release_channel = ?');
     args.push(effChannel);
   }
   const rows = await c.env.DB.prepare(
-    `SELECT id, version, release_channel, filename, size, sha256, content_type, is_mandatory, created_at
-       FROM versions WHERE ${where.join(' AND ')} ORDER BY created_at DESC`,
+    `SELECT v.id, v.version, v.release_channel, v.filename, v.size, v.sha256, v.content_type, v.is_mandatory,
+            p.current_version, v.created_at
+      FROM versions v
+      JOIN projects p ON p.id = v.project_id
+      WHERE ${where.join(' AND ')}
+      ORDER BY CASE WHEN v.version = p.current_version THEN 0 ELSE 1 END, v.created_at DESC`,
   )
     .bind(...args)
     .all<{
@@ -201,6 +209,7 @@ downloadRoutes.get('/device/list', async (c) => {
       sha256: string | null;
       content_type: string | null;
       is_mandatory: number;
+      current_version: string | null;
       created_at: number;
     }>();
   const proj = await c.env.DB.prepare(
@@ -219,6 +228,7 @@ downloadRoutes.get('/device/list', async (c) => {
     sha256: r.sha256,
     contentType: r.content_type,
     isMandatory: !!r.is_mandatory,
+    isCurrent: r.current_version === r.version,
     createdAt: r.created_at,
     download: `/api/download/device/version/${r.id}`,
   }));

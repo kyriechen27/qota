@@ -6,6 +6,8 @@ PRAGMA foreign_keys = ON;
 -- Users (global identity)
 -- role = 'super_admin' grants implicit access to everything.
 -- role = 'developer' has no global rights; access is via memberships.
+-- Additional global roles live in user_global_roles so existing databases do
+-- not need the original users table rebuilt when new roles are added.
 -- (Devices/CI are NOT users — they live in api_tokens.)
 -- ============================================================
 CREATE TABLE users (
@@ -18,6 +20,13 @@ CREATE TABLE users (
   is_active     INTEGER NOT NULL DEFAULT 1,
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL
+);
+
+CREATE TABLE user_global_roles (
+  user_id    INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  role       TEXT    NOT NULL CHECK (role IN ('admin', 'observer')),
+  updated_at INTEGER NOT NULL,
+  updated_by INTEGER REFERENCES users(id)
 );
 
 -- ============================================================

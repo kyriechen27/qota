@@ -148,6 +148,26 @@ th { background: var(--panel-2); color: var(--muted); font-weight: 500; }
 tr:last-child td { border-bottom: none; }
 tr:hover td { background: #1a1f2a; }
 
+.version-group-row { cursor: pointer; }
+.version-group-row td { background: #182131; }
+.version-group-row:hover td { background: #1d2a3d; }
+.version-detail-row td:first-child { padding-left: 40px; }
+.version-group-main,
+.tag-list {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.version-toggle {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  text-align: center;
+  font-weight: 700;
+  line-height: 1;
+}
+
 .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
 .card h3 { margin-top: 0; }
 
@@ -166,6 +186,7 @@ tr:hover td { background: #1a1f2a; }
 .tag.admin { background: #2a1f3a; color: #c084fc; border-color: #4a2f6a; }
 .tag.stable { background: #1f2a1f; color: #86efac; border-color: #2f4a2f; }
 .tag.beta { background: #2a2519; color: #fbbf24; border-color: #4a4029; }
+.tag.current { background: #14302f; color: #67e8f9; border-color: #23666f; }
 
 .login-page {
   display: flex;
@@ -211,13 +232,32 @@ tr:hover td { background: #1a1f2a; }
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 24px;
+  width: 420px;
   min-width: 420px;
   max-width: 90vw;
   max-height: 90vh;
   overflow: auto;
 }
 .dialog h3 { margin-top: 0; }
-.dialog-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+.dialog .muted {
+  overflow-wrap: anywhere;
+}
+.dialog input,
+.dialog select,
+.dialog textarea {
+  max-width: 100%;
+}
+.dialog-actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; margin-top: 16px; }
+.inline-warning {
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid #5b4320;
+  border-radius: 8px;
+  background: #241d12;
+  color: #f8d28a;
+  overflow-wrap: anywhere;
+}
+.inline-warning .muted { color: #d8b978; }
 
 .progress { height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
 .progress > div { height: 100%; background: var(--accent); transition: width 0.2s; }
@@ -231,4 +271,8 @@ tr:hover td { background: #1a1f2a; }
   .brand { border-bottom: none; padding: 0 12px 0 0; margin: 0 12px 0 0; }
   .sidebar .spacer { display: none; }
   .sidebar .user-box { border: none; margin: 0; padding: 0; }
+  .dialog {
+    width: calc(100vw - 32px);
+    min-width: 0;
+  }
 }

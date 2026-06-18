@@ -9,7 +9,7 @@ import type { Customer, Project } from '@qota/shared';
 export default function Projects() {
   const { user } = useAuth();
   const { t } = useI18n();
-  const isAdmin = user?.role === 'super_admin';
+  const isAdmin = user?.role === 'super_admin' || user?.role === 'admin';
   const [params, setParams] = useSearchParams();
   const customerIdParam = params.get('customerId');
   const customerId = customerIdParam ? Number(customerIdParam) : undefined;
@@ -47,7 +47,7 @@ export default function Projects() {
   }, [customerId]);
 
   const customerName = useMemo(() => {
-    const m = new Map(customers.map((c) => [c.id, c.code]));
+    const m = new Map(customers.map((c) => [c.id, `${c.name} (${c.code})`]));
     return (id: number) => m.get(id) ?? `#${id}`;
   }, [customers]);
 
@@ -98,7 +98,7 @@ export default function Projects() {
           <option value="">{t('projects.allCustomers')}</option>
           {customers.map((c) => (
             <option key={c.id} value={c.id}>
-              {c.code} — {c.name}
+              {c.name} ({c.code})
             </option>
           ))}
         </select>
@@ -172,7 +172,7 @@ export default function Projects() {
                 </option>
                 {customers.map((c) => (
                   <option key={c.id} value={c.id}>
-                    {c.code} — {c.name}
+                    {c.name} ({c.code})
                   </option>
                 ))}
               </select>

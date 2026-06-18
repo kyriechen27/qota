@@ -2,6 +2,8 @@
 //
 // Roles:
 //   - users.role = 'super_admin'  → implicit access to everything
+//   - users.role = 'admin'        → global management except super-admin users
+//   - users.role = 'observer'     → global read/download only
 //   - users.role = 'developer'    → no global access; relies on memberships
 //
 // Customer-scoped roles (in `memberships` and `project_memberships` tables):
@@ -46,6 +48,26 @@ const ROLE_GRANTS: Record<CustomerRole, ReadonlySet<Action>> = {
   ]),
   viewer: new Set<Action>(['view', 'download']),
 };
+
+const GLOBAL_ADMIN_ACTIONS = new Set<Action>([
+  'view',
+  'download',
+  'upload',
+  'manage_versions',
+  'manage_tokens',
+  'manage_members',
+  'manage_projects',
+  'manage_customer',
+]);
+
+const GLOBAL_OBSERVER_ACTIONS = new Set<Action>(['view', 'download']);
+
+function globalRoleHas(user: AuthedUser, action: Action): boolean | null {
+  if (user.role === 'super_admin') return true;
+  if (user.role === 'admin') return GLOBAL_ADMIN_ACTIONS.has(action);
+  if (user.role === 'observer') return GLOBAL_OBSERVER_ACTIONS.has(action);
+  return null;
+}
 
 export function roleHas(role: CustomerRole, action: Action): boolean {
   return ROLE_GRANTS[role].has(action);
@@ -92,7 +114,8 @@ export async function canDoOnCustomer(
   customerId: number,
   action: Action,
 ): Promise<boolean> {
-  if (user.role === 'super_admin') return true;
+  const global = globalRoleHas(user, action);
+  if (global !== null) return global;
   const role = await effectiveRoleOnCustomer(db, user.id, customerId);
   return !!role && roleHas(role, action);
 }
@@ -103,7 +126,8 @@ export async function canDoOnProject(
   projectId: number,
   action: Action,
 ): Promise<boolean> {
-  if (user.role === 'super_admin') return true;
+  const global = globalRoleHas(user, action);
+  if (global !== null) return global;
   const role = await effectiveRoleOnProject(db, user.id, projectId);
   return !!role && roleHas(role, action);
 }
@@ -142,12 +166,12 @@ export async function requireCustomerAccess(
   return row;
 }
 
-/** Customer ids the user can see (null = no filter, i.e. super_admin). */
+/** Customer ids the user can see (null = no filter, i.e. global role can see all). */
 export async function visibleCustomerIds(
   db: D1Database,
   user: AuthedUser,
 ): Promise<number[] | null> {
-  if (user.role === 'super_admin') return null;
+  if (user.role === 'super_admin' || user.role === 'admin' || user.role === 'observer') return null;
   const direct = await db
     .prepare('SELECT customer_id FROM memberships WHERE user_id = ?')
     .bind(user.id)
@@ -172,7 +196,7 @@ export async function visibleProjectIds(
   db: D1Database,
   user: AuthedUser,
 ): Promise<number[] | null> {
-  if (user.role === 'super_admin') return null;
+  if (user.role === 'super_admin' || user.role === 'admin' || user.role === 'observer') return null;
   const rows = await db
     .prepare(
       `SELECT DISTINCT p.id FROM projects p

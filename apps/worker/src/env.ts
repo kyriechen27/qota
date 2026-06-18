@@ -47,7 +47,7 @@ export interface Bindings {
   R2_SECRET_ACCESS_KEY?: string;
 }
 
-export type GlobalRole = 'super_admin' | 'developer';
+export type GlobalRole = 'super_admin' | 'admin' | 'developer' | 'observer';
 export type CustomerRole = 'customer_admin' | 'developer' | 'viewer';
 
 export interface AuthedUser {

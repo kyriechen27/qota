@@ -14,7 +14,7 @@ import type { AppEnv } from '../env';
 import { requireUser } from '../middleware/auth';
 import { badRequest, conflict, notFound } from '../utils/errors';
 import { requireProjectAccess } from '../lib/memberships';
-import { makeStorage } from '../lib/s3';
+import { makeStorage, type StorageBackend } from '../lib/s3';
 import { audit } from '../lib/audit';
 import { versionDto } from './versions';
 
@@ -42,6 +42,14 @@ function clampPartSize(hint: number | undefined, totalSize: number): number {
 function r2KeyFor(customerCode: string, projectCode: string, channel: string, version: string, filename: string): string {
   const safe = filename.replace(/[^A-Za-z0-9._+-]/g, '_');
   return `${customerCode}/${projectCode}/${channel}/${version}/${safe}`;
+}
+
+async function deleteObjectBestEffort(storage: StorageBackend, key: string) {
+  try {
+    await storage.deleteObject(key);
+  } catch (e) {
+    console.warn('[upload.complete] old object delete failed:', e);
+  }
 }
 
 interface SessionRow {
@@ -111,6 +119,7 @@ uploadRoutes.post('/init', async (c) => {
     minVersion?: string | null;
     maxVersion?: string | null;
     rolloutPercentage?: number;
+    overwriteExisting?: boolean;
     expectedSha256?: string;
     partSizeHint?: number;
   };
@@ -140,13 +149,12 @@ uploadRoutes.post('/init', async (c) => {
     .first<{ code: string }>();
   if (!customer) throw notFound('customer not found');
 
-  // Reject duplicate (project, version, channel) — block early before we open an R2 multipart.
-  const dup = await c.env.DB.prepare(
-    `SELECT id FROM versions WHERE project_id = ? AND version = ? AND release_channel = ?`,
+  const existing = await c.env.DB.prepare(
+    `SELECT id, r2_key FROM versions WHERE project_id = ? AND version = ? AND release_channel = ?`,
   )
     .bind(body.projectId, body.version, channel)
-    .first();
-  if (dup) throw conflict('version+channel already exists');
+    .first<{ id: number; r2_key: string }>();
+  if (existing && !body.overwriteExisting) throw conflict('version+channel already exists');
 
   const totalSize = body.totalSize!;
   const partSize = clampPartSize(body.partSizeHint, totalSize);
@@ -161,9 +169,9 @@ uploadRoutes.post('/init', async (c) => {
   const r = await c.env.DB.prepare(
     `INSERT INTO upload_sessions
        (project_id, r2_key, filename, total_size, part_size, upload_id, expected_sha256, release_channel,
-        target_version, content_type, notes, is_mandatory, min_version, max_version, rollout_percentage,
+        target_version, content_type, notes, is_mandatory, min_version, max_version, rollout_percentage, version_id,
         status, initiated_by, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?)`,
   )
     .bind(
       body.projectId,
@@ -181,6 +189,7 @@ uploadRoutes.post('/init', async (c) => {
       body.minVersion ?? null,
       body.maxVersion ?? null,
       body.rolloutPercentage === undefined ? 100 : Math.floor(body.rolloutPercentage),
+      existing?.id ?? null,
       me.id,
       now,
     )
@@ -193,7 +202,7 @@ uploadRoutes.post('/init', async (c) => {
     projectId: body.projectId,
     targetType: 'upload_session',
     targetId: sessionId,
-    meta: { key, totalSize, partSize, partCount, version: body.version, channel },
+    meta: { key, totalSize, partSize, partCount, version: body.version, channel, overwriteVersionId: existing?.id },
   });
 
   return c.json({
@@ -313,34 +322,81 @@ uploadRoutes.post('/complete', async (c) => {
     console.warn('[upload.complete] size mismatch', { expected: session.total_size, actual: head.size });
   }
 
-  // Insert the version row
-  const verRes = await c.env.DB.prepare(
-    `INSERT INTO versions
-       (project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
-        is_mandatory, min_version, max_version, rollout_percentage, device_group_id,
-        uploaded_by, created_at, updated_at)
-     VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
-  )
-    .bind(
-      session.project_id,
-      session.target_version,
-      session.release_channel,
-      session.r2_key,
-      session.filename,
-      session.total_size,
-      body.sha256 ?? session.expected_sha256 ?? null,
-      session.content_type,
-      session.notes,
-      session.is_mandatory,
-      session.min_version,
-      session.max_version,
-      session.rollout_percentage,
-      session.initiated_by,
-      now,
-      now,
+  const sha256 = body.sha256 ?? session.expected_sha256 ?? null;
+  let versionId = session.version_id ?? 0;
+  let oldKey: string | null = null;
+
+  if (session.version_id) {
+    const existing = await c.env.DB.prepare('SELECT r2_key FROM versions WHERE id = ? AND project_id = ?')
+      .bind(session.version_id, session.project_id)
+      .first<{ r2_key: string }>();
+    if (!existing) throw conflict('overwrite target version no longer exists');
+    oldKey = existing.r2_key;
+    await c.env.DB.prepare(
+      `UPDATE versions
+          SET status = 'ready',
+              r2_key = ?,
+              filename = ?,
+              size = ?,
+              sha256 = ?,
+              content_type = ?,
+              notes = ?,
+              is_mandatory = ?,
+              min_version = ?,
+              max_version = ?,
+              rollout_percentage = ?,
+              uploaded_by = ?,
+              created_at = ?,
+              updated_at = ?
+        WHERE id = ?`,
     )
-    .run();
-  const versionId = Number(verRes.meta.last_row_id);
+      .bind(
+        session.r2_key,
+        session.filename,
+        session.total_size,
+        sha256,
+        session.content_type,
+        session.notes,
+        session.is_mandatory,
+        session.min_version,
+        session.max_version,
+        session.rollout_percentage,
+        session.initiated_by,
+        now,
+        now,
+        session.version_id,
+      )
+      .run();
+  } else {
+    // Insert the version row
+    const verRes = await c.env.DB.prepare(
+      `INSERT INTO versions
+         (project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
+          is_mandatory, min_version, max_version, rollout_percentage, device_group_id,
+          uploaded_by, created_at, updated_at)
+       VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
+    )
+      .bind(
+        session.project_id,
+        session.target_version,
+        session.release_channel,
+        session.r2_key,
+        session.filename,
+        session.total_size,
+        sha256,
+        session.content_type,
+        session.notes,
+        session.is_mandatory,
+        session.min_version,
+        session.max_version,
+        session.rollout_percentage,
+        session.initiated_by,
+        now,
+        now,
+      )
+      .run();
+    versionId = Number(verRes.meta.last_row_id);
+  }
 
   await c.env.DB.prepare(
     `UPDATE upload_sessions SET status = 'completed', completed_at = ?, version_id = ? WHERE id = ?`,
@@ -358,16 +414,21 @@ uploadRoutes.post('/complete', async (c) => {
       sessionId: session.id,
       key: session.r2_key,
       size: session.total_size,
-      sha256: body.sha256 ?? session.expected_sha256 ?? null,
+      sha256,
       etag: completeRes.etag,
       parts: body.parts.length,
+      overwritten: !!session.version_id,
     },
   });
 
+  if (oldKey && oldKey !== session.r2_key) void deleteObjectBestEffort(s3, oldKey);
+
   const ver = await c.env.DB.prepare(
-    `SELECT id, project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
-            is_mandatory, min_version, max_version, rollout_percentage, device_group_id, download_count, uploaded_by, created_at, updated_at
-       FROM versions WHERE id = ?`,
+    `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type, v.notes,
+            v.is_mandatory, p.current_version, v.min_version, v.max_version, v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug, v.uploaded_by, v.created_at, v.updated_at
+       FROM versions v
+       JOIN projects p ON p.id = v.project_id
+      WHERE v.id = ?`,
   )
     .bind(versionId)
     .first<any>();

@@ -9,7 +9,7 @@ import type { Customer } from '@qota/shared';
 export default function Customers() {
   const { user } = useAuth();
   const { t } = useI18n();
-  const isAdmin = user?.role === 'super_admin';
+  const isAdmin = user?.role === 'super_admin' || user?.role === 'admin';
   const [items, setItems] = useState<Customer[]>([]);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);

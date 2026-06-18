@@ -22,6 +22,7 @@ export interface UploadJobOptions {
   minVersion?: string | null;
   maxVersion?: string | null;
   rolloutPercentage?: number;
+  overwriteExisting?: boolean;
   partSizeHint?: number;
   concurrency?: number;
   onProgress?: (loaded: number, total: number, phase: 'sha256' | 'upload') => void;
@@ -122,6 +123,7 @@ export function startUpload(opts: UploadJobOptions): UploadJobHandle {
       minVersion: opts.minVersion,
       maxVersion: opts.maxVersion,
       rolloutPercentage: opts.rolloutPercentage,
+      overwriteExisting: opts.overwriteExisting,
       expectedSha256: sha256,
       partSizeHint: opts.partSizeHint,
     });
