@@ -196,11 +196,6 @@ export default function ProjectDetail() {
     await mutateVersions(() => api.updateVersionGroup({ projectId, version: versionLabel, status }));
   }
 
-  async function archiveAllVersions() {
-    if (!confirm(t('pd.confirmArchiveAll'))) return;
-    await mutateVersions(() => api.archiveAllVersions(projectId));
-  }
-
   async function createToken(e: FormEvent) {
     e.preventDefault();
     setErr(null);
@@ -558,12 +553,6 @@ export default function ProjectDetail() {
         <div className="version-card-header">
           <div className="version-section-title"><h3>{t('pd.versions')}</h3><span className="version-count">{versionGroups.length}</span></div>
           <div className="version-actions">
-            <button
-              onClick={archiveAllVersions}
-              disabled={versionBusy || !versions.some((v) => v.status === 'ready')}
-            >
-              {t('pd.archiveAll')}
-            </button>
             <button className="primary" onClick={() => setShowUpload(true)}>
               {t('pd.uploadNew')}
             </button>

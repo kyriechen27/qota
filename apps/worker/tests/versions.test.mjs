@@ -217,7 +217,7 @@ test('group archive and restore are scoped to one project and label and preserve
   assert.deepEqual(await f.current(), ['v2']);
 });
 
-test('archive all changes only ready artifacts in the requested project and clears its selections', async (t) => {
+test('removed archive-all endpoint returns 404 without changing artifacts or current selections', async (t) => {
   const f = await fixture(t);
   const one = f.version('v1', 'ota', { notes: 'Keep these release notes' });
   const two = f.version('v2', 'flash');
@@ -227,20 +227,12 @@ test('archive all changes only ready artifacts in the requested project and clea
   await f.group('v1', { isCurrent: true });
   await f.group('v2', { isCurrent: true });
   await f.group('v1', { isCurrent: true }, 2);
-  const untouchedPending = f.row(pending);
-  const untouchedArchive = f.row(previouslyArchived);
-  const result = await f.request('/api/versions/archive-all', { method: 'POST', body: { projectId: 1 } });
-  assert.equal(result.ok, true);
-  assert.equal(f.row(one).status, 'archived');
-  assert.equal(f.row(two).status, 'archived');
-  assert.equal(f.row(one).notes, 'Keep these release notes');
-  assert.deepEqual(f.row(pending), untouchedPending);
-  assert.deepEqual(f.row(previouslyArchived), untouchedArchive);
-  assert.equal(f.row(other).status, 'ready');
-  assert.deepEqual(await f.current(), []);
+  const ids = [one, two, pending, previouslyArchived, other];
+  const before = ids.map(f.row);
+  await f.request('/api/versions/archive-all', { method: 'POST', body: { projectId: 1 }, status: 404 });
+  assert.deepEqual(ids.map(f.row), before);
+  assert.deepEqual(await f.current(), ['v1', 'v2']);
   assert.deepEqual(await f.current(2), ['v1']);
-  await f.request('/api/versions/archive-all', { method: 'POST', body: { projectId: 1 } });
-  assert.deepEqual(await f.current(), []);
 });
 
 test('full multiline notes round-trip through detail, lists, updates, archive and restore', async (t) => {
@@ -294,18 +286,16 @@ test('device latest prioritizes all current labels within the requested channel 
   await f.request('/api/download/device/list?channel=ota', { token: pinnedToken, status: 403 });
 });
 
-test('new bulk mutations enforce authentication, role permissions, and project boundaries', async (t) => {
+test('version group mutations enforce authentication, role permissions, and project boundaries', async (t) => {
   const f = await fixture(t);
   const one = f.version('v1', 'ota');
   const other = f.version('v1', 'ota', { projectId: 2 });
   for (const [userId, status] of [[null, 401], [3, 403], [4, 403]]) {
     await f.group('v1', { isCurrent: true }, 1, { userId, status });
     await f.group('v1', { status: 'archived' }, 1, { userId, status });
-    await f.request('/api/versions/archive-all', { method: 'POST', body: { projectId: 1 }, userId, status });
   }
   await f.group('v1', { isCurrent: true }, 2, { userId: 2, status: 403 });
   await f.group('v1', { status: 'archived' }, 2, { userId: 2, status: 403 });
-  await f.request('/api/versions/archive-all', { method: 'POST', body: { projectId: 2 }, userId: 2, status: 403 });
   assert.equal(f.row(one).status, 'ready');
   assert.equal(f.row(other).status, 'ready');
   assert.deepEqual(await f.current(), []);

@@ -28340,27 +28340,6 @@ versionRoutes.patch("/group", async (c) => {
   ).bind(body.projectId, body.version).all();
   return c.json((await withNotePermissions(c.env.DB, c.get("user"), updated.results ?? [])).map(versionDto));
 });
-versionRoutes.post("/archive-all", async (c) => {
-  const body = await c.req.json().catch(() => null);
-  if (!body || !Number.isSafeInteger(body.projectId) || body.projectId <= 0) {
-    throw badRequest("valid projectId required");
-  }
-  const proj = await requireProjectAccess(c.env.DB, c.get("user"), body.projectId, "manage_versions");
-  const now = Date.now();
-  await c.env.DB.batch([
-    c.env.DB.prepare(`UPDATE versions SET status = 'archived', updated_at = ? WHERE project_id = ? AND status = 'ready'`).bind(now, body.projectId),
-    clearUnusedCurrentVersions(c.env.DB, body.projectId),
-    syncLegacyCurrentVersion(c.env.DB, body.projectId, now)
-  ]);
-  await audit(c, {
-    action: "version.archive_all",
-    customerId: proj.customer_id,
-    projectId: body.projectId,
-    targetType: "project",
-    targetId: body.projectId
-  });
-  return c.json({ ok: true });
-});
 versionRoutes.patch("/:id", async (c) => {
   const id = Number(c.req.param("id"));
   if (!Number.isFinite(id)) throw badRequest("invalid id");
