@@ -13,6 +13,7 @@
 //     → 302 redirect
 
 import { Hono, type Context } from 'hono';
+import { IS_CURRENT_SQL } from '../lib/current-versions';
 import type { AppEnv } from '../env';
 import { requireUser } from '../middleware/auth';
 import { badRequest, forbidden, notFound, unauthorized } from '../utils/errors';
@@ -158,17 +159,17 @@ downloadRoutes.get('/device/latest', async (c) => {
     if (projectCode && p.p_code !== projectCode) throw forbidden('project mismatch');
   }
 
-  const current = await c.env.DB.prepare('SELECT current_version FROM projects WHERE id = ?')
-    .bind(dev.projectId)
-    .first<{ current_version: string | null }>();
-  const currentVersion = current?.current_version ?? null;
+  const filename = c.req.query('filename');
+  const args: unknown[] = [dev.projectId, channel];
+  if (filename !== undefined) args.push(filename);
   const row = await c.env.DB.prepare(
-    `SELECT id, project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type
-       FROM versions
-      WHERE project_id = ? AND release_channel = ? AND status = 'ready'
-      ORDER BY CASE WHEN version = ? THEN 0 ELSE 1 END, created_at DESC LIMIT 1`,
+    `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type
+       FROM versions v
+      WHERE v.project_id = ? AND v.release_channel = ? AND v.status = 'ready'
+        ${filename !== undefined ? 'AND v.filename = ?' : ''}
+      ORDER BY ${IS_CURRENT_SQL} DESC, v.created_at DESC, v.id DESC LIMIT 1`,
   )
-    .bind(dev.projectId, channel, currentVersion)
+    .bind(...args)
     .first<VersionRow>();
   if (!row) throw notFound('no ready versions in this channel');
 
@@ -191,13 +192,18 @@ downloadRoutes.get('/device/list', async (c) => {
     where.push('v.release_channel = ?');
     args.push(effChannel);
   }
+  const filename = c.req.query('filename');
+  if (filename !== undefined) {
+    where.push('v.filename = ?');
+    args.push(filename);
+  }
   const rows = await c.env.DB.prepare(
     `SELECT v.id, v.version, v.release_channel, v.filename, v.size, v.sha256, v.content_type, v.is_mandatory,
-            p.current_version, v.created_at
+            ${IS_CURRENT_SQL} AS is_current, v.created_at
       FROM versions v
       JOIN projects p ON p.id = v.project_id
       WHERE ${where.join(' AND ')}
-      ORDER BY CASE WHEN v.version = p.current_version THEN 0 ELSE 1 END, v.created_at DESC`,
+      ORDER BY is_current DESC, v.created_at DESC, v.id DESC`,
   )
     .bind(...args)
     .all<{
@@ -209,7 +215,7 @@ downloadRoutes.get('/device/list', async (c) => {
       sha256: string | null;
       content_type: string | null;
       is_mandatory: number;
-      current_version: string | null;
+      is_current: number;
       created_at: number;
     }>();
   const proj = await c.env.DB.prepare(
@@ -228,7 +234,7 @@ downloadRoutes.get('/device/list', async (c) => {
     sha256: r.sha256,
     contentType: r.content_type,
     isMandatory: !!r.is_mandatory,
-    isCurrent: r.current_version === r.version,
+    isCurrent: !!r.is_current,
     createdAt: r.created_at,
     download: `/api/download/device/version/${r.id}`,
   }));

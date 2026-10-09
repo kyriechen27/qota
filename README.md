@@ -88,6 +88,8 @@ npm run dev
 
 `npm run dev` 使用 Node 运行时:API 在 http://127.0.0.1:8080,Vite 在
 http://localhost:5173,文件默认存到 `apps/worker/data/blobs`,不需要 R2/MinIO。
+支持内置 SQLite 的 Node 版本会自动使用 `node:sqlite`;较旧的 Node 版本使用
+可选的 `better-sqlite3` 依赖,避免新版 Node 因原生模块版本不匹配而无法启动。
 第一次启动如果数据库为空,会自动创建 `ADMIN_EMAIL` / `ADMIN_PASSWORD`
 (默认 `admin@example.com` / `admin12345`)。
 
@@ -280,13 +282,36 @@ curl -L --output ota.bin -H "Authorization: Bearer qd_..." \
 后台 *Download* 按钮调 `POST /api/download/grant`,得到 5min presigned URL,然后浏览
 器直拉 R2(不经 Worker 流量)。
 
+### 当前使用、归档与备注
+
+同一项目可以同时标记多个版本号为“当前使用”,也可以单独取消。标记覆盖该版本号下
+所有就绪通道;设备 `/device/latest` 优先选择所请求通道中最新上传的当前版本,
+没有匹配的当前版本时选择该通道最新的就绪版本。
+
+版本列表支持整组归档和归档全部就绪版本,归档后显示在“版本”与“API 令牌”之间的
+“归档”区域,并可恢复。归档整个版本会取消它的当前使用标记;恢复不会自动重新标记。
+
+备注列最多显示两行,点击可查看全文。不同文件的备注按文件名和通道分别展示。已有备注仅允许
+原上传者或有权限的管理员修改;当前使用中的版本必须先单独取消当前使用,才能修改备注。
+
+### 批量上传
+
+上传窗口支持一次选择多个文件,共用版本号和备注。每个文件可以单独选择或新建通道,
+默认使用项目的默认通道。同一版本、同一通道可以保留多个不同名称的文件,
+同名文件也可以分配到不同通道;只有版本号、通道和文件名都相同时才需要确认覆盖。
+文件依次上传并分别显示进度和结果。部分文件失败不会中断其他文件,重试只处理未成功的文件。
+取消会停止当前上传和后续队列,已经成功上传的文件会保留。
+
+设备可通过 `/device/list` 获取各文件 ID 后分别下载,也可在 `/device/latest` 添加
+`filename` 参数筛选指定文件名。不指定文件名时保持原有的最新文件选择规则。
+
 ## 上传协议(参考)
 
 每一步都是 JSON over `Authorization: Bearer <jwt>`(or CI api_token with scope upload):
 
 | Step | Request | Notes |
 | --- | --- | --- |
-| `POST /api/upload/init` | `{ projectId, filename, totalSize, version, releaseChannel?, expectedSha256?, partSizeHint?, notes?, isMandatory?, minVersion?, maxVersion?, rolloutPercentage? }` | Worker 用 R2 S3 endpoint 调 CreateMultipartUpload,返回 `sessionId/uploadId/key/partSize/partCount/uploadedParts`。 |
+| `POST /api/upload/init` | `{ projectId, filename, totalSize, version, releaseChannel?, expectedSha256?, partSizeHint?, notes?, isMandatory?, minVersion?, maxVersion?, rolloutPercentage?, overwriteExisting? }` | Worker 用 R2 S3 endpoint 调 CreateMultipartUpload,返回 `sessionId/uploadId/key/partSize/partCount/uploadedParts`。同版本、同通道、同文件名返回 409,设置 `overwriteExisting: true` 可明确覆盖该文件。 |
 | `POST /api/upload/sign-part` | `{ sessionId, partNumber }` | 返回 10min 短期 presigned PUT URL。 |
 | `PUT <presigned url>` | 二进制分片 | 客户端直传 R2。响应 header `ETag` 必须能读到 → 检查 CORS。 |
 | `POST /api/upload/complete` | `{ sessionId, parts:[{partNumber, etag, size}], sha256 }` | Worker CompleteMultipartUpload + HEAD 校验 + 写 `versions(status=ready)`。 |
@@ -296,7 +321,8 @@ curl -L --output ota.bin -H "Authorization: Bearer qd_..." \
 
 ## 数据布局
 
-R2 key:`<customer_code>/<project_code>/<channel>/<version>/<filename>`
+新上传的 R2 key:`<customer_code>/<project_code>/<channel>/<version>/<upload_uuid>/<safe_filename>`。
+每次上传使用独立路径,不同文件名和并发上传不会相互覆盖;已有文件路径保持不变。
 可在 Cloudflare dashboard / `wrangler r2 object list qota-ota` 直接浏览。
 
 ## 设计取舍 & TODO

@@ -39,7 +39,7 @@ export interface UploadJobHandle {
   }>;
 }
 
-export async function sha256File(file: File, onProgress?: (loaded: number, total: number) => void): Promise<string> {
+export async function sha256File(file: File, onProgress?: (loaded: number, total: number) => void, signal?: AbortSignal): Promise<string> {
   // crypto.subtle.digest doesn't stream, so we chunk-hash via WebCrypto subtle on each slice
   // and combine using crypto.subtle's incremental API... which doesn't exist. So we read the
   // whole file. For huge files this is slow but unavoidable in a browser today. Acceptable
@@ -48,12 +48,15 @@ export async function sha256File(file: File, onProgress?: (loaded: number, total
   const total = file.size;
   const chunks: ArrayBuffer[] = [];
   for (let off = 0; off < total; off += SHA256_CHUNK) {
+    signal?.throwIfAborted();
     const slice = file.slice(off, Math.min(off + SHA256_CHUNK, total));
     const buf = await slice.arrayBuffer();
+    signal?.throwIfAborted();
     chunks.push(buf);
     loaded += buf.byteLength;
     onProgress?.(loaded, total);
   }
+  signal?.throwIfAborted();
   // Concatenate into one buffer for digest
   const merged = new Uint8Array(total);
   let cursor = 0;
@@ -62,38 +65,39 @@ export async function sha256File(file: File, onProgress?: (loaded: number, total
     cursor += c.byteLength;
   }
   const hash = await crypto.subtle.digest('SHA-256', merged);
+  signal?.throwIfAborted();
   return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 function putPart(url: string, blob: Blob, onProgress: (loaded: number) => void, signal?: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('aborted', 'AbortError'));
+      return;
+    }
     const xhr = new XMLHttpRequest();
     xhr.open('PUT', url, true);
     xhr.responseType = 'text';
-    let lastLoaded = 0;
+    const abort = () => xhr.abort();
+    const cleanup = () => signal?.removeEventListener('abort', abort);
     xhr.upload.onprogress = (ev) => {
       if (!ev.lengthComputable) return;
-      onProgress(ev.loaded - lastLoaded);
-      lastLoaded = ev.loaded;
+      onProgress(Math.min(ev.loaded, blob.size));
     };
     xhr.onload = () => {
+      cleanup();
       if (xhr.status >= 200 && xhr.status < 300) {
         const etag = (xhr.getResponseHeader('ETag') ?? '').replace(/^"|"$/g, '');
         if (!etag) return reject(new Error('R2 did not return ETag (check bucket CORS — ExposeHeaders must include ETag)'));
+        onProgress(blob.size);
         resolve(`"${etag}"`);
       } else {
         reject(new Error(`PUT part: ${xhr.status} ${xhr.responseText.slice(0, 200)}`));
       }
     };
-    xhr.onerror = () => reject(new Error('network error during PUT'));
-    xhr.onabort = () => reject(new DOMException('aborted', 'AbortError'));
-    if (signal) {
-      if (signal.aborted) {
-        xhr.abort();
-        return;
-      }
-      signal.addEventListener('abort', () => xhr.abort(), { once: true });
-    }
+    xhr.onerror = () => { cleanup(); reject(new Error('network error during PUT')); };
+    xhr.onabort = () => { cleanup(); reject(new DOMException('aborted', 'AbortError')); };
+    signal?.addEventListener('abort', abort, { once: true });
     xhr.send(blob);
   });
 }
@@ -101,15 +105,18 @@ function putPart(url: string, blob: Blob, onProgress: (loaded: number) => void, 
 export function startUpload(opts: UploadJobOptions): UploadJobHandle {
   const concurrency = Math.max(1, Math.min(8, opts.concurrency ?? 4));
   let sessionId = 0;
-  let aborted = false;
   const internalAbort = new AbortController();
+  const abortFromSignal = () => internalAbort.abort();
   if (opts.signal) {
-    opts.signal.addEventListener('abort', () => internalAbort.abort(), { once: true });
+    if (opts.signal.aborted) internalAbort.abort();
+    else opts.signal.addEventListener('abort', abortFromSignal, { once: true });
   }
 
   const promise = (async () => {
+    internalAbort.signal.throwIfAborted();
     opts.onProgress?.(0, opts.file.size, 'sha256');
-    const sha256 = await sha256File(opts.file, (loaded, total) => opts.onProgress?.(loaded, total, 'sha256'));
+    const sha256 = await sha256File(opts.file, (loaded, total) => opts.onProgress?.(loaded, total, 'sha256'), internalAbort.signal);
+    internalAbort.signal.throwIfAborted();
 
     const init = await api.uploadInit({
       projectId: opts.projectId,
@@ -128,12 +135,20 @@ export function startUpload(opts: UploadJobOptions): UploadJobHandle {
       partSizeHint: opts.partSizeHint,
     });
     sessionId = init.sessionId;
+    // Init may finish after cancellation; the catch below cleans up that session.
+    internalAbort.signal.throwIfAborted();
 
     const partCount = init.partCount;
     const partSize = init.partSize;
     const known = new Map((init.uploadedParts ?? []).map((p) => [p.partNumber, p]));
     const parts: UploadPart[] = new Array(partCount);
     let bytesDone = [...known.values()].reduce((a, b) => a + b.size, 0);
+    const partProgress = new Map<number, number>();
+    const reportPart = (partNumber: number, loaded: number) => {
+      bytesDone += loaded - (partProgress.get(partNumber) ?? 0);
+      partProgress.set(partNumber, loaded);
+      opts.onProgress?.(bytesDone, opts.file.size, 'upload');
+    };
     for (const k of known.values()) parts[k.partNumber - 1] = { partNumber: k.partNumber, etag: k.etag, size: k.size };
     opts.onProgress?.(bytesDone, opts.file.size, 'upload');
 
@@ -153,10 +168,7 @@ export function startUpload(opts: UploadJobOptions): UploadJobHandle {
           const etag = await putPart(
             url,
             blob,
-            (delta) => {
-              bytesDone += delta;
-              opts.onProgress?.(bytesDone, opts.file.size, 'upload');
-            },
+            (loaded) => reportPart(partNumber, loaded),
             internalAbort.signal,
           );
           parts[partNumber - 1] = { partNumber, etag, size: blob.size };
@@ -164,6 +176,7 @@ export function startUpload(opts: UploadJobOptions): UploadJobHandle {
         } catch (e: any) {
           if (e?.name === 'AbortError' || internalAbort.signal.aborted) throw e;
           if (tries >= 3) throw e;
+          reportPart(partNumber, 0);
           const re = await api.uploadSignPart(sessionId, partNumber);
           url = re.url;
           await new Promise((r) => setTimeout(r, 400 * tries));
@@ -186,16 +199,25 @@ export function startUpload(opts: UploadJobOptions): UploadJobHandle {
         })(),
       );
     }
-    await Promise.all(workers);
+    try {
+      await Promise.all(workers);
+    } catch (error) {
+      internalAbort.abort();
+      await Promise.allSettled(workers);
+      throw error;
+    }
+    internalAbort.signal.throwIfAborted();
 
     const assembled = parts.filter(Boolean);
     if (assembled.length !== partCount) {
       throw new Error(`assembled ${assembled.length}/${partCount} parts`);
     }
+    // Once completion is submitted, wait for its result rather than racing it
+    // with abort. A queue cancellation can still stop the following files.
     const ver = await api.uploadComplete({ sessionId, parts: assembled, sha256 });
     return { versionId: ver.id, sessionId, sha256 };
   })().catch(async (e) => {
-    aborted = true;
+    internalAbort.abort();
     if (sessionId) {
       try {
         await api.uploadAbort(sessionId);
@@ -204,22 +226,17 @@ export function startUpload(opts: UploadJobOptions): UploadJobHandle {
       }
     }
     throw e;
-  });
+  }).finally(() => opts.signal?.removeEventListener('abort', abortFromSignal));
 
   return {
     get sessionId() {
       return sessionId;
     },
     abort: async () => {
-      aborted = true;
       internalAbort.abort();
-      if (sessionId) {
-        try {
-          await api.uploadAbort(sessionId);
-        } catch {
-          /* ignore */
-        }
-      }
+      // The job owns cleanup, including sessions created after abort was called.
+      // Waiting also keeps the next file from overlapping the old request.
+      await promise.catch(() => {});
     },
     promise,
   };

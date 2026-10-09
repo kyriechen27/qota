@@ -5,7 +5,7 @@ qota runs from **one TypeScript codebase** on two targets:
 | | Runtime | Database | Storage | Web |
 |---|---|---|---|---|
 | **Cloudflare** | Pages Functions (or Workers) | D1 | R2 (S3 API) | Pages |
-| **Docker / self-host** | Node (`@hono/node-server`) | SQLite (`better-sqlite3`) | Local folder (default) · MinIO/any S3 (opt-in) | served by the Node server |
+| **Docker / self-host** | Node (`@hono/node-server`) | SQLite (`node:sqlite`, older Node: `better-sqlite3`) | Local folder (default) · MinIO/any S3 (opt-in) | served by the Node server |
 
 ## Storage backends
 
@@ -182,9 +182,16 @@ Deploy. **On first request the API auto-creates the D1 schema and the admin user
 > reusing this project just sets their own three bindings — nothing is baked into the build.
 
 **After that, every `git push` deploys the committed `apps/web/dist`** (run
-`npm run pages:build` first). If you later *add* a migration to `apps/worker/migrations/`,
-apply it once with `npm run d1:migrate:remote` (needs the `database_id` in
-`apps/worker/wrangler.toml`).
+`npm run pages:build` first). For an existing Pages project, deploy the latest
+`main` commit using the same bindings and build settings.
+
+The bundled Pages entry automatically upgrades the database on the first API
+request, including multiple current versions (`0007`) and multiple files per
+version/channel (`0008`). Existing files, metadata and upload references are
+preserved; these Pages upgrades require no manual SQL. Future migrations must
+also be wired into `pages-entry.ts` to use this automatic upgrade path. Standalone
+Worker deployments still apply migrations with `npm run d1:migrate:remote`
+(using the database ID configured in `apps/worker/wrangler.toml`).
 
 ### Local preview of the Pages build
 

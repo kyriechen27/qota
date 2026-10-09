@@ -9,6 +9,7 @@ import {
 } from '../lib/memberships';
 import { audit } from '../lib/audit';
 import { generateUniqueCode, projectCodeTaken } from '../utils/slug';
+import { setCurrentVersion, syncLegacyCurrentVersion } from '../lib/current-versions';
 
 export const projectRoutes = new Hono<AppEnv>();
 
@@ -21,12 +22,13 @@ interface ProjectRow {
   name: string;
   description: string | null;
   default_channel: string;
-  current_version: string | null;
+  current_versions: string;
   created_at: number;
   updated_at: number;
 }
 
 function dto(r: ProjectRow) {
+  const currentVersions = JSON.parse(r.current_versions) as string[];
   return {
     id: r.id,
     customerId: r.customer_id,
@@ -34,11 +36,20 @@ function dto(r: ProjectRow) {
     name: r.name,
     description: r.description,
     defaultChannel: r.default_channel,
-    currentVersion: r.current_version,
+    currentVersions,
+    currentVersion: currentVersions[0] ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
 }
+
+const PROJECT_SELECT = `SELECT p.id, p.customer_id, p.code, p.name, p.description, p.default_channel,
+  (SELECT json_group_array(version) FROM (
+    SELECT cv.version FROM project_current_versions cv
+    JOIN versions v ON v.project_id = cv.project_id AND v.version = cv.version
+     WHERE cv.project_id = p.id AND v.status = 'ready'
+     GROUP BY cv.version ORDER BY MAX(v.created_at) DESC, MAX(v.id) DESC
+  )) AS current_versions, p.created_at, p.updated_at FROM projects p`;
 
 const CODE_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const CHANNEL_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
@@ -64,7 +75,7 @@ projectRoutes.get('/', async (c) => {
   }
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   const rows = await c.env.DB.prepare(
-    `SELECT id, customer_id, code, name, description, default_channel, current_version, created_at, updated_at FROM projects ${where} ORDER BY name ASC`,
+    `${PROJECT_SELECT} ${where} ORDER BY name ASC`,
   )
     .bind(...args)
     .all<ProjectRow>();
@@ -77,7 +88,7 @@ projectRoutes.get('/:id', async (c) => {
   const user = c.get('user')!;
   await requireProjectAccess(c.env.DB, user, id, 'view');
   const row = await c.env.DB.prepare(
-    'SELECT id, customer_id, code, name, description, default_channel, current_version, created_at, updated_at FROM projects WHERE id = ?',
+    `${PROJECT_SELECT} WHERE p.id = ?`,
   )
     .bind(id)
     .first<ProjectRow>();
@@ -131,7 +142,7 @@ projectRoutes.post('/', async (c) => {
     .run();
   const id = Number(r.meta.last_row_id);
   const row = await c.env.DB.prepare(
-    'SELECT id, customer_id, code, name, description, default_channel, current_version, created_at, updated_at FROM projects WHERE id = ?',
+    `${PROJECT_SELECT} WHERE p.id = ?`,
   )
     .bind(id)
     .first<ProjectRow>();
@@ -181,7 +192,7 @@ projectRoutes.patch('/:id', async (c) => {
   }
   if (body.currentVersion !== undefined) {
     if (body.currentVersion !== null) {
-      if (!VERSION_RE.test(body.currentVersion)) throw badRequest('currentVersion invalid');
+      if (typeof body.currentVersion !== 'string' || !VERSION_RE.test(body.currentVersion)) throw badRequest('currentVersion invalid');
       const ready = await c.env.DB.prepare(
         `SELECT id FROM versions WHERE project_id = ? AND version = ? AND status = 'ready' LIMIT 1`,
       )
@@ -189,16 +200,26 @@ projectRoutes.patch('/:id', async (c) => {
         .first<{ id: number }>();
       if (!ready) throw badRequest('currentVersion must match a ready version');
     }
-    sets.push('current_version = ?');
-    args.push(body.currentVersion);
   }
-  if (sets.length === 0) return c.json({ ok: true });
-  sets.push('updated_at = ?');
-  args.push(Date.now());
-  args.push(id);
-  await c.env.DB.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE id = ?`).bind(...args).run();
+  if (sets.length === 0 && body.currentVersion === undefined) return c.json({ ok: true });
+  const now = Date.now();
+  const changes: D1PreparedStatement[] = [];
+  if (sets.length) {
+    sets.push('updated_at = ?');
+    args.push(now, id);
+    changes.push(c.env.DB.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE id = ?`).bind(...args));
+  }
+  if (body.currentVersion !== undefined) {
+    // Legacy clients can add a label or explicitly clear all current labels.
+    // A string must not silently unset any of the other current labels.
+    changes.push(body.currentVersion === null
+      ? c.env.DB.prepare('DELETE FROM project_current_versions WHERE project_id = ?').bind(id)
+      : setCurrentVersion(c.env.DB, id, body.currentVersion, true));
+    changes.push(syncLegacyCurrentVersion(c.env.DB, id, now));
+  }
+  await c.env.DB.batch(changes);
   const row = await c.env.DB.prepare(
-    'SELECT id, customer_id, code, name, description, default_channel, current_version, created_at, updated_at FROM projects WHERE id = ?',
+    `${PROJECT_SELECT} WHERE p.id = ?`,
   )
     .bind(id)
     .first<ProjectRow>();

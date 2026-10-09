@@ -20,6 +20,8 @@ import migration0003 from './migrations/0003_public_versions.sql';
 import migration0004 from './migrations/0004_api_token_secret.sql';
 import migration0005 from './migrations/0005_current_version.sql';
 import migration0006 from './migrations/0006_global_roles.sql';
+import migration0007 from './migrations/0007_current_versions.sql';
+import migration0008 from './migrations/0008_multiple_files.sql';
 
 interface PagesEnv extends Bindings {
   ASSETS: Fetcher;
@@ -53,9 +55,11 @@ async function ensureSchema(env: PagesEnv): Promise<void> {
       ...statements(migration0003),
       ...statements(migration0004),
       ...statements(migration0005),
+      ...statements(migration0007),
     ]) {
       await env.DB.prepare(stmt).run();
     }
+    await ensureMultipleFiles(env);
     schemaReady = true;
     console.log('[schema] initialized D1 tables on first run');
     return;
@@ -67,6 +71,8 @@ async function ensureSchema(env: PagesEnv): Promise<void> {
   await ensureColumn(env, 'api_tokens', 'token_enc', statements(migration0004));
   await ensureColumn(env, 'projects', 'current_version', statements(migration0005));
   await ensureGlobalRoles(env, statements(migration0006));
+  await ensureCurrentVersions(env);
+  await ensureMultipleFiles(env);
   schemaReady = true;
 }
 
@@ -91,6 +97,27 @@ async function ensureGlobalRoles(env: PagesEnv, stmts: string[]): Promise<void> 
   if (!row) {
     for (const stmt of stmts) await env.DB.prepare(stmt).run();
     console.log('[schema] added user_global_roles');
+  }
+}
+
+async function ensureCurrentVersions(env: PagesEnv): Promise<void> {
+  const row = await env.DB.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'project_current_versions'",
+  ).first();
+  if (!row) {
+    await env.DB.batch(statements(migration0007).map((stmt) => env.DB.prepare(stmt)));
+    console.log('[schema] added project_current_versions');
+  }
+}
+
+async function ensureMultipleFiles(env: PagesEnv): Promise<void> {
+  const row = await env.DB.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_versions_file'",
+  ).first();
+  if (!row) {
+    // Rebuild and restore dependent references in one atomic transaction.
+    await env.DB.batch(statements(migration0008).map((stmt) => env.DB.prepare(stmt)));
+    console.log('[schema] enabled multiple files per version and channel');
   }
 }
 

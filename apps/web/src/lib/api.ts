@@ -156,6 +156,18 @@ export const api = {
       status?: 'ready' | 'archived';
     },
   ) => request<Version>(`/api/versions/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  updateVersionGroup: (body: {
+    projectId: number;
+    version: string;
+    isCurrent?: boolean;
+    status?: 'ready' | 'archived';
+    notes?: string | null;
+  }) => request<Version[]>('/api/versions/group', { method: 'PATCH', body: JSON.stringify(body) }),
+  archiveAllVersions: (projectId: number) =>
+    request<{ ok: true }>('/api/versions/archive-all', {
+      method: 'POST',
+      body: JSON.stringify({ projectId }),
+    }),
   deleteVersion: (id: number) => request<{ ok: true }>(`/api/versions/${id}`, { method: 'DELETE' }),
   // Public, token-less download link (capability slug). Enable is idempotent.
   enableVersionPublic: (id: number) =>

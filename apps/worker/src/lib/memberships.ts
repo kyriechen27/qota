@@ -200,10 +200,10 @@ export async function visibleProjectIds(
   const rows = await db
     .prepare(
       `SELECT DISTINCT p.id FROM projects p
-        WHERE EXISTS (SELECT 1 FROM memberships m WHERE m.user_id = ?1 AND m.customer_id = p.customer_id)
-           OR EXISTS (SELECT 1 FROM project_memberships pm WHERE pm.user_id = ?1 AND pm.project_id = p.id)`,
+        WHERE EXISTS (SELECT 1 FROM memberships m WHERE m.user_id = ? AND m.customer_id = p.customer_id)
+           OR EXISTS (SELECT 1 FROM project_memberships pm WHERE pm.user_id = ? AND pm.project_id = p.id)`,
     )
-    .bind(user.id)
+    .bind(user.id, user.id)
     .all<{ id: number }>();
   return (rows.results ?? []).map((r) => r.id);
 }

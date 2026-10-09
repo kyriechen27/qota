@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useState, type FormEvent } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { useParams } from 'react-router-dom';
 import { QRCodeSVG } from 'qrcode.react';
 import { api } from '../lib/api';
@@ -14,20 +14,14 @@ export default function ProjectDetail() {
   const [project, setProject] = useState<Project | null>(null);
   const [versions, setVersions] = useState<Version[]>([]);
   const [expandedVersionGroups, setExpandedVersionGroups] = useState<Set<string>>(() => new Set());
+  const [notesDialog, setNotesDialog] = useState<{ version: string; items: Version[] } | null>(null);
+  const [versionBusy, setVersionBusy] = useState(false);
+  const versionBusyRef = useRef(false);
   const [tokens, setTokens] = useState<ApiToken[]>([]);
   const [err, setErr] = useState<string | null>(null);
 
   // upload state
   const [showUpload, setShowUpload] = useState(false);
-  const [file, setFile] = useState<File | null>(null);
-  const [version, setVersion] = useState('');
-  const [channel, setChannel] = useState('stable');
-  const [notes, setNotes] = useState('');
-  const [mandatory, setMandatory] = useState(false);
-  const [phase, setPhase] = useState<'idle' | 'sha256' | 'upload'>('idle');
-  const [progress, setProgress] = useState({ loaded: 0, total: 0 });
-  const [job, setJob] = useState<UploadJobHandle | null>(null);
-  const [uploadConflict, setUploadConflict] = useState<Version | null>(null);
 
   // token state
   const [showTokenDlg, setShowTokenDlg] = useState(false);
@@ -59,39 +53,14 @@ export default function ProjectDetail() {
     return [...set].sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
   }, [versions]);
 
-  const versionGroups = useMemo(() => {
-    const groups = new Map<string, Version[]>();
-    for (const v of versions) {
-      const list = groups.get(v.version);
-      if (list) list.push(v);
-      else groups.set(v.version, [v]);
-    }
-
-    return [...groups.entries()].flatMap(([label, items]) => {
-      const [first, ...rest] = items;
-      if (!first) return [];
-      const latest = rest.reduce((best, item) => (item.createdAt > best.createdAt ? item : best), first);
-      const channels = [...new Set(items.map((item) => item.releaseChannel))];
-      const statusCounts = new Map<Version['status'], number>();
-      for (const item of items) statusCounts.set(item.status, (statusCounts.get(item.status) ?? 0) + 1);
-      const sortedItems = [...items].sort(
-        (a, b) => Number(b.isCurrent) - Number(a.isCurrent) || b.createdAt - a.createdAt,
-      );
-      return {
-        label,
-        items: sortedItems,
-        latest,
-        channels,
-        statusCounts,
-        totalSize: items.reduce((sum, item) => sum + item.size, 0),
-        totalDownloads: items.reduce((sum, item) => sum + item.downloadCount, 0),
-        hasMandatory: items.some((item) => item.isMandatory),
-        hasCurrent: items.some((item) => item.isCurrent),
-        hasReady: items.some((item) => item.status === 'ready'),
-        hasPublic: items.some((item) => item.publicSlug),
-      };
-    }).sort((a, b) => Number(b.hasCurrent) - Number(a.hasCurrent) || b.latest.createdAt - a.latest.createdAt);
-  }, [versions]);
+  const versionGroups = useMemo(
+    () => groupVersions(versions.filter((v) => v.status !== 'archived')),
+    [versions],
+  );
+  const archivedGroups = useMemo(
+    () => groupVersions(versions.filter((v) => v.status === 'archived')),
+    [versions],
+  );
 
   async function load() {
     try {
@@ -113,65 +82,6 @@ export default function ProjectDetail() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId]);
 
-  async function runUpload(overwriteExisting = false) {
-    if (!file || !version) return;
-    setUploadConflict(null);
-    setErr(null);
-    setPhase('sha256');
-    setProgress({ loaded: 0, total: file.size });
-    const handle = startUpload({
-      projectId,
-      file,
-      version,
-      releaseChannel: channel || 'stable',
-      notes: notes || undefined,
-      isMandatory: mandatory,
-      overwriteExisting,
-      concurrency: 4,
-      onProgress: (loaded, total, ph) => {
-        setPhase(ph);
-        setProgress({ loaded, total });
-      },
-    });
-    setJob(handle);
-    try {
-      await handle.promise;
-      setShowUpload(false);
-      setFile(null);
-      setVersion('');
-      setNotes('');
-      setMandatory(false);
-      setPhase('idle');
-      setProgress({ loaded: 0, total: 0 });
-      setJob(null);
-      await load();
-    } catch (e: any) {
-      if (e?.name !== 'AbortError') setErr(e?.message ?? String(e));
-      setPhase('idle');
-      setJob(null);
-    }
-  }
-
-  async function startUploadHandler(e: FormEvent) {
-    e.preventDefault();
-    if (!file || !version) return;
-    const releaseChannel = channel || 'stable';
-    const existing = versions.find((v) => v.version === version && v.releaseChannel === releaseChannel);
-    if (existing) {
-      setErr(null);
-      setUploadConflict(existing);
-      return;
-    }
-    await runUpload(false);
-  }
-
-  async function cancelUpload() {
-    if (!job) return;
-    await job.abort();
-    setPhase('idle');
-    setProgress({ loaded: 0, total: 0 });
-    setJob(null);
-  }
 
   async function download(v: Version) {
     try {
@@ -249,41 +159,46 @@ export default function ProjectDetail() {
     }
   }
 
-  async function deleteVer(v: Version) {
-    if (!confirm(t('pd.confirmDeleteVer', { version: v.version, channel: v.releaseChannel }))) return;
+  async function mutateVersions(mutation: () => Promise<unknown>) {
+    if (versionBusyRef.current) return;
+    versionBusyRef.current = true;
+    setVersionBusy(true);
+    setErr(null);
     try {
-      await api.deleteVersion(v.id);
+      await mutation();
       await load();
     } catch (e: any) {
-      setErr(e?.message);
+      setErr(e?.message ?? String(e));
+    } finally {
+      versionBusyRef.current = false;
+      setVersionBusy(false);
     }
+  }
+
+  async function deleteVer(v: Version) {
+    if (!confirm(t('pd.confirmDeleteVer', { version: v.version, channel: v.releaseChannel }))) return;
+    await mutateVersions(() => api.deleteVersion(v.id));
   }
 
   async function archiveVer(v: Version) {
-    try {
-      await api.updateVersion(v.id, { status: 'archived' });
-      await load();
-    } catch (e: any) {
-      setErr(e?.message);
-    }
+    await mutateVersions(() => api.updateVersion(v.id, { status: 'archived' }));
   }
 
   async function restoreVer(v: Version) {
-    try {
-      await api.updateVersion(v.id, { status: 'ready' });
-      await load();
-    } catch (e: any) {
-      setErr(e?.message);
-    }
+    await mutateVersions(() => api.updateVersion(v.id, { status: 'ready' }));
   }
 
-  async function setCurrentVersion(versionLabel: string) {
-    try {
-      await api.updateProject(projectId, { currentVersion: versionLabel });
-      await load();
-    } catch (e: any) {
-      setErr(e?.message);
-    }
+  async function setCurrentVersion(versionLabel: string, isCurrent: boolean) {
+    await mutateVersions(() => api.updateVersionGroup({ projectId, version: versionLabel, isCurrent }));
+  }
+
+  async function setGroupStatus(versionLabel: string, status: 'ready' | 'archived') {
+    await mutateVersions(() => api.updateVersionGroup({ projectId, version: versionLabel, status }));
+  }
+
+  async function archiveAllVersions() {
+    if (!confirm(t('pd.confirmArchiveAll'))) return;
+    await mutateVersions(() => api.archiveAllVersions(projectId));
   }
 
   async function createToken(e: FormEvent) {
@@ -357,10 +272,9 @@ export default function ProjectDetail() {
     );
   }
 
-  const pct = progress.total > 0 ? Math.round((progress.loaded / progress.total) * 100) : 0;
   const publicUrl = publicVer?.publicSlug ? publicUrlFor(publicVer.publicSlug) : null;
   const renderChannelTag = (releaseChannel: string) => (
-    <span className={`tag ${releaseChannel === 'stable' ? 'stable' : releaseChannel === 'beta' ? 'beta' : ''}`}>
+    <span className={`tag ${releaseChannel === 'stable' ? 'stable' : releaseChannel === 'beta' ? 'beta' : ''}`} title={releaseChannel}>
       {releaseChannel}
     </span>
   );
@@ -368,70 +282,261 @@ export default function ProjectDetail() {
     [...statusCounts.entries()]
       .map(([status, count]) => `${t(`status.${status}`)}${count > 1 ? ` x${count}` : ''}`)
       .join(' / ');
-  const renderVersionActions = (v: Version, showCurrentAction = true) => (
-    <>
-      <button onClick={() => download(v)} style={{ marginRight: 6 }} disabled={v.status !== 'ready'}>
-        {t('pd.download')}
-      </button>
+  const renderNotes = (items: Version[]) => {
+    const noteGroups = groupNotes(items);
+    const preview = noteGroups.find((entry) => entry.notes)?.notes;
+    const versionLabel = items[0]!.version;
+    const current = versions.some((item) => item.version === versionLabel && item.isCurrent);
+    if (!preview && !current && !items.some((item) => item.canEditNotes)) return <span className="muted">-</span>;
+    return (
       <button
-        onClick={() => openPublic(v)}
-        style={{ marginRight: 6 }}
-        disabled={v.status !== 'ready' && !v.publicSlug}
-        className={v.publicSlug ? 'primary' : ''}
-        title={t('pd.dlgPublic')}
+        type="button"
+        className={`version-notes-preview${noteGroups.length > 1 ? ' has-multiple' : ''}${preview ? '' : ' is-empty'}`}
+        title={t('pd.viewVersionNotes', { version: versionLabel })}
+        aria-label={t('pd.viewVersionNotes', { version: versionLabel })}
+        onClick={(e) => {
+          e.stopPropagation();
+          setNotesDialog({ version: versionLabel, items });
+        }}
       >
-        {v.publicSlug ? `${t('pd.public')} ✓` : t('pd.public')}
+        <span className="version-notes-content">
+          <span className="version-notes-excerpt">
+            {preview || t(current ? 'pd.noNotes' : 'pd.addNotes')}
+          </span>
+          {noteGroups.length > 1 && (
+            <span className="version-notes-more">{t('pd.notesVariants', { count: noteGroups.length })}</span>
+          )}
+        </span>
+        <VersionIcon name="notes" />
       </button>
+    );
+  };
+  const renderVersionActions = (v: Version, showCurrentAction = true) => (
+    <div className="version-row-actions">
+      {showCurrentAction && v.status === 'ready' && (
+        <button
+          className={`version-current-action${v.isCurrent ? ' is-active' : ''}`}
+          onClick={() => setCurrentVersion(v.version, !v.isCurrent)}
+          disabled={versionBusy}
+          aria-pressed={v.isCurrent}
+        >
+          {v.isCurrent ? t('pd.unsetCurrent') : t('pd.setCurrent')}
+        </button>
+      )}
       {v.status === 'ready' && (
-        <button onClick={() => archiveVer(v)} style={{ marginRight: 6 }}>
+        <button onClick={() => archiveVer(v)} disabled={versionBusy}>
           {t('pd.archive')}
         </button>
       )}
-      {showCurrentAction && v.status === 'ready' && (
-        <button onClick={() => setCurrentVersion(v.version)} style={{ marginRight: 6 }} disabled={v.isCurrent}>
-          {v.isCurrent ? t('pd.currentVersion') : t('pd.setCurrent')}
-        </button>
-      )}
       {v.status === 'archived' && (
-        <button onClick={() => restoreVer(v)} style={{ marginRight: 6 }}>
+        <button onClick={() => restoreVer(v)} disabled={versionBusy}>
           {t('pd.restore')}
         </button>
       )}
-      <button className="danger" onClick={() => deleteVer(v)}>
-        {t('common.delete')}
+      <span className="version-action-divider" aria-hidden="true" />
+      <button
+        className="version-icon-button"
+        onClick={() => download(v)}
+        disabled={v.status !== 'ready'}
+        title={t('pd.download')}
+        aria-label={t('pd.download')}
+      >
+        <VersionIcon name="download" />
       </button>
-    </>
+      <button
+        onClick={() => openPublic(v)}
+        disabled={v.status !== 'ready' && !v.publicSlug}
+        className={`version-icon-button${v.publicSlug ? ' is-public' : ''}`}
+        title={t('pd.dlgPublic')}
+        aria-label={t('pd.public')}
+      >
+        <VersionIcon name="public" />
+      </button>
+      <button
+        className="version-icon-button version-delete-action"
+        onClick={() => deleteVer(v)}
+        disabled={versionBusy}
+        title={t('common.delete')}
+        aria-label={t('common.delete')}
+      >
+        <VersionIcon name="delete" />
+      </button>
+    </div>
+  );
+  const renderUploadTime = (timestamp: number) => (
+    <time className="version-upload-time" dateTime={new Date(timestamp).toISOString()}>
+      <span>{new Date(timestamp).toLocaleDateString()}</span>
+      <span>{new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })}</span>
+    </time>
   );
   const renderVersionRow = (v: Version, grouped = false) => (
     <tr key={v.id} className={grouped ? 'version-detail-row' : undefined}>
       <td>
-        <span className="code">{v.version}</span>
-        {!grouped && v.isCurrent && (
-          <span className="tag current" style={{ marginLeft: 6 }}>
-            {t('pd.currentTag')}
-          </span>
-        )}
-        {v.publicSlug && (
-          <span className="tag" style={{ marginLeft: 6 }}>
-            {t('pd.publicTag')}
-          </span>
-        )}
+        <div className="version-identity">
+          <span className="version-label" title={v.version}>{v.version}</span>
+          {(v.isCurrent || v.publicSlug) && (
+            <span className="version-meta">
+              {v.isCurrent && <span className="tag current">{t('pd.currentTag')}</span>}
+              {v.publicSlug && <span className="version-public-label">{t('pd.publicTag')}</span>}
+            </span>
+          )}
+        </div>
       </td>
+      <td className="version-notes-cell">{renderNotes([v])}</td>
       <td>{renderChannelTag(v.releaseChannel)}</td>
       <td>
         <span className={`tag ${v.status === 'ready' ? 'stable' : ''}`}>{t(`status.${v.status}`)}</span>
       </td>
       <td>{formatBytes(v.size)}</td>
+      <td><span className="version-filename" title={v.filename}>{v.filename}</span></td>
+      <td>{renderUploadTime(v.createdAt)}</td>
       <td>
-        <span className="code" title={v.sha256 ?? ''}>
+        <span className="version-checksum" title={v.sha256 ?? ''}>
           {v.sha256 ? `${v.sha256.slice(0, 12)}...` : '-'}
         </span>
       </td>
-      <td>{v.isMandatory ? '✓' : ''}</td>
-      <td className="muted">{new Date(v.createdAt).toLocaleString()}</td>
       <td>{v.downloadCount}</td>
-      <td>{renderVersionActions(v, !grouped)}</td>
+      <td className="version-actions-cell">{renderVersionActions(v, !grouped)}</td>
     </tr>
+  );
+
+  const renderVersionsTable = (groups: ReturnType<typeof groupVersions>, archived = false) => (
+    <div className="version-table-scroll">
+      <table className="version-table">
+        <colgroup>
+          <col style={{ width: 184 }} />
+          <col style={{ width: 204 }} />
+          <col style={{ width: 140 }} />
+          <col style={{ width: 90 }} />
+          <col style={{ width: 92 }} />
+          <col style={{ width: 150 }} />
+          <col style={{ width: 116 }} />
+          <col style={{ width: 108 }} />
+          <col style={{ width: 76 }} />
+          <col style={{ width: 300 }} />
+        </colgroup>
+        <thead>
+          <tr>
+            <th>{t('pd.colVersion')}</th>
+            <th className="version-notes-cell">{t('pd.colNotes')}</th>
+            <th>{t('pd.colChannel')}</th>
+            <th>{t('pd.colStatus')}</th>
+            <th>{t('pd.colSize')}</th>
+            <th>{t('pd.colFilename')}</th>
+            <th>{t('pd.colUploaded')}</th>
+            <th>{t('pd.colSha')}</th>
+            <th>{t('pd.colDownloads')}</th>
+            <th className="version-actions-cell">{t('pd.colActions')}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {groups.map((group) => {
+            const [first] = group.items;
+            if (!first) return null;
+            if (group.items.length === 1) return renderVersionRow(first);
+
+            const groupKey = `${archived ? 'archived' : 'active'}:${group.label}`;
+            const expanded = expandedVersionGroups.has(groupKey);
+            const onlyStatus = group.statusCounts.size === 1 ? group.latest.status : null;
+            return (
+              <Fragment key={`group-${group.label}`}>
+                <tr className="version-group-row" onClick={() => toggleVersionGroup(groupKey)}>
+                  <td>
+                    <div className="version-group-main">
+                      <button
+                        type="button"
+                        className={`version-toggle${expanded ? ' is-expanded' : ''}`}
+                        title={t(expanded ? 'pd.collapse' : 'pd.expand')}
+                        aria-label={`${t(expanded ? 'pd.collapse' : 'pd.expand')} ${group.label}`}
+                        aria-expanded={expanded}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleVersionGroup(groupKey);
+                        }}
+                      >
+                        <VersionIcon name="chevron" />
+                      </button>
+                      <div className="version-identity">
+                        <span className="version-label" title={group.label}>{group.label}</span>
+                        <span className="version-meta">
+                          {group.hasCurrent
+                            ? <span className="tag current">{t('pd.currentTag')}</span>
+                            : <span>{t('pd.channelCount', { count: group.channels.length })}</span>}
+                          {group.hasPublic && <span className="version-public-label">{t('pd.publicTag')}</span>}
+                        </span>
+                      </div>
+                    </div>
+                  </td>
+                  <td className="version-notes-cell">{renderNotes(group.items)}</td>
+                  <td>
+                    <span className="version-channel-list">
+                      {group.channels.slice(0, 2).map((ch) => <Fragment key={ch}>{renderChannelTag(ch)}</Fragment>)}
+                      {group.channels.length > 2 && <span className="version-channel-more" title={group.channels.slice(2).join(', ')}>+{group.channels.length - 2}</span>}
+                    </span>
+                  </td>
+                  <td>
+                    <span className={`tag ${onlyStatus === 'ready' ? 'stable' : ''}`}>
+                      {statusSummary(group.statusCounts)}
+                    </span>
+                  </td>
+                  <td>{formatBytes(group.totalSize)}</td>
+                  <td>{t('pd.firmwareCount', { count: group.items.length })}</td>
+                  <td>{renderUploadTime(group.latest.createdAt)}</td>
+                  <td>
+                    <span className="muted">-</span>
+                  </td>
+                  <td>{group.totalDownloads}</td>
+                  <td className="version-actions-cell">
+                    <div className="version-row-actions" onClick={(e) => e.stopPropagation()}>
+                      {group.hasReady && (
+                        <>
+                          <button
+                            type="button"
+                            className={`version-current-action${group.hasCurrent ? ' is-active' : ''}`}
+                            aria-pressed={group.hasCurrent}
+                            onClick={() => setCurrentVersion(group.label, !group.hasCurrent)}
+                            disabled={versionBusy}
+                          >
+                            {group.hasCurrent ? t('pd.unsetCurrent') : t('pd.setCurrent')}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setGroupStatus(group.label, 'archived')}
+                            disabled={versionBusy}
+                          >
+                            {t('pd.archive')}
+                          </button>
+                        </>
+                      )}
+                      {archived && (
+                        <button
+                          type="button"
+                          onClick={() => setGroupStatus(group.label, 'ready')}
+                          disabled={versionBusy}
+                        >
+                          {t('pd.restore')}
+                        </button>
+                      )}
+                      <button type="button" onClick={() => toggleVersionGroup(groupKey)}>
+                        {expanded ? t('pd.collapse') : t('pd.expand')}
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+                {expanded && group.items.map((v) => renderVersionRow(v, true))}
+              </Fragment>
+            );
+          })}
+          {groups.length === 0 && (
+            <tr>
+              <td colSpan={10} className="muted" style={{ textAlign: 'center', padding: 24 }}>
+                {t(archived ? 'pd.noArchives' : 'pd.noVersions')}
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
   );
 
   return (
@@ -448,110 +553,34 @@ export default function ProjectDetail() {
         </div>
       )}
 
-      <div className="card">
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-          <h3 style={{ margin: 0 }}>{t('pd.versions')}</h3>
-          <button className="primary" onClick={() => setShowUpload(true)}>
-            {t('pd.uploadNew')}
-          </button>
+      <div className="card version-card">
+        <div className="version-card-header">
+          <div className="version-section-title"><h3>{t('pd.versions')}</h3><span className="version-count">{versionGroups.length}</span></div>
+          <div className="version-actions">
+            <button
+              onClick={archiveAllVersions}
+              disabled={versionBusy || !versions.some((v) => v.status === 'ready')}
+            >
+              {t('pd.archiveAll')}
+            </button>
+            <button className="primary" onClick={() => setShowUpload(true)}>
+              {t('pd.uploadNew')}
+            </button>
+          </div>
         </div>
-        <table>
-          <thead>
-            <tr>
-              <th>{t('pd.colVersion')}</th>
-              <th>{t('pd.colChannel')}</th>
-              <th>{t('pd.colStatus')}</th>
-              <th>{t('pd.colSize')}</th>
-              <th>{t('pd.colSha')}</th>
-              <th>{t('pd.colMandatory')}</th>
-              <th>{t('pd.colUploaded')}</th>
-              <th>{t('pd.colDownloads')}</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {versionGroups.map((group) => {
-              const [first] = group.items;
-              if (!first) return null;
-              if (group.items.length === 1) return renderVersionRow(first);
+        {renderVersionsTable(versionGroups)}
+      </div>
 
-              const expanded = expandedVersionGroups.has(group.label);
-              const onlyStatus = group.statusCounts.size === 1 ? group.latest.status : null;
-              return (
-                <Fragment key={`group-${group.label}`}>
-                  <tr className="version-group-row" onClick={() => toggleVersionGroup(group.label)}>
-                    <td>
-                      <span className="version-group-main">
-                        <button
-                          type="button"
-                          className="version-toggle"
-                          aria-expanded={expanded}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            toggleVersionGroup(group.label);
-                          }}
-                        >
-                          {expanded ? '-' : '+'}
-                        </button>
-                        <span className="code">{group.label}</span>
-                        <span className="tag">{t('pd.channelCount', { count: group.items.length })}</span>
-                        {group.hasCurrent && <span className="tag current">{t('pd.currentTag')}</span>}
-                        {group.hasPublic && <span className="tag">{t('pd.publicTag')}</span>}
-                      </span>
-                    </td>
-                    <td>
-                      <span className="tag-list">{group.channels.map((ch) => <Fragment key={ch}>{renderChannelTag(ch)}</Fragment>)}</span>
-                    </td>
-                    <td>
-                      <span className={`tag ${onlyStatus === 'ready' ? 'stable' : ''}`}>
-                        {statusSummary(group.statusCounts)}
-                      </span>
-                    </td>
-                    <td>{formatBytes(group.totalSize)}</td>
-                    <td>
-                      <span className="muted">-</span>
-                    </td>
-                    <td>{group.hasMandatory ? '✓' : ''}</td>
-                    <td className="muted">{new Date(group.latest.createdAt).toLocaleString()}</td>
-                    <td>{group.totalDownloads}</td>
-                    <td>
-                      {group.hasReady && (
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            void setCurrentVersion(group.label);
-                          }}
-                          disabled={group.hasCurrent}
-                          style={{ marginRight: 6 }}
-                        >
-                          {group.hasCurrent ? t('pd.currentVersion') : t('pd.setCurrent')}
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          toggleVersionGroup(group.label);
-                        }}
-                      >
-                        {expanded ? t('pd.collapse') : t('pd.expand')}
-                      </button>
-                    </td>
-                  </tr>
-                  {expanded && group.items.map((v) => renderVersionRow(v, true))}
-                </Fragment>
-              );
-            })}
-            {versions.length === 0 && (
-              <tr>
-                <td colSpan={9} className="muted" style={{ textAlign: 'center', padding: 24 }}>
-                  {t('pd.noVersions')}
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+      <div className="card version-card version-archive-card">
+        <div className="version-card-header">
+          <div className="version-section-title"><h3>{t('pd.archives')}</h3><span className="version-count">{archivedGroups.length}</span></div>
+        </div>
+        {archivedGroups.length > 0 ? (
+          <>
+            <p className="version-section-hint">{t('pd.archiveHint')}</p>
+            {renderVersionsTable(archivedGroups, true)}
+          </>
+        ) : <p className="version-empty-archive">{t('pd.noArchives')}</p>}
       </div>
 
       <div className="card">
@@ -632,116 +661,29 @@ export default function ProjectDetail() {
         </table>
       </div>
 
+      {notesDialog && (
+        <VersionNotesDialog
+          version={notesDialog.version}
+          items={versions.filter((v) => notesDialog.items.some((item) => item.id === v.id))}
+          current={versions.some((v) => v.version === notesDialog.version && v.isCurrent)}
+          onClose={() => setNotesDialog(null)}
+          onSave={async (versionId, updatedNotes) => {
+            const updated = await api.updateVersion(versionId, { notes: updatedNotes });
+            patchVersion(versionId, updated);
+          }}
+        />
+      )}
+
       {showUpload && (
-        <div className="dialog-backdrop" onClick={() => phase === 'idle' && setShowUpload(false)}>
-          <form className="dialog" onSubmit={startUploadHandler} onClick={(e) => e.stopPropagation()}>
-            <h3>{t('pd.dlgUpload')}</h3>
-            <label>
-              <span className="lbl">{t('pd.fldFile')}</span>
-              <input
-                type="file"
-                onChange={(e) => {
-                  setFile(e.target.files?.[0] ?? null);
-                  setUploadConflict(null);
-                }}
-                required
-                disabled={phase !== 'idle'}
-              />
-              {file && (
-                <div className="muted" style={{ marginTop: 4 }}>
-                  {file.name} — {formatBytes(file.size)}
-                </div>
-              )}
-            </label>
-            <label>
-              <span className="lbl">{t('pd.fldVersion')}</span>
-              <VersionField
-                value={version}
-                onChange={(v) => {
-                  setVersion(v);
-                  setUploadConflict(null);
-                }}
-                options={versionList}
-                disabled={phase !== 'idle'}
-              />
-            </label>
-            <label>
-              <span className="lbl">{t('pd.fldChannel')}</span>
-              <ChannelField
-                value={channel}
-                onChange={(v) => {
-                  setChannel(v);
-                  setUploadConflict(null);
-                }}
-                options={channelList}
-                disabled={phase !== 'idle'}
-              />
-            </label>
-            <label>
-              <input
-                type="checkbox"
-                checked={mandatory}
-                onChange={(e) => setMandatory(e.target.checked)}
-                disabled={phase !== 'idle'}
-              />{' '}
-              {t('pd.fldMandatory')}
-            </label>
-            <label>
-              <span className="lbl">{t('pd.fldNotes')}</span>
-              <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} disabled={phase !== 'idle'} style={{ width: '100%' }} />
-            </label>
-            {uploadConflict && phase === 'idle' && (
-              <div className="inline-warning">
-                <strong>{t('pd.uploadConflictTitle')}</strong>
-                <div className="muted">
-                  {t('pd.uploadConflictBody', {
-                    version,
-                    channel: channel || 'stable',
-                    existing: uploadConflict.filename,
-                    current: file?.name ?? '',
-                  })}
-                </div>
-                <div className="dialog-actions" style={{ marginTop: 10 }}>
-                  <button type="button" onClick={() => setUploadConflict(null)}>
-                    {t('pd.renameUpload')}
-                  </button>
-                  <button type="button" className="primary" onClick={() => void runUpload(true)}>
-                    {t('pd.overwriteUpload')}
-                  </button>
-                </div>
-              </div>
-            )}
-            {phase !== 'idle' && (
-              <div style={{ margin: '12px 0' }}>
-                <div className="muted" style={{ marginBottom: 4 }}>
-                  {phase === 'sha256' ? t('pd.hashing') : t('pd.uploadingR2')} {pct}%
-                </div>
-                <div className="progress">
-                  <div style={{ width: `${pct}%` }} />
-                </div>
-                <div className="muted" style={{ marginTop: 4 }}>
-                  {formatBytes(progress.loaded)} / {formatBytes(progress.total)}
-                </div>
-              </div>
-            )}
-            <div className="dialog-actions">
-              {phase !== 'idle' ? (
-                <button type="button" className="danger" onClick={cancelUpload}>
-                  {t('pd.cancelUpload')}
-                </button>
-              ) : (
-                <>
-                  <button type="button" onClick={() => setShowUpload(false)}>
-                    {t('common.close')}
-                  </button>
-                  <button type="submit" className="primary" disabled={!file || !version}>
-                    {t('pd.startUpload')}
-                  </button>
-                </>
-              )}
-            </div>
-          </form>
-        </div>
+        <UploadFilesDialog
+          key={projectId}
+          projectId={projectId}
+          defaultChannel={project.defaultChannel || 'stable'}
+          channels={channelList}
+          versions={versionList}
+          onClose={() => setShowUpload(false)}
+          onRefresh={load}
+        />
       )}
 
       {showTokenDlg && (
@@ -901,18 +843,545 @@ export default function ProjectDetail() {
   );
 }
 
+type UploadQueueStatus = 'waiting' | 'sha256' | 'upload' | 'success' | 'error' | 'cancelled';
+type UploadQueueItem = {
+  id: number;
+  file: File;
+  channel: string;
+  attempted: boolean;
+  status: UploadQueueStatus;
+  loaded: number;
+  error?: string;
+};
+const uploadChannelPattern = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+const uploadFileKey = (filename: string, channel: string) => JSON.stringify([filename, channel]);
+
+function UploadFilesDialog({
+  projectId,
+  defaultChannel,
+  channels,
+  versions,
+  onClose,
+  onRefresh,
+}: {
+  projectId: number;
+  defaultChannel: string;
+  channels: string[];
+  versions: string[];
+  onClose: () => void;
+  onRefresh: () => Promise<void>;
+}) {
+  const { t } = useI18n();
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const nextId = useRef(1);
+  const alive = useRef(true);
+  const busyRef = useRef(false);
+  const cancelRef = useRef(false);
+  const jobRef = useRef<UploadJobHandle | null>(null);
+  const [queue, setQueue] = useState<UploadQueueItem[]>([]);
+  const [version, setVersion] = useState('');
+  const [notes, setNotes] = useState('');
+  const [mandatory, setMandatory] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [started, setStarted] = useState(false);
+  const [selectionError, setSelectionError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [conflict, setConflict] = useState<{ items: UploadQueueItem[]; existingItems: UploadQueueItem[] } | null>(null);
+
+  const channelOptions = useMemo(() => [...new Set([
+    ...channels,
+    defaultChannel,
+    ...queue.map((item) => item.channel).filter((value) => uploadChannelPattern.test(value)),
+  ])].sort(), [channels, defaultChannel, queue]);
+  const duplicateIds = useMemo(() => {
+    const keys = new Map<string, number>();
+    const duplicates = new Set<number>();
+    for (const item of queue) {
+      const key = uploadFileKey(item.file.name, item.channel);
+      const existingId = keys.get(key);
+      if (existingId !== undefined) {
+        duplicates.add(existingId);
+        duplicates.add(item.id);
+      } else keys.set(key, item.id);
+    }
+    return duplicates;
+  }, [queue]);
+
+  useEffect(() => {
+    alive.current = true;
+    const dialog = dialogRef.current;
+    dialog?.showModal();
+    return () => {
+      alive.current = false;
+      cancelRef.current = true;
+      void jobRef.current?.abort().catch(() => {});
+      dialog?.close();
+    };
+  }, []);
+
+  function updateItem(id: number, patch: Partial<UploadQueueItem>) {
+    if (alive.current) setQueue((items) => items.map((item) => item.id === id ? { ...item, ...patch } : item));
+  }
+
+  function addFiles(files: File[]) {
+    if (busyRef.current) return;
+    const keys = new Set(queue.map((item) => uploadFileKey(item.file.name, item.channel)));
+    const duplicates = new Set<string>();
+    const added: UploadQueueItem[] = [];
+    for (const file of files) {
+      const key = uploadFileKey(file.name, defaultChannel);
+      if (keys.has(key)) {
+        duplicates.add(file.name);
+        continue;
+      }
+      keys.add(key);
+      added.push({ id: nextId.current++, file, channel: defaultChannel, attempted: false, status: 'waiting', loaded: 0 });
+    }
+    setQueue((items) => [...items, ...added]);
+    setSelectionError(duplicates.size ? t('pd.duplicateSelection', { names: [...duplicates].join('、'), channel: defaultChannel }) : null);
+    setConflict(null);
+    setError(null);
+  }
+
+  function changeFileChannel(item: UploadQueueItem, channel: string) {
+    if (busyRef.current || item.attempted) return;
+    updateItem(item.id, { channel });
+    setConflict(null);
+    setSelectionError(null);
+    setError(null);
+  }
+
+  async function runQueue(items: UploadQueueItem[], overwriteIds: Set<number>) {
+    setStarted(true);
+    setConflict(null);
+    const ids = new Set(items.map((item) => item.id));
+    setQueue((all) => all.map((item) => ids.has(item.id) ? { ...item, status: 'waiting', loaded: 0, error: undefined } : item));
+    try {
+      for (const item of items) {
+        if (cancelRef.current || !alive.current) break;
+        updateItem(item.id, { status: 'sha256', loaded: 0, error: undefined, attempted: true });
+        try {
+          const job = startUpload({
+            projectId,
+            file: item.file,
+            version,
+            releaseChannel: item.channel,
+            notes: notes || undefined,
+            isMandatory: mandatory,
+            overwriteExisting: overwriteIds.has(item.id),
+            concurrency: 4,
+            onProgress: (loaded, _total, phase) => {
+              if (!cancelRef.current) updateItem(item.id, { loaded: Math.min(loaded, item.file.size), status: phase });
+            },
+          });
+          jobRef.current = job;
+          await job.promise;
+          updateItem(item.id, { status: 'success', loaded: item.file.size });
+        } catch (e: any) {
+          updateItem(item.id, {
+            status: cancelRef.current || e?.name === 'AbortError' ? 'cancelled' : 'error',
+            error: cancelRef.current || e?.name === 'AbortError' ? undefined : e?.message ?? String(e),
+          });
+        } finally {
+          jobRef.current = null;
+        }
+      }
+    } finally {
+      if (alive.current) {
+        if (cancelRef.current) {
+          setQueue((all) => all.map((item) => ids.has(item.id) && ['waiting', 'sha256', 'upload'].includes(item.status)
+            ? { ...item, status: 'cancelled' }
+            : item));
+        }
+        try {
+          await onRefresh();
+        } catch (e: any) {
+          if (alive.current) setError(e?.message ?? String(e));
+        } finally {
+          if (alive.current) {
+            setBusy(false);
+            setCancelling(false);
+          }
+        }
+      }
+      busyRef.current = false;
+    }
+  }
+
+  async function prepareUpload(e: FormEvent) {
+    e.preventDefault();
+    if (busyRef.current || !version) return;
+    if (duplicateIds.size) {
+      setError(t('pd.duplicateFileChannels'));
+      return;
+    }
+    const items = queue.filter((item) => ['waiting', 'error', 'cancelled'].includes(item.status));
+    if (!items.length) return;
+    if (items.some((item) => !uploadChannelPattern.test(item.channel))) {
+      setError(t('pd.invalidFileChannel'));
+      return;
+    }
+    busyRef.current = true;
+    cancelRef.current = false;
+    setBusy(true);
+    setCancelling(false);
+    setError(null);
+    setConflict(null);
+    try {
+      const existing = await api.listVersions(projectId, { includePending: true });
+      if (!alive.current || cancelRef.current) {
+        if (alive.current) {
+          const ids = new Set(items.map((item) => item.id));
+          setQueue((all) => all.map((item) => ids.has(item.id) ? { ...item, status: 'cancelled' } : item));
+        }
+        return;
+      }
+      const existingItems = items.filter((item) => existing.some((v) => v.version === version
+        && v.releaseChannel === item.channel && v.filename === item.file.name));
+      if (existingItems.length) {
+        setConflict({ items, existingItems });
+        return;
+      }
+      await runQueue(items, new Set());
+    } catch (e: any) {
+      if (alive.current) setError(e?.message ?? String(e));
+    } finally {
+      busyRef.current = false;
+      if (alive.current) {
+        setBusy(false);
+        setCancelling(false);
+      }
+    }
+  }
+
+  async function confirmOverwrite() {
+    if (!conflict || busyRef.current || duplicateIds.size) return;
+    busyRef.current = true;
+    cancelRef.current = false;
+    setBusy(true);
+    setCancelling(false);
+    setError(null);
+    await runQueue(conflict.items, new Set(conflict.existingItems.map((item) => item.id)));
+  }
+
+  async function cancelUpload() {
+    cancelRef.current = true;
+    setCancelling(true);
+    try {
+      await jobRef.current?.abort();
+    } catch (e: any) {
+      if (alive.current) setError(e?.message ?? String(e));
+    }
+  }
+
+  function newBatch() {
+    setQueue([]);
+    setStarted(false);
+    setSelectionError(null);
+    setError(null);
+    setConflict(null);
+  }
+
+  const readyCount = queue.filter((item) => ['waiting', 'error', 'cancelled'].includes(item.status)).length;
+  const successCount = queue.filter((item) => item.status === 'success').length;
+  const failedCount = queue.filter((item) => item.status === 'error').length;
+  const cancelledCount = queue.filter((item) => item.status === 'cancelled').length;
+  const totalSize = queue.reduce((sum, item) => sum + item.file.size, 0);
+
+  return (
+    <dialog
+      ref={dialogRef}
+      className="dialog upload-dialog"
+      aria-labelledby="upload-dialog-title"
+      onCancel={(e) => {
+        e.preventDefault();
+        if (!busyRef.current) onClose();
+      }}
+    >
+      <form onSubmit={prepareUpload}>
+        <div className="upload-dialog-heading">
+          <div><h3 id="upload-dialog-title">{t('pd.dlgUpload')}</h3><p>{t('pd.batchUploadHint')}</p></div>
+          <button type="button" disabled={busy} onClick={onClose}>{t('common.close')}</button>
+        </div>
+        <div className="upload-dialog-body">
+          <div className="upload-file-picker">
+            <div><strong>{t('pd.uploadFiles')}</strong><span>{t('pd.selectedFiles', { count: queue.length, size: formatBytes(totalSize) })}</span></div>
+            <label className={`upload-select-button${busy ? ' is-disabled' : ''}`}>
+              {t(queue.length ? 'pd.addFiles' : 'pd.chooseFiles')}
+              <input
+                type="file"
+                multiple
+                className="upload-file-input"
+                aria-label={t('pd.chooseFiles')}
+                disabled={busy}
+                onChange={(e) => {
+                  addFiles(Array.from(e.target.files ?? []));
+                  e.target.value = '';
+                }}
+              />
+            </label>
+          </div>
+          {selectionError && <p className="upload-selection-warning" role="alert">{selectionError}</p>}
+          {queue.length ? (
+            <ul className="upload-file-list">
+              {queue.map((item, index) => {
+                const active = item.status === 'sha256' || item.status === 'upload';
+                const percentage = item.file.size > 0 ? Math.round(item.loaded / item.file.size * 100) : 0;
+                return (
+                  <li className={`upload-file-row upload-file-${item.status}${duplicateIds.has(item.id) ? ' upload-file-duplicate' : ''}`} key={item.id} data-upload-id={item.id}>
+                    <div className="upload-file-main">
+                      <span className="upload-file-icon"><VersionIcon name="notes" /></span>
+                      <div className="upload-file-detail">
+                        <span className="upload-file-name" title={item.file.name}>{item.file.name}</span>
+                        <span className="upload-file-size">{formatBytes(item.file.size)}{active ? ` · ${percentage}%` : ''}</span>
+                      </div>
+                      <div className="upload-file-channel">
+                        <label htmlFor={`upload-channel-${item.id}`}>{t('pd.fldChannel')}</label>
+                        <ChannelField
+                          id={`upload-channel-${item.id}`}
+                          ariaLabel={t('pd.fileChannelLabel', { index: index + 1, filename: item.file.name })}
+                          value={item.channel}
+                          onChange={(value) => changeFileChannel(item, value)}
+                          options={channelOptions}
+                          required
+                          disabled={busy || item.attempted}
+                        />
+                      </div>
+                      <span className={`upload-file-status ${item.status}`}>{t(`pd.uploadStatus.${item.status}`)}</span>
+                      <button
+                        type="button"
+                        className="upload-remove-file"
+                        disabled={busy}
+                        title={t('pd.removeFile', { filename: `${item.channel} / ${item.file.name}` })}
+                        aria-label={t('pd.removeFile', { filename: `${item.channel} / ${item.file.name}` })}
+                        onClick={() => { setQueue((items) => items.filter((entry) => entry.id !== item.id)); setConflict(null); }}
+                      >×</button>
+                    </div>
+                    {active && <div className="progress" role="progressbar" aria-label={item.file.name} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percentage}><div style={{ width: `${percentage}%` }} /></div>}
+                    {item.error && <p className="upload-file-error" role="alert">{item.error}</p>}
+                    {duplicateIds.has(item.id) && <p className="upload-file-error" role="alert">{t('pd.duplicateFileChannel', { channel: item.channel })}</p>}
+                  </li>
+                );
+              })}
+            </ul>
+          ) : <div className="upload-file-empty">{t('pd.fileSelectionHint')}</div>}
+          <label>
+            <span className="lbl">{t('pd.fldVersion')}</span>
+            <VersionField value={version} onChange={(value) => { setVersion(value); setConflict(null); }} options={versions} disabled={busy || started} />
+          </label>
+          <label>
+            <span className="lbl">{t('pd.sharedNotes')}</span>
+            <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} disabled={busy || started} style={{ width: '100%' }} />
+          </label>
+          <label className="upload-mandatory"><input type="checkbox" checked={mandatory} onChange={(e) => setMandatory(e.target.checked)} disabled={busy || started} /> {t('pd.fldMandatory')}</label>
+          {started && <p className="upload-batch-lock-hint">{t('pd.batchSettingsLocked')}</p>}
+          {error && <p className="error" role="alert">{error}</p>}
+          {conflict && (
+            <div className="inline-warning" role="alert">
+              <strong>{t('pd.uploadConflictTitle')}</strong>
+              <p>{t('pd.batchConflictBody', { version, count: conflict.existingItems.length })}</p>
+              <ul className="upload-conflict-files">{conflict.existingItems.map((item) => <li key={item.id}><span className="tag">{item.channel}</span> {item.file.name}</li>)}</ul>
+              <div className="dialog-actions">
+                <button type="button" onClick={() => setConflict(null)}>{t('pd.reviewSelection')}</button>
+                <button type="button" className="primary" onClick={confirmOverwrite}>{t('pd.overwriteAndUpload')}</button>
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="upload-dialog-footer">
+          <div className="upload-summary" aria-live="polite">
+            {started ? t('pd.uploadSummary', { success: successCount, failed: failedCount, cancelled: cancelledCount }) : t('pd.uploadSequentialHint')}
+          </div>
+          <div className="version-actions">
+            {busy ? (
+              <button type="button" className="danger" onClick={cancelUpload} disabled={cancelling}>{t(cancelling ? 'pd.cancellingUploads' : 'pd.cancelUpload')}</button>
+            ) : (
+              <>
+                {started && <button type="button" onClick={newBatch}>{t('pd.newUploadBatch')}</button>}
+                {readyCount > 0 && <button type="submit" className="primary" disabled={!version || !!conflict || duplicateIds.size > 0}>{t(started ? 'pd.retryRemaining' : 'pd.startUpload')}</button>}
+                {started && readyCount === 0 && <button type="button" className="primary" onClick={onClose}>{t('common.done')}</button>}
+              </>
+            )}
+          </div>
+        </div>
+      </form>
+    </dialog>
+  );
+}
+
+function VersionIcon({ name }: { name: 'download' | 'public' | 'delete' | 'notes' | 'chevron' }) {
+  const paths = {
+    download: <><path d="M12 3v12m-4-4 4 4 4-4" /><path d="M5 15v5h14v-5" /></>,
+    public: <><path d="m10 13 4-4" /><path d="m8 16-1 1a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0m2 1 1-1a4 4 0 0 1 6 6l-4 4a4 4 0 0 1-6 0" transform="translate(1 0)" /></>,
+    delete: <><path d="M4 7h16M9 7V4h6v3M6 7l1 14h10l1-14M10 11v6m4-6v6" /></>,
+    notes: <><path d="M6 3h9l4 4v14H6zM14 3v5h5M9 12h7m-7 4h5" /></>,
+    chevron: <path d="m9 5 7 7-7 7" />,
+  };
+  return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
+}
+
+function groupNotes(items: Version[]) {
+  const groups = new Map<string, { notes: string; items: Version[] }>();
+  for (const item of items) {
+    const notes = item.notes?.trim() ? item.notes : '';
+    const existing = groups.get(notes);
+    if (existing) existing.items.push(item);
+    else groups.set(notes, { notes, items: [item] });
+  }
+  return [...groups.values()];
+}
+
+function VersionNotesDialog({
+  version,
+  items,
+  current,
+  onClose,
+  onSave,
+}: {
+  version: string;
+  items: Version[];
+  current: boolean;
+  onClose: () => void;
+  onSave: (id: number, notes: string | null) => Promise<void>;
+}) {
+  const { t } = useI18n();
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const savingRef = useRef(false);
+  const editing = items.find((item) => item.id === editingId);
+  const editable = !current && editing?.canEditNotes;
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    dialog?.showModal();
+    return () => dialog?.close();
+  }, []);
+
+  async function save(e: FormEvent) {
+    e.preventDefault();
+    if (!editing || !editable || savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
+    setError(null);
+    try {
+      await onSave(editing.id, draft.trim() ? draft : null);
+      setEditingId(null);
+    } catch (e: any) {
+      setError(e?.message ?? String(e));
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  }
+
+  return (
+    <dialog
+      ref={dialogRef}
+      className="dialog version-notes-dialog"
+      aria-labelledby="version-notes-title"
+      onCancel={(e) => {
+        e.preventDefault();
+        if (!saving) onClose();
+      }}
+      onClick={(e) => {
+        if (e.target !== e.currentTarget || saving) return;
+        const bounds = e.currentTarget.getBoundingClientRect();
+        if (e.clientX < bounds.left || e.clientX > bounds.right || e.clientY < bounds.top || e.clientY > bounds.bottom) {
+          onClose();
+        }
+      }}
+    >
+      <div className="version-notes-header">
+        <h3 id="version-notes-title">{t('pd.colNotes')} <span className="code">{version}</span></h3>
+        <button type="button" onClick={onClose} disabled={saving} autoFocus>{t('common.close')}</button>
+      </div>
+      {current ? (
+        <p className="version-notes-hint">{t('pd.notesCurrentLocked')}</p>
+      ) : items.some((item) => !item.canEditNotes) ? (
+        <p className="version-notes-hint">{t('pd.notesPermissionHint')}</p>
+      ) : null}
+      <div className="version-notes-body">
+        {editing ? (
+          <form onSubmit={save}>
+            <label>
+              <span className="lbl">{t('pd.editFileNotes', { channel: editing.releaseChannel, filename: editing.filename })}</span>
+              <textarea
+                className="version-notes-editor"
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                disabled={saving || !editable}
+                autoFocus
+              />
+            </label>
+            <p className="muted">{t('pd.notesEditHint')}</p>
+            {error && <p className="error" role="alert">{error}</p>}
+            <div className="dialog-actions">
+              <button type="button" disabled={saving} onClick={() => { setEditingId(null); setError(null); }}>
+                {t('common.cancel')}
+              </button>
+              <button type="submit" className="primary" disabled={saving || !editable}>
+                {saving ? t('pd.savingNotes') : t('common.save')}
+              </button>
+            </div>
+          </form>
+        ) : groupNotes(items).map((entry) => (
+          <section className="version-notes-section" key={entry.items[0]!.id}>
+            <div className="version-note-files">
+              {entry.items.map((item) => (
+                <div className="version-note-file-row" key={item.id}>
+                  <div className="version-note-file-identity">
+                    <span className="tag">{item.releaseChannel}</span>
+                    <span className="version-note-filename" title={item.filename}>{item.filename}</span>
+                  </div>
+                  {item.canEditNotes && !current && (
+                    <button
+                      type="button"
+                      title={t('pd.editFileNotes', { channel: item.releaseChannel, filename: item.filename })}
+                      aria-label={t('pd.editFileNotes', { channel: item.releaseChannel, filename: item.filename })}
+                      onClick={() => {
+                        setEditingId(item.id);
+                        setDraft(item.notes ?? '');
+                        setError(null);
+                      }}
+                    >
+                      {t('pd.editNotes')}
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+            <div className={`version-notes-text${entry.notes ? '' : ' muted'}`}>
+              {entry.notes || t('pd.noNotes')}
+            </div>
+          </section>
+        ))}
+      </div>
+    </dialog>
+  );
+}
+
 function ChannelField({
   value,
   onChange,
   options,
   allowAny = false,
   disabled = false,
+  required = false,
+  id,
+  ariaLabel,
 }: {
   value: string;
   onChange: (v: string) => void;
   options: string[];
   allowAny?: boolean;
   disabled?: boolean;
+  required?: boolean;
+  id?: string;
+  ariaLabel?: string;
 }) {
   const { t } = useI18n();
   return (
@@ -922,6 +1391,9 @@ function ChannelField({
       options={options}
       allowAny={allowAny}
       disabled={disabled}
+      required={required}
+      id={id}
+      ariaLabel={ariaLabel}
       pattern="^[a-z0-9][a-z0-9_\-]{0,31}$"
       anyLabel={t('pd.tokenChannelAny')}
       newLabel={t('pd.channelNew')}
@@ -971,6 +1443,8 @@ function SelectOrCreateField({
   newLabel,
   backLabel,
   fallbackValue,
+  id,
+  ariaLabel,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -984,6 +1458,8 @@ function SelectOrCreateField({
   newLabel: string;
   backLabel: string;
   fallbackValue?: string;
+  id?: string;
+  ariaLabel?: string;
 }) {
   const NEW = '__new__';
   // Start in "create" mode if the current value is not in the existing choices.
@@ -993,6 +1469,8 @@ function SelectOrCreateField({
     return (
       <div style={{ display: 'grid', gap: 6 }}>
         <input
+          id={id}
+          aria-label={ariaLabel}
           value={value}
           onChange={(e) => onChange(e.target.value)}
           pattern={pattern}
@@ -1020,6 +1498,8 @@ function SelectOrCreateField({
 
   return (
     <select
+      id={id}
+      aria-label={ariaLabel}
       value={selectValue}
       disabled={disabled}
       required={required}
@@ -1047,4 +1527,37 @@ function SelectOrCreateField({
       <option value={NEW}>{newLabel}</option>
     </select>
   );
+}
+
+function groupVersions(versions: Version[]) {
+  const groups = new Map<string, Version[]>();
+  for (const v of versions) {
+    const list = groups.get(v.version);
+    if (list) list.push(v);
+    else groups.set(v.version, [v]);
+  }
+
+  return [...groups.entries()].flatMap(([label, items]) => {
+    const [first, ...rest] = items;
+    if (!first) return [];
+    const latest = rest.reduce((best, item) => (item.createdAt > best.createdAt ? item : best), first);
+    const channels = [...new Set(items.map((item) => item.releaseChannel))];
+    const statusCounts = new Map<Version['status'], number>();
+    for (const item of items) statusCounts.set(item.status, (statusCounts.get(item.status) ?? 0) + 1);
+    const sortedItems = [...items].sort(
+      (a, b) => Number(b.isCurrent) - Number(a.isCurrent) || b.createdAt - a.createdAt,
+    );
+    return {
+      label,
+      items: sortedItems,
+      latest,
+      channels,
+      statusCounts,
+      totalSize: items.reduce((sum, item) => sum + item.size, 0),
+      totalDownloads: items.reduce((sum, item) => sum + item.downloadCount, 0),
+      hasCurrent: items.some((item) => item.isCurrent),
+      hasReady: items.some((item) => item.status === 'ready'),
+      hasPublic: items.some((item) => item.publicSlug),
+    };
+  }).sort((a, b) => Number(b.hasCurrent) - Number(a.hasCurrent) || b.latest.createdAt - a.latest.createdAt);
 }

@@ -5,11 +5,13 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../env';
 import { requireUser } from '../middleware/auth';
-import { badRequest, notFound } from '../utils/errors';
+import { badRequest, conflict, notFound } from '../utils/errors';
 import { requireProjectAccess, visibleProjectIds } from '../lib/memberships';
 import { makeStorage } from '../lib/s3';
 import { audit } from '../lib/audit';
 import { base64UrlEncode } from '../utils/encoding';
+import { IS_CURRENT_SQL, NOTES_UNLOCKED_SQL, setCurrentVersion, clearUnusedCurrentVersions, syncLegacyCurrentVersion } from '../lib/current-versions';
+import { withNotePermissions, requireNotesEdit } from '../lib/version-notes';
 
 export const versionRoutes = new Hono<AppEnv>();
 
@@ -27,8 +29,9 @@ interface VersionRow {
   sha256: string | null;
   content_type: string | null;
   notes: string | null;
+  can_edit_notes?: boolean;
   is_mandatory: number;
-  current_version: string | null;
+  is_current: number;
   min_version: string | null;
   max_version: string | null;
   rollout_percentage: number;
@@ -53,8 +56,9 @@ export function versionDto(r: VersionRow) {
     sha256: r.sha256,
     contentType: r.content_type,
     notes: r.notes,
+    canEditNotes: !!r.can_edit_notes,
     isMandatory: !!r.is_mandatory,
-    isCurrent: r.current_version === r.version,
+    isCurrent: !!r.is_current,
     minVersion: r.min_version,
     maxVersion: r.max_version,
     rolloutPercentage: r.rollout_percentage,
@@ -87,14 +91,14 @@ versionRoutes.get('/', async (c) => {
   }
   const rows = await c.env.DB.prepare(
     `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type, v.notes,
-            v.is_mandatory, p.current_version, v.min_version, v.max_version, v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug, v.uploaded_by, v.created_at, v.updated_at
+            v.is_mandatory, ${IS_CURRENT_SQL} AS is_current, v.min_version, v.max_version, v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug, v.uploaded_by, v.created_at, v.updated_at
        FROM versions v
        JOIN projects p ON p.id = v.project_id
       WHERE ${where.join(' AND ')} ORDER BY v.created_at DESC`,
   )
     .bind(...args)
     .all<VersionRow>();
-  return c.json((rows.results ?? []).map(versionDto));
+  return c.json((await withNotePermissions(c.env.DB, user, rows.results ?? [])).map(versionDto));
 });
 
 interface AccessibleRow extends VersionRow {
@@ -134,7 +138,7 @@ versionRoutes.get('/accessible', async (c) => {
   }
   const rows = await c.env.DB.prepare(
     `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size,
-            v.sha256, v.content_type, v.notes, v.is_mandatory, p.current_version, v.min_version, v.max_version,
+            v.sha256, v.content_type, v.notes, v.is_mandatory, ${IS_CURRENT_SQL} AS is_current, v.min_version, v.max_version,
             v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug,
             v.uploaded_by, v.created_at, v.updated_at,
             p.code AS project_code, p.name AS project_name,
@@ -147,7 +151,7 @@ versionRoutes.get('/accessible', async (c) => {
   )
     .bind(...args)
     .all<AccessibleRow>();
-  return c.json((rows.results ?? []).map(accessibleDto));
+  return c.json((await withNotePermissions(c.env.DB, user, rows.results ?? [])).map(accessibleDto));
 });
 
 versionRoutes.get('/:id', async (c) => {
@@ -156,7 +160,7 @@ versionRoutes.get('/:id', async (c) => {
   const user = c.get('user')!;
   const row = await c.env.DB.prepare(
     `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type, v.notes,
-            v.is_mandatory, p.current_version, v.min_version, v.max_version, v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug, v.uploaded_by, v.created_at, v.updated_at
+            v.is_mandatory, ${IS_CURRENT_SQL} AS is_current, v.min_version, v.max_version, v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug, v.uploaded_by, v.created_at, v.updated_at
        FROM versions v
        JOIN projects p ON p.id = v.project_id
       WHERE v.id = ?`,
@@ -165,16 +169,115 @@ versionRoutes.get('/:id', async (c) => {
     .first<VersionRow>();
   if (!row) throw notFound();
   await requireProjectAccess(c.env.DB, user, row.project_id, 'view');
-  return c.json(versionDto(row));
+  return c.json(versionDto((await withNotePermissions(c.env.DB, user, [row]))[0]!));
+});
+
+type GroupPatchBody = {
+  projectId: number;
+  version: string;
+  notes?: string | null;
+  isCurrent?: boolean;
+  status?: 'ready' | 'archived';
+};
+
+function validateVersionPatch(body: { notes?: string | null; isCurrent?: boolean; status?: string }) {
+  if (body.notes !== undefined && body.notes !== null && typeof body.notes !== 'string') {
+    throw badRequest('notes must be a string or null');
+  }
+  if (body.isCurrent !== undefined && typeof body.isCurrent !== 'boolean') {
+    throw badRequest('isCurrent must be a boolean');
+  }
+  if (body.status !== undefined && body.status !== 'ready' && body.status !== 'archived') {
+    throw badRequest('status must be ready or archived');
+  }
+}
+
+// Label-level changes are atomic across all its channels. Literal mutation
+// routes precede /:id so "group" is never parsed as an artifact id.
+versionRoutes.patch('/group', async (c) => {
+  const body = await c.req.json<GroupPatchBody>().catch(() => null);
+  if (!body || !Number.isSafeInteger(body.projectId) || body.projectId <= 0) {
+    throw badRequest('valid projectId required');
+  }
+  if (typeof body.version !== 'string' || !/^[A-Za-z0-9._+-]{1,64}$/.test(body.version)) {
+    throw badRequest('valid version required');
+  }
+  validateVersionPatch(body);
+  const proj = await requireProjectAccess(c.env.DB, c.get('user')!, body.projectId, 'manage_versions');
+  const existing = await c.env.DB.prepare(
+    `SELECT id, status, project_id, version, uploaded_by FROM versions WHERE project_id = ? AND version = ? AND status != 'pending'`,
+  ).bind(body.projectId, body.version).all<{ id: number; status: VersionRow['status']; project_id: number; version: string; uploaded_by: number }>();
+  const rows = existing.results ?? [];
+  if (rows.length === 0) throw notFound('version not found');
+  if (body.notes !== undefined) await requireNotesEdit(c.env.DB, c.get('user')!, rows);
+  if (body.isCurrent && (body.status === 'archived' ||
+    (body.status !== 'ready' && !rows.some((row) => row.status === 'ready')))) {
+    throw badRequest('only ready versions can be current');
+  }
+  const now = Date.now();
+  const changes: D1PreparedStatement[] = [];
+  if (body.notes !== undefined) {
+    changes.push(c.env.DB.prepare(
+      `UPDATE versions SET notes = ?, updated_at = ?
+        WHERE project_id = ? AND version = ? AND status != 'pending'
+          AND id IN (${rows.map(() => '?').join(',')}) AND ${NOTES_UNLOCKED_SQL}`,
+    ).bind(body.notes, now, body.projectId, body.version, ...rows.map((row) => row.id)));
+  }
+  if (body.status !== undefined) {
+    changes.push(c.env.DB.prepare(
+      `UPDATE versions SET status = ?, updated_at = ? WHERE project_id = ? AND version = ? AND status = ?
+        ${body.notes !== undefined ? `AND ${NOTES_UNLOCKED_SQL}` : ''}`,
+    ).bind(body.status, now, body.projectId, body.version, body.status === 'archived' ? 'ready' : 'archived'));
+  }
+  if (body.isCurrent !== undefined) {
+    changes.push(setCurrentVersion(c.env.DB, body.projectId, body.version, body.isCurrent, body.notes !== undefined));
+  }
+  if (changes.length) {
+    changes.push(clearUnusedCurrentVersions(c.env.DB, body.projectId));
+    changes.push(syncLegacyCurrentVersion(c.env.DB, body.projectId, now));
+    const result = await c.env.DB.batch(changes);
+    if (body.notes !== undefined && result[0]?.meta.changes === 0) {
+      throw conflict('version changed; cancel current usage before editing notes');
+    }
+    await audit(c, {
+      action: 'version.group.update', customerId: proj.customer_id, projectId: body.projectId,
+      targetType: 'version', meta: { version: body.version, fields: Object.keys(body).filter((key) => key !== 'projectId' && key !== 'version') },
+    });
+  }
+  const updated = await c.env.DB.prepare(
+    `SELECT v.*, ${IS_CURRENT_SQL} AS is_current FROM versions v
+      WHERE v.project_id = ? AND v.version = ? ORDER BY v.created_at DESC, v.id DESC`,
+  ).bind(body.projectId, body.version).all<VersionRow>();
+  return c.json((await withNotePermissions(c.env.DB, c.get('user')!, updated.results ?? [])).map(versionDto));
+});
+
+versionRoutes.post('/archive-all', async (c) => {
+  const body = await c.req.json<{ projectId: number }>().catch(() => null);
+  if (!body || !Number.isSafeInteger(body.projectId) || body.projectId <= 0) {
+    throw badRequest('valid projectId required');
+  }
+  const proj = await requireProjectAccess(c.env.DB, c.get('user')!, body.projectId, 'manage_versions');
+  const now = Date.now();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE versions SET status = 'archived', updated_at = ? WHERE project_id = ? AND status = 'ready'`)
+      .bind(now, body.projectId),
+    clearUnusedCurrentVersions(c.env.DB, body.projectId),
+    syncLegacyCurrentVersion(c.env.DB, body.projectId, now),
+  ]);
+  await audit(c, {
+    action: 'version.archive_all', customerId: proj.customer_id, projectId: body.projectId,
+    targetType: 'project', targetId: body.projectId,
+  });
+  return c.json({ ok: true });
 });
 
 versionRoutes.patch('/:id', async (c) => {
   const id = Number(c.req.param('id'));
   if (!Number.isFinite(id)) throw badRequest('invalid id');
   const user = c.get('user')!;
-  const existing = await c.env.DB.prepare('SELECT project_id, version, status FROM versions WHERE id = ?')
+  const existing = await c.env.DB.prepare('SELECT project_id, version, status, uploaded_by FROM versions WHERE id = ?')
     .bind(id)
-    .first<{ project_id: number; version: string; status: VersionRow['status'] }>();
+    .first<{ project_id: number; version: string; status: VersionRow['status']; uploaded_by: number }>();
   if (!existing) throw notFound();
   const proj = await requireProjectAccess(c.env.DB, user, existing.project_id, 'manage_versions');
   type PatchBody = {
@@ -187,6 +290,8 @@ versionRoutes.patch('/:id', async (c) => {
     status?: 'ready' | 'archived';
   };
   const body = (await c.req.json<PatchBody>().catch(() => ({} as PatchBody))) as PatchBody;
+  validateVersionPatch(body);
+  if (body.notes !== undefined) await requireNotesEdit(c.env.DB, user, [existing]);
   const sets: string[] = [];
   const args: unknown[] = [];
   if (body.notes !== undefined) {
@@ -211,7 +316,7 @@ versionRoutes.patch('/:id', async (c) => {
     args.push(pct);
   }
   if (body.status !== undefined) {
-    if (body.status !== 'ready' && body.status !== 'archived') throw badRequest('status must be ready or archived');
+    if (existing.status === 'pending') throw badRequest('pending uploads cannot be archived or restored');
     sets.push('status = ?');
     args.push(body.status);
   }
@@ -220,41 +325,23 @@ versionRoutes.patch('/:id', async (c) => {
     if (body.isCurrent && nextStatus !== 'ready') throw badRequest('only ready versions can be current');
   }
   const now = Date.now();
-  if (body.isCurrent) {
-    await c.env.DB.prepare('UPDATE projects SET current_version = ?, updated_at = ? WHERE id = ?')
-      .bind(existing.version, now, existing.project_id)
-      .run();
-  } else if (body.isCurrent === false) {
-    await c.env.DB.prepare('UPDATE projects SET current_version = NULL, updated_at = ? WHERE id = ? AND current_version = ?')
-      .bind(now, existing.project_id, existing.version)
-      .run();
+  const changes: D1PreparedStatement[] = [];
+  if (sets.length) {
+    sets.push('updated_at = ?');
+    args.push(now, id);
+    changes.push(c.env.DB.prepare(
+      `UPDATE versions SET ${sets.join(', ')} WHERE id = ? ${body.notes !== undefined ? `AND ${NOTES_UNLOCKED_SQL}` : ''}`,
+    ).bind(...args));
   }
-  if (sets.length === 0) {
-    const row = await c.env.DB.prepare(
-      `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type, v.notes,
-              v.is_mandatory, p.current_version, v.min_version, v.max_version, v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug, v.uploaded_by, v.created_at, v.updated_at
-         FROM versions v
-         JOIN projects p ON p.id = v.project_id
-        WHERE v.id = ?`,
-    )
-      .bind(id)
-      .first<VersionRow>();
-    return c.json(versionDto(row!));
+  if (body.isCurrent !== undefined) {
+    changes.push(setCurrentVersion(c.env.DB, existing.project_id, existing.version, body.isCurrent, body.notes !== undefined));
   }
-  sets.push('updated_at = ?');
-  args.push(now);
-  args.push(id);
-  await c.env.DB.prepare(`UPDATE versions SET ${sets.join(', ')} WHERE id = ?`).bind(...args).run();
-  if (body.status === 'archived') {
-    const remaining = await c.env.DB.prepare(
-      `SELECT id FROM versions WHERE project_id = ? AND version = ? AND status = 'ready' LIMIT 1`,
-    )
-      .bind(existing.project_id, existing.version)
-      .first<{ id: number }>();
-    if (!remaining) {
-      await c.env.DB.prepare('UPDATE projects SET current_version = NULL, updated_at = ? WHERE id = ? AND current_version = ?')
-        .bind(now, existing.project_id, existing.version)
-        .run();
+  if (changes.length) {
+    changes.push(clearUnusedCurrentVersions(c.env.DB, existing.project_id));
+    changes.push(syncLegacyCurrentVersion(c.env.DB, existing.project_id, now));
+    const result = await c.env.DB.batch(changes);
+    if (body.notes !== undefined && result[0]?.meta.changes === 0) {
+      throw conflict('version changed; cancel current usage before editing notes');
     }
   }
   await audit(c, {
@@ -267,14 +354,14 @@ versionRoutes.patch('/:id', async (c) => {
   });
   const row = await c.env.DB.prepare(
     `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type, v.notes,
-            v.is_mandatory, p.current_version, v.min_version, v.max_version, v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug, v.uploaded_by, v.created_at, v.updated_at
+            v.is_mandatory, ${IS_CURRENT_SQL} AS is_current, v.min_version, v.max_version, v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug, v.uploaded_by, v.created_at, v.updated_at
        FROM versions v
        JOIN projects p ON p.id = v.project_id
       WHERE v.id = ?`,
   )
     .bind(id)
     .first<VersionRow>();
-  return c.json(versionDto(row!));
+  return c.json(versionDto((await withNotePermissions(c.env.DB, user, [row!]))[0]!));
 });
 
 // Enable token-less public download for a version: mints an unguessable
@@ -346,17 +433,11 @@ versionRoutes.delete('/:id', async (c) => {
   } catch (e) {
     console.warn('[versions.delete] R2 delete failed (will still drop metadata):', e);
   }
-  await c.env.DB.prepare('DELETE FROM versions WHERE id = ?').bind(id).run();
-  const remaining = await c.env.DB.prepare(
-    `SELECT id FROM versions WHERE project_id = ? AND version = ? AND status = 'ready' LIMIT 1`,
-  )
-    .bind(row.project_id, row.version)
-    .first<{ id: number }>();
-  if (!remaining) {
-    await c.env.DB.prepare('UPDATE projects SET current_version = NULL, updated_at = ? WHERE id = ? AND current_version = ?')
-      .bind(Date.now(), row.project_id, row.version)
-      .run();
-  }
+  await c.env.DB.batch([
+    c.env.DB.prepare('DELETE FROM versions WHERE id = ?').bind(id),
+    clearUnusedCurrentVersions(c.env.DB, row.project_id),
+    syncLegacyCurrentVersion(c.env.DB, row.project_id, Date.now()),
+  ]);
   await audit(c, {
     action: 'version.delete',
     customerId: proj.customer_id,

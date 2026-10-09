@@ -51,6 +51,8 @@ export interface Project {
   name: string;
   description: string | null;
   defaultChannel: string;
+  currentVersions: string[];
+  /** Latest current label, retained for older clients. Prefer currentVersions. */
   currentVersion: string | null;
   createdAt: number;
   updatedAt: number;
@@ -70,6 +72,8 @@ export interface Version {
   sha256: string | null;
   contentType: string | null;
   notes: string | null;
+  /** Authenticated caller may edit notes; false while this label is current. */
+  canEditNotes?: boolean;
   isMandatory: boolean;
   isCurrent: boolean;
   minVersion: string | null;
@@ -203,7 +207,7 @@ export interface UploadInitRequest {
   minVersion?: string | null;
   maxVersion?: string | null;
   rolloutPercentage?: number;
-  /** Replace the existing row when (project, version, releaseChannel) already exists. */
+  /** Replace only the matching (project, version, releaseChannel, filename) file. */
   overwriteExisting?: boolean;
   /** Hex SHA-256, client-computed. Will be re-verified on complete if provided. */
   expectedSha256?: string;

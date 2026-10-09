@@ -17,6 +17,8 @@ import { requireProjectAccess } from '../lib/memberships';
 import { makeStorage, type StorageBackend } from '../lib/s3';
 import { audit } from '../lib/audit';
 import { versionDto } from './versions';
+import { IS_CURRENT_SQL, NOTES_UNLOCKED_SQL } from '../lib/current-versions';
+import { requireNotesEdit, withNotePermissions } from '../lib/version-notes';
 
 export const uploadRoutes = new Hono<AppEnv>();
 
@@ -40,8 +42,10 @@ function clampPartSize(hint: number | undefined, totalSize: number): number {
 }
 
 function r2KeyFor(customerCode: string, projectCode: string, channel: string, version: string, filename: string): string {
-  const safe = filename.replace(/[^A-Za-z0-9._+-]/g, '_');
-  return `${customerCode}/${projectCode}/${channel}/${version}/${safe}`;
+  const safe = filename.replace(/[^A-Za-z0-9._+-]/g, '_').slice(0, 160) || 'file';
+  // Each upload owns its object. Equal/sanitized filenames and concurrent
+  // replacements must never overwrite an object still served by a version.
+  return `${customerCode}/${projectCode}/${channel}/${version}/${crypto.randomUUID()}/${safe}`;
 }
 
 async function deleteObjectBestEffort(storage: StorageBackend, key: string) {
@@ -114,7 +118,7 @@ uploadRoutes.post('/init', async (c) => {
     contentType?: string | null;
     version?: string;
     releaseChannel?: string;
-    notes?: string;
+    notes?: string | null;
     isMandatory?: boolean;
     minVersion?: string | null;
     maxVersion?: string | null;
@@ -126,7 +130,9 @@ uploadRoutes.post('/init', async (c) => {
   const body = (await c.req.json<InitBody>().catch(() => ({} as InitBody))) as InitBody;
 
   if (!body.projectId) throw badRequest('projectId required');
-  if (!body.filename) throw badRequest('filename required');
+  if (typeof body.filename !== 'string' || !body.filename || body.filename.includes('\0')) {
+    throw badRequest('filename required');
+  }
   if (!Number.isFinite(body.totalSize) || (body.totalSize ?? 0) <= 0) {
     throw badRequest('totalSize must be a positive integer');
   }
@@ -143,6 +149,9 @@ uploadRoutes.post('/init', async (c) => {
     if (!Number.isFinite(v) || v < 0 || v > 100) throw badRequest('rolloutPercentage 0..100');
   }
 
+  if (body.notes !== undefined && body.notes !== null && typeof body.notes !== 'string') {
+    throw badRequest('notes must be a string or null');
+  }
   const project = await requireProjectAccess(c.env.DB, me, body.projectId, 'upload');
   const customer = await c.env.DB.prepare('SELECT code FROM customers WHERE id = ?')
     .bind(project.customer_id)
@@ -150,11 +159,14 @@ uploadRoutes.post('/init', async (c) => {
   if (!customer) throw notFound('customer not found');
 
   const existing = await c.env.DB.prepare(
-    `SELECT id, r2_key FROM versions WHERE project_id = ? AND version = ? AND release_channel = ?`,
+    `SELECT id, r2_key, project_id, version, notes, uploaded_by FROM versions
+      WHERE project_id = ? AND version = ? AND release_channel = ? AND filename = ?`,
   )
-    .bind(body.projectId, body.version, channel)
-    .first<{ id: number; r2_key: string }>();
-  if (existing && !body.overwriteExisting) throw conflict('version+channel already exists');
+    .bind(body.projectId, body.version, channel, body.filename)
+    .first<{ id: number; r2_key: string; project_id: number; version: string; notes: string | null; uploaded_by: number }>();
+  if (existing && !body.overwriteExisting) throw conflict('filename already exists for this version and channel');
+  const notes = body.notes === undefined ? existing?.notes ?? null : body.notes;
+  if (existing && existing.notes !== notes) await requireNotesEdit(c.env.DB, me, [existing]);
 
   const totalSize = body.totalSize!;
   const partSize = clampPartSize(body.partSizeHint, totalSize);
@@ -184,7 +196,7 @@ uploadRoutes.post('/init', async (c) => {
       channel,
       body.version,
       body.contentType ?? null,
-      body.notes ?? null,
+      notes,
       body.isMandatory ? 1 : 0,
       body.minVersion ?? null,
       body.maxVersion ?? null,
@@ -279,6 +291,17 @@ uploadRoutes.post('/complete', async (c) => {
     throw badRequest('sha256 mismatch with init expectedSha256');
   }
 
+  // Recheck on completion: current usage and permissions may have changed
+  // since initialization. Deny changed notes before completing the object.
+  const overwriteTarget = session.version_id ? await c.env.DB.prepare(
+    'SELECT project_id, version, notes, uploaded_by FROM versions WHERE id = ? AND project_id = ?',
+  ).bind(session.version_id, session.project_id)
+    .first<{ project_id: number; version: string; notes: string | null; uploaded_by: number }>() : null;
+  if (session.version_id && !overwriteTarget) throw conflict('overwrite target version no longer exists');
+  if (overwriteTarget && overwriteTarget.notes !== session.notes) {
+    await requireNotesEdit(c.env.DB, me, [overwriteTarget]);
+  }
+
   const s3 = makeStorage(c.env);
   let completeRes: { etag: string };
   try {
@@ -302,137 +325,166 @@ uploadRoutes.post('/complete', async (c) => {
     throw e;
   }
 
-  // Record parts (best-effort idempotent)
-  const now = Date.now();
-  for (const p of body.parts) {
-    await c.env.DB.prepare(
-      `INSERT OR REPLACE INTO upload_parts (session_id, part_number, etag, size, uploaded_at)
-       VALUES (?, ?, ?, ?, ?)`,
-    )
-      .bind(session.id, p.partNumber, p.etag, p.size, now)
-      .run();
-  }
-
-  // Verify R2 object exists and get authoritative size
-  const head = await s3.headObject(session.r2_key);
-  if (!head) throw conflict('object missing after complete');
-  if (head.size !== session.total_size) {
-    // Don't fail the request: R2 sometimes reports a slightly different content-length
-    // header during eventual consistency, but record a warning in audit.
-    console.warn('[upload.complete] size mismatch', { expected: session.total_size, actual: head.size });
-  }
-
-  const sha256 = body.sha256 ?? session.expected_sha256 ?? null;
-  let versionId = session.version_id ?? 0;
-  let oldKey: string | null = null;
-
-  if (session.version_id) {
-    const existing = await c.env.DB.prepare('SELECT r2_key FROM versions WHERE id = ? AND project_id = ?')
-      .bind(session.version_id, session.project_id)
-      .first<{ r2_key: string }>();
-    if (!existing) throw conflict('overwrite target version no longer exists');
-    oldKey = existing.r2_key;
-    await c.env.DB.prepare(
-      `UPDATE versions
-          SET status = 'ready',
-              r2_key = ?,
-              filename = ?,
-              size = ?,
-              sha256 = ?,
-              content_type = ?,
-              notes = ?,
-              is_mandatory = ?,
-              min_version = ?,
-              max_version = ?,
-              rollout_percentage = ?,
-              uploaded_by = ?,
-              created_at = ?,
-              updated_at = ?
-        WHERE id = ?`,
-    )
-      .bind(
-        session.r2_key,
-        session.filename,
-        session.total_size,
-        sha256,
-        session.content_type,
-        session.notes,
-        session.is_mandatory,
-        session.min_version,
-        session.max_version,
-        session.rollout_percentage,
-        session.initiated_by,
-        now,
-        now,
-        session.version_id,
+  try {
+    // Record parts (best-effort idempotent)
+    const now = Date.now();
+    for (const p of body.parts) {
+      await c.env.DB.prepare(
+        `INSERT OR REPLACE INTO upload_parts (session_id, part_number, etag, size, uploaded_at)
+         VALUES (?, ?, ?, ?, ?)`,
       )
-      .run();
-  } else {
-    // Insert the version row
-    const verRes = await c.env.DB.prepare(
-      `INSERT INTO versions
-         (project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
-          is_mandatory, min_version, max_version, rollout_percentage, device_group_id,
-          uploaded_by, created_at, updated_at)
-       VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
-    )
-      .bind(
-        session.project_id,
-        session.target_version,
-        session.release_channel,
-        session.r2_key,
-        session.filename,
-        session.total_size,
-        sha256,
-        session.content_type,
-        session.notes,
-        session.is_mandatory,
-        session.min_version,
-        session.max_version,
-        session.rollout_percentage,
-        session.initiated_by,
-        now,
-        now,
+        .bind(session.id, p.partNumber, p.etag, p.size, now)
+        .run();
+    }
+
+    // Verify R2 object exists and get authoritative size
+    const head = await s3.headObject(session.r2_key);
+    if (!head) throw conflict('object missing after complete');
+    if (head.size !== session.total_size) {
+      // Don't fail the request: R2 sometimes reports a slightly different content-length
+      // header during eventual consistency, but record a warning in audit.
+      console.warn('[upload.complete] size mismatch', { expected: session.total_size, actual: head.size });
+    }
+
+    const sha256 = body.sha256 ?? session.expected_sha256 ?? null;
+    let versionId = session.version_id ?? 0;
+    let oldKey: string | null = null;
+
+    if (session.version_id) {
+      const existing = await c.env.DB.prepare('SELECT r2_key, project_id, version, notes, uploaded_by FROM versions WHERE id = ? AND project_id = ?')
+        .bind(session.version_id, session.project_id)
+        .first<{ r2_key: string; project_id: number; version: string; notes: string | null; uploaded_by: number }>();
+      if (!existing) throw conflict('overwrite target version no longer exists');
+      if (existing.notes !== session.notes) await requireNotesEdit(c.env.DB, me, [existing]);
+      const [notesPermission] = await withNotePermissions(c.env.DB, me, [existing]);
+      oldKey = existing.r2_key;
+      const overwriteResult = await c.env.DB.prepare(
+        `UPDATE versions
+            SET status = 'ready',
+                r2_key = ?,
+                filename = ?,
+                size = ?,
+                sha256 = ?,
+                content_type = ?,
+                notes = ?,
+                is_mandatory = ?,
+                min_version = ?,
+                max_version = ?,
+                rollout_percentage = ?,
+                created_at = ?,
+                updated_at = ?
+          WHERE id = ? AND uploaded_by = ? AND r2_key = ?
+            AND (notes IS ? OR (? = 1 AND ${NOTES_UNLOCKED_SQL}))`,
       )
+        .bind(
+          session.r2_key,
+          session.filename,
+          session.total_size,
+          sha256,
+          session.content_type,
+          session.notes,
+          session.is_mandatory,
+          session.min_version,
+          session.max_version,
+          session.rollout_percentage,
+          now,
+          now,
+          session.version_id,
+          existing.uploaded_by,
+          existing.r2_key,
+          session.notes,
+          notesPermission?.can_edit_notes ? 1 : 0,
+        )
+        .run();
+      if (overwriteResult.meta.changes === 0) {
+        throw conflict('version changed; cancel current usage before editing notes');
+      }
+    } else {
+      // Insert the version row
+      const verRes = await c.env.DB.prepare(
+        `INSERT INTO versions
+           (project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
+            is_mandatory, min_version, max_version, rollout_percentage, device_group_id,
+            uploaded_by, created_at, updated_at)
+         VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+         ON CONFLICT (project_id, version, release_channel, filename) DO NOTHING`,
+      )
+        .bind(
+          session.project_id,
+          session.target_version,
+          session.release_channel,
+          session.r2_key,
+          session.filename,
+          session.total_size,
+          sha256,
+          session.content_type,
+          session.notes,
+          session.is_mandatory,
+          session.min_version,
+          session.max_version,
+          session.rollout_percentage,
+          session.initiated_by,
+          now,
+          now,
+        )
+        .run();
+      if (verRes.meta.changes === 0) {
+        throw conflict('filename already exists for this version and channel');
+      }
+      versionId = Number(verRes.meta.last_row_id);
+    }
+
+    await c.env.DB.prepare(
+      `UPDATE upload_sessions SET status = 'completed', completed_at = ?, version_id = ? WHERE id = ?`,
+    )
+      .bind(now, versionId, session.id)
       .run();
-    versionId = Number(verRes.meta.last_row_id);
+
+    await audit(c, {
+      action: 'version.upload.complete',
+      customerId: project.customer_id,
+      projectId: session.project_id,
+      targetType: 'version',
+      targetId: versionId,
+      meta: {
+        sessionId: session.id,
+        key: session.r2_key,
+        size: session.total_size,
+        sha256,
+        etag: completeRes.etag,
+        parts: body.parts.length,
+        overwritten: !!session.version_id,
+      },
+    });
+
+    if (oldKey && oldKey !== session.r2_key) void deleteObjectBestEffort(s3, oldKey);
+
+    const ver = await c.env.DB.prepare(
+      `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type, v.notes,
+              v.is_mandatory, ${IS_CURRENT_SQL} AS is_current, v.min_version, v.max_version, v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug, v.uploaded_by, v.created_at, v.updated_at
+         FROM versions v
+         JOIN projects p ON p.id = v.project_id
+        WHERE v.id = ?`,
+    )
+      .bind(versionId)
+      .first<any>();
+    return c.json(versionDto((await withNotePermissions(c.env.DB, me, [ver]))[0]), 201);
+  } catch (error) {
+    // Object completion can succeed while a concurrent metadata write wins.
+    // Delete only this session's unattached object, never a published artifact
+    // (including legacy sessions that used the old deterministic storage key).
+    const referenced = await c.env.DB.prepare('SELECT id FROM versions WHERE r2_key = ? LIMIT 1')
+      .bind(session.r2_key).first<{ id: number }>();
+    if (!referenced) {
+      const sharedSession = await c.env.DB.prepare(
+        `SELECT id FROM upload_sessions WHERE r2_key = ? AND id != ? AND status = 'in_progress' LIMIT 1`,
+      ).bind(session.r2_key, session.id).first<{ id: number }>();
+      if (!sharedSession) await deleteObjectBestEffort(s3, session.r2_key);
+      await c.env.DB.prepare(`UPDATE upload_sessions SET status = 'failed' WHERE id = ? AND status = 'in_progress'`)
+        .bind(session.id).run();
+    }
+    throw error;
   }
-
-  await c.env.DB.prepare(
-    `UPDATE upload_sessions SET status = 'completed', completed_at = ?, version_id = ? WHERE id = ?`,
-  )
-    .bind(now, versionId, session.id)
-    .run();
-
-  await audit(c, {
-    action: 'version.upload.complete',
-    customerId: project.customer_id,
-    projectId: session.project_id,
-    targetType: 'version',
-    targetId: versionId,
-    meta: {
-      sessionId: session.id,
-      key: session.r2_key,
-      size: session.total_size,
-      sha256,
-      etag: completeRes.etag,
-      parts: body.parts.length,
-      overwritten: !!session.version_id,
-    },
-  });
-
-  if (oldKey && oldKey !== session.r2_key) void deleteObjectBestEffort(s3, oldKey);
-
-  const ver = await c.env.DB.prepare(
-    `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type, v.notes,
-            v.is_mandatory, p.current_version, v.min_version, v.max_version, v.rollout_percentage, v.device_group_id, v.download_count, v.public_slug, v.uploaded_by, v.created_at, v.updated_at
-       FROM versions v
-       JOIN projects p ON p.id = v.project_id
-      WHERE v.id = ?`,
-  )
-    .bind(versionId)
-    .first<any>();
-  return c.json(versionDto(ver), 201);
 });
 
 // ============================================================

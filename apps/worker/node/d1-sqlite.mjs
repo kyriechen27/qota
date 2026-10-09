@@ -1,4 +1,5 @@
-// Minimal D1Database-compatible adapter over better-sqlite3.
+// D1Database-compatible adapter over Node's built-in SQLite when available,
+// with optional better-sqlite3 support for Node 18/20.
 //
 // The qota worker only uses this slice of the D1 API:
 //   db.prepare(sql).bind(...args).first<T>() | .all<T>() | .run()
@@ -6,7 +7,98 @@
 // We implement exactly that surface (batch/exec included for completeness)
 // so the same worker code runs unchanged on Cloudflare D1 and on Node/SQLite.
 
-import Database from 'better-sqlite3';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+let NativeDatabase;
+try {
+  // Lazy loading keeps this module usable on Node versions without node:sqlite.
+  const sqlite = require('node:sqlite');
+  NativeDatabase = sqlite.DatabaseSync ?? sqlite.Database;
+} catch (error) {
+  if (error.code !== 'ERR_UNKNOWN_BUILTIN_MODULE') throw error;
+}
+
+class NativeStatement {
+  constructor(statement) {
+    this.statement = statement;
+    this.returnArrays = false;
+  }
+
+  raw(enabled = true) {
+    this.returnArrays = enabled;
+    // Older built-in SQLite releases do not yet have setReturnArrays.
+    this.statement.setReturnArrays?.(enabled);
+    return this;
+  }
+
+  row(value) {
+    if (value === undefined || Array.isArray(value)) return value;
+    // node:sqlite returns null-prototype objects; keep the existing adapter's
+    // plain-object contract for API consumers and direct migration/test access.
+    return this.returnArrays ? Object.values(value) : { ...value };
+  }
+
+  get(...args) {
+    return this.row(this.statement.get(...args));
+  }
+
+  all(...args) {
+    return this.statement.all(...args).map((row) => this.row(row));
+  }
+
+  run(...args) {
+    return this.statement.run(...args);
+  }
+}
+
+class BuiltinDatabase {
+  constructor(filename) {
+    this.database = new NativeDatabase(filename);
+    this.nextSavepoint = 0;
+  }
+
+  prepare(sql) {
+    return new NativeStatement(this.database.prepare(sql));
+  }
+
+  exec(sql) {
+    return this.database.exec(sql);
+  }
+
+  pragma(sql) {
+    return this.prepare(`PRAGMA ${sql}`).all();
+  }
+
+  transaction(fn) {
+    return (...args) => {
+      // Savepoints also preserve atomicity for nested synchronous operations.
+      const name = `qota_transaction_${++this.nextSavepoint}`;
+      this.exec(`SAVEPOINT ${name}`);
+      try {
+        const result = fn(...args);
+        this.exec(`RELEASE SAVEPOINT ${name}`);
+        return result;
+      } catch (error) {
+        this.exec(`ROLLBACK TO SAVEPOINT ${name}`);
+        this.exec(`RELEASE SAVEPOINT ${name}`);
+        throw error;
+      }
+    };
+  }
+
+  close() {
+    return this.database.close();
+  }
+}
+
+function openDatabase(filename) {
+  if (NativeDatabase) return new BuiltinDatabase(filename);
+  // No native addon is loaded on modern Node, avoiding ABI mismatches after
+  // switching Node versions. Older supported versions retain the same driver.
+  const Database = require('better-sqlite3');
+  return new Database(filename);
+}
 
 // better-sqlite3 only accepts numbers, bigints, strings, Buffers and null as
 // bound params. D1 callers pass undefined (→ null) and booleans (→ 0/1).
@@ -61,7 +153,7 @@ class PreparedStatement {
 }
 
 export function createSqliteD1(filename) {
-  const db = new Database(filename);
+  const db = openDatabase(filename);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
 
