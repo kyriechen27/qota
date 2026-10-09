@@ -1,7 +1,7 @@
 import type { D1Database } from '@cloudflare/workers-types';
 import type { AuthedUser, CustomerRole } from '../env';
 import { roleHas } from './memberships';
-import { conflict, forbidden, notFound } from '../utils/errors';
+import { badRequest, conflict, forbidden, notFound } from '../utils/errors';
 
 export interface NotesVersion {
   project_id: number;
@@ -13,7 +13,17 @@ interface NotesContext {
   canManage: boolean;
   isAdmin: boolean;
   current: Set<string>;
-  metadata: Map<string, { notes: string | null; created_by: number }>;
+  metadata: Map<string, { notes: string | null; special_version: string | null; created_by: number }>;
+}
+
+export function normalizeSpecialVersion(value: unknown): string | null | undefined {
+  if (value === undefined || value === null) return value;
+  if (typeof value !== 'string') throw badRequest('specialVersion must be a string or null');
+  const normalized = value.trim();
+  if (/[\r\n\u2028\u2029\0]/.test(value) || normalized.length > 128) {
+    throw badRequest('specialVersion must be a single line of at most 128 characters');
+  }
+  return normalized || null;
 }
 
 // Fetch roles, current labels and parent notes in bounded batches. The catalog
@@ -32,8 +42,8 @@ async function notesContexts(db: D1Database, user: AuthedUser, projectIds: numbe
       ).bind(user.id, user.id, ...ids).all<{ id: number; role: CustomerRole | null }>(),
       db.prepare(`SELECT project_id, version FROM project_current_versions WHERE project_id IN (${placeholders})`)
         .bind(...ids).all<{ project_id: number; version: string }>(),
-      db.prepare(`SELECT project_id, version, notes, created_by FROM version_metadata WHERE project_id IN (${placeholders})`)
-        .bind(...ids).all<{ project_id: number; version: string; notes: string | null; created_by: number }>(),
+      db.prepare(`SELECT project_id, version, notes, special_version, created_by FROM version_metadata WHERE project_id IN (${placeholders})`)
+        .bind(...ids).all<{ project_id: number; version: string; notes: string | null; special_version: string | null; created_by: number }>(),
     ]);
     for (const project of projects.results ?? []) {
       const globalAdmin = user.role === 'super_admin' || user.role === 'admin';
@@ -63,6 +73,7 @@ export async function withNotePermissions<T extends NotesVersion>(db: D1Database
       notes_locked: locked,
       can_edit_notes: canManage && (!!context?.isAdmin || row.uploaded_by === user.id),
       version_notes: metadata?.notes ?? null,
+      special_version: metadata?.special_version ?? null,
       version_notes_creator: metadata?.created_by ?? null,
       can_edit_version_notes: canManage && !!metadata && (!!context?.isAdmin || metadata.created_by === user.id),
     };

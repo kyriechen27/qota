@@ -24,6 +24,7 @@ import migration0007 from './migrations/0007_current_versions.sql';
 import migration0008 from './migrations/0008_multiple_files.sql';
 import migration0009 from './migrations/0009_version_metadata.sql';
 import migration0010 from './migrations/0010_upload_version_notes.sql';
+import migration0011 from './migrations/0011_special_version.sql';
 
 interface PagesEnv extends Bindings {
   ASSETS: Fetcher;
@@ -64,6 +65,7 @@ async function ensureSchema(env: PagesEnv): Promise<void> {
     await ensureMultipleFiles(env);
     await ensureVersionMetadata(env);
     await ensureUploadVersionNotes(env);
+    await ensureSpecialVersion(env);
     schemaReady = true;
     console.log('[schema] initialized D1 tables on first run');
     return;
@@ -79,6 +81,7 @@ async function ensureSchema(env: PagesEnv): Promise<void> {
   await ensureMultipleFiles(env);
   await ensureVersionMetadata(env);
   await ensureUploadVersionNotes(env);
+  await ensureSpecialVersion(env);
   schemaReady = true;
 }
 
@@ -143,6 +146,15 @@ async function ensureUploadVersionNotes(env: PagesEnv): Promise<void> {
   if (row && !row.sql.includes('has_version_notes')) {
     await env.DB.batch(statements(migration0010).map((stmt) => env.DB.prepare(stmt)));
     console.log('[schema] added upload version notes');
+  }
+}
+
+async function ensureSpecialVersion(env: PagesEnv): Promise<void> {
+  const row = await env.DB.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'upload_sessions'")
+    .first<{ sql: string }>();
+  if (row && !row.sql.includes('has_special_version')) {
+    await env.DB.batch(statements(migration0011).map((stmt) => env.DB.prepare(stmt)));
+    console.log('[schema] added optional special version');
   }
 }
 

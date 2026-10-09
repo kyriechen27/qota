@@ -11,7 +11,7 @@ import { makeStorage } from '../lib/s3';
 import { audit } from '../lib/audit';
 import { base64UrlEncode } from '../utils/encoding';
 import { IS_CURRENT_SQL, NOTES_UNLOCKED_SQL, setCurrentVersion, clearUnusedCurrentVersions, syncLegacyCurrentVersion } from '../lib/current-versions';
-import { withNotePermissions, requireNotesEdit, requireVersionNotesEdit, VERSION_NOTES_UNLOCKED_SQL, clearUnusedVersionMetadata } from '../lib/version-notes';
+import { withNotePermissions, requireNotesEdit, requireVersionNotesEdit, VERSION_NOTES_UNLOCKED_SQL, clearUnusedVersionMetadata, normalizeSpecialVersion } from '../lib/version-notes';
 
 export const versionRoutes = new Hono<AppEnv>();
 
@@ -31,6 +31,7 @@ interface VersionRow {
   notes: string | null;
   can_edit_notes?: boolean;
   version_notes?: string | null;
+  special_version?: string | null;
   can_edit_version_notes?: boolean;
   is_mandatory: number;
   is_current: number;
@@ -60,6 +61,7 @@ export function versionDto(r: VersionRow) {
     notes: r.notes,
     canEditNotes: !!r.can_edit_notes,
     versionNotes: r.version_notes ?? null,
+    specialVersion: r.special_version ?? null,
     canEditVersionNotes: !!r.can_edit_version_notes,
     isMandatory: !!r.is_mandatory,
     isCurrent: !!r.is_current,
@@ -181,6 +183,7 @@ type GroupPatchBody = {
   version: string;
   notes?: string | null;
   versionNotes?: string | null;
+  specialVersion?: string | null;
   isCurrent?: boolean;
   status?: 'ready' | 'archived';
 };
@@ -211,6 +214,7 @@ versionRoutes.patch('/group', async (c) => {
     throw badRequest('valid version required');
   }
   validateVersionPatch(body);
+  if (body.specialVersion !== undefined) body.specialVersion = normalizeSpecialVersion(body.specialVersion);
   const proj = await requireProjectAccess(c.env.DB, c.get('user')!, body.projectId, 'manage_versions');
   const existing = await c.env.DB.prepare(
     `SELECT id, status, project_id, version, uploaded_by FROM versions WHERE project_id = ? AND version = ? AND status != 'pending'`,
@@ -218,10 +222,11 @@ versionRoutes.patch('/group', async (c) => {
   const rows = existing.results ?? [];
   if (rows.length === 0) throw notFound('version not found');
   if (body.notes !== undefined) await requireNotesEdit(c.env.DB, c.get('user')!, rows);
-  const versionCreator = body.versionNotes !== undefined
+  const editsParent = body.versionNotes !== undefined || body.specialVersion !== undefined;
+  const versionCreator = editsParent
     ? await requireVersionNotesEdit(c.env.DB, c.get('user')!, rows[0]!)
     : undefined;
-  const editsNotes = body.notes !== undefined || body.versionNotes !== undefined;
+  const editsNotes = body.notes !== undefined || editsParent;
   // If the last file was deleted and this label recreated during validation,
   // a combined request must not act on the new creator's label.
   const creatorGuard = versionCreator === undefined ? '' : `AND EXISTS (
@@ -236,12 +241,22 @@ versionRoutes.patch('/group', async (c) => {
   const now = Date.now();
   const changes: D1PreparedStatement[] = [];
   const noteChangeIndexes: number[] = [];
-  if (body.versionNotes !== undefined) {
+  if (editsParent) {
+    const sets: string[] = [];
+    const args: unknown[] = [];
+    if (body.versionNotes !== undefined) {
+      sets.push('notes = ?');
+      args.push(body.versionNotes);
+    }
+    if (body.specialVersion !== undefined) {
+      sets.push('special_version = ?');
+      args.push(body.specialVersion);
+    }
     noteChangeIndexes.push(changes.length);
     changes.push(c.env.DB.prepare(
-      `UPDATE version_metadata SET notes = ?, updated_at = ?
+      `UPDATE version_metadata SET ${sets.join(', ')}, updated_at = ?
         WHERE project_id = ? AND version = ? AND created_by = ? AND ${VERSION_NOTES_UNLOCKED_SQL}`,
-    ).bind(body.versionNotes, now, body.projectId, body.version, versionCreator));
+    ).bind(...args, now, body.projectId, body.version, versionCreator));
   }
   if (body.notes !== undefined) {
     noteChangeIndexes.push(changes.length);

@@ -162,6 +162,7 @@ export const api = {
     isCurrent?: boolean;
     status?: 'ready' | 'archived';
     versionNotes?: string | null;
+    specialVersion?: string | null;
   }) => request<Version[]>('/api/versions/group', { method: 'PATCH', body: JSON.stringify(body) }),
   deleteVersion: (id: number) => request<{ ok: true }>(`/api/versions/${id}`, { method: 'DELETE' }),
   // Public, token-less download link (capability slug). Enable is idempotent.

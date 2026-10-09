@@ -169,13 +169,13 @@ tr:hover td { background: #1a1f2a; }
 .version-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .version-actions button { white-space: nowrap; }
 .version-table-scroll { width: 100%; overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; scrollbar-color: #394252 transparent; }
-.version-table { table-layout: fixed; min-width: 1460px; border: 0; border-collapse: separate; border-spacing: 0; border-radius: 0; overflow: visible; }
+.version-table { table-layout: fixed; min-width: 1604px; border: 0; border-collapse: separate; border-spacing: 0; border-radius: 0; overflow: visible; }
 .version-table th { white-space: nowrap; padding: 10px; font-size: 12px; color: #8e99aa; background: #1b202a; }
 .version-table td { height: 68px; vertical-align: middle; padding: 10px; background: var(--panel); }
 .version-table tr:hover td { background: #1a202a; }
 .version-table .tag { white-space: nowrap; font-size: 10px; padding: 1px 6px; }
-.version-table td:nth-child(3) > .tag { max-width: 100%; overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
-.version-table td:nth-child(n + 4):nth-child(-n + 9) { white-space: nowrap; }
+.version-table td:nth-child(4) > .tag { max-width: 100%; overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
+.version-table td:nth-child(n + 5):nth-child(-n + 10) { white-space: nowrap; }
 .version-group-row { cursor: pointer; }
 .version-group-row td { background: #171f2b; }
 .version-group-row:hover td { background: #1c2735; }
@@ -209,6 +209,18 @@ tr:hover td { background: #1a1f2a; }
 .version-actions-cell { position: sticky; right: 0; z-index: 1; box-shadow: -1px 0 0 var(--border), -8px 0 12px -10px #090c11; }
 .version-table th.version-actions-cell { z-index: 2; }
 .version-notes-cell { overflow: hidden; }
+.version-special-button { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 32px; padding: 3px 0; border: 0; background: transparent; text-align: left; }
+.version-special-button:hover { background: transparent; }
+.version-special-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.version-special-label { display: block; min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #b9cce8; font-size: 12px; }
+.version-special-button > svg { flex: 0 0 14px; width: 14px; height: 14px; color: #748399; }
+.version-special-button:hover > svg { color: var(--accent); }
+.dialog.special-version-dialog { width: 480px; overflow-y: auto; }
+.upload-version-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.upload-version-fields > label { min-width: 0; }
+@media (max-width: 600px) {
+  .upload-version-fields { grid-template-columns: 1fr; gap: 0; }
+}
 .version-notes-preview { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 32px; padding: 3px 0; border: 0; background: transparent; text-align: left; line-height: 1.55; color: #c2cad6; }
 .version-notes-preview:hover { background: transparent; color: #e5ecf6; }
 .version-notes-preview:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -219,6 +231,26 @@ tr:hover td { background: #1a1f2a; }
 .version-notes-preview.has-multiple .version-notes-excerpt { -webkit-line-clamp: 1; }
 .version-notes-preview.is-empty { color: #748399; }
 .version-notes-more { display: block; color: #809bc0; font-size: 10px; margin-top: 3px; }
+.version-notes-tooltip {
+  position: fixed;
+  z-index: 1200;
+  width: min(440px, calc(100vw - 24px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 13px 15px;
+  border: 1px solid #3d4d65;
+  border-radius: 9px;
+  background: #202a39;
+  color: #e2e9f3;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.4);
+  font-size: 13px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  scrollbar-color: #526580 #202a39;
+}
+.version-notes-tooltip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 @media (max-width: 1000px) {
   .version-actions-cell { position: static; box-shadow: none; }
 }

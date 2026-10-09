@@ -73,6 +73,8 @@ export interface Version {
   contentType: string | null;
   /** Notes shared by this version label, independent of its file notes. */
   versionNotes: string | null;
+  /** Optional version-level text; shares version-note edit permissions. */
+  specialVersion: string | null;
   canEditVersionNotes?: boolean;
   /** Notes belonging only to this file. */
   notes: string | null;
@@ -210,6 +212,8 @@ export interface UploadInitRequest {
   notes?: string | null;
   /** Shared version notes. Omit to preserve; null clears the existing value. */
   versionNotes?: string | null;
+  /** Single-line version metadata, max 128 chars. Omit to preserve; null clears. */
+  specialVersion?: string | null;
   isMandatory?: boolean;
   minVersion?: string | null;
   maxVersion?: string | null;

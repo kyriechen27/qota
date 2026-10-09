@@ -5,6 +5,7 @@ import { api } from '../lib/api';
 import { startUpload, type UploadJobHandle } from '../lib/upload';
 import { formatBytes } from '../lib/utils';
 import { useI18n } from '../lib/i18n';
+import VersionNotesPreview from '../components/VersionNotesPreview';
 import type { ApiToken, Project, Version } from '@qota/shared';
 
 export default function ProjectDetail() {
@@ -15,6 +16,7 @@ export default function ProjectDetail() {
   const [versions, setVersions] = useState<Version[]>([]);
   const [expandedVersionGroups, setExpandedVersionGroups] = useState<Set<string>>(() => new Set());
   const [notesDialog, setNotesDialog] = useState<{ version: string; items: Version[]; scope: 'version' | 'file' } | null>(null);
+  const [specialVersionDialog, setSpecialVersionDialog] = useState<string | null>(null);
   const [versionBusy, setVersionBusy] = useState(false);
   const versionBusyRef = useRef(false);
   const [tokens, setTokens] = useState<ApiToken[]>([]);
@@ -52,6 +54,8 @@ export default function ProjectDetail() {
     for (const v of versions) set.add(v.version);
     return [...set].sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
   }, [versions]);
+
+  const specialVersionList = useMemo(() => [...new Set(versions.map((v) => v.specialVersion).filter((value): value is string => !!value))].sort(), [versions]);
 
   const versionGroups = useMemo(
     () => groupVersions(versions.filter((v) => v.status !== 'archived')),
@@ -285,23 +289,14 @@ export default function ProjectDetail() {
       version: versionLabel, filename: first.filename, channel: first.releaseChannel,
     });
     return (
-      <button
-        type="button"
-        className={`version-notes-preview${preview ? '' : ' is-empty'}`}
-        title={label}
-        aria-label={label}
-        onClick={(e) => {
-          e.stopPropagation();
+      <VersionNotesPreview
+        text={preview}
+        label={label}
+        icon={<VersionIcon name="notes" />}
+        onClick={() => {
           setNotesDialog({ version: versionLabel, items, scope });
         }}
-      >
-        <span className="version-notes-content">
-          <span className="version-notes-excerpt">
-            {preview || ''}
-          </span>
-        </span>
-        <VersionIcon name="notes" />
-      </button>
+      />
     );
   };
   const renderVersionActions = (v: Version, showCurrentAction = true) => (
@@ -375,6 +370,7 @@ export default function ProjectDetail() {
           )}
         </div>
       </td>
+      <td><span className="version-special-label" title={v.specialVersion ?? ''}>{v.specialVersion ?? ''}</span></td>
       <td className="version-notes-cell">{renderNotes([v])}</td>
       <td>{renderChannelTag(v.releaseChannel)}</td>
       <td>
@@ -398,6 +394,7 @@ export default function ProjectDetail() {
       <table className="version-table">
         <colgroup>
           <col style={{ width: 184 }} />
+          <col style={{ width: 144 }} />
           <col style={{ width: 204 }} />
           <col style={{ width: 140 }} />
           <col style={{ width: 90 }} />
@@ -411,6 +408,7 @@ export default function ProjectDetail() {
         <thead>
           <tr>
             <th>{t('pd.colVersion')}</th>
+            <th>{t('pd.specialVersion')}</th>
             <th className="version-notes-cell">{t('pd.colNotes')}</th>
             <th>{t('pd.colChannel')}</th>
             <th>{t('pd.colStatus')}</th>
@@ -458,6 +456,21 @@ export default function ProjectDetail() {
                         </span>
                       </div>
                     </div>
+                  </td>
+                  <td>
+                    <button
+                      type="button"
+                      className="version-special-button"
+                      title={first.specialVersion || t('pd.editSpecialVersion', { version: group.label })}
+                      aria-label={t('pd.editSpecialVersion', { version: group.label })}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setSpecialVersionDialog(group.label);
+                      }}
+                    >
+                      <span className="version-special-label">{first.specialVersion ?? ''}</span>
+                      <VersionIcon name="edit" />
+                    </button>
                   </td>
                   <td className="version-notes-cell">{renderNotes(group.items, 'version')}</td>
                   <td>
@@ -521,7 +534,7 @@ export default function ProjectDetail() {
           })}
           {groups.length === 0 && (
             <tr>
-              <td colSpan={10} className="muted" style={{ textAlign: 'center', padding: 24 }}>
+              <td colSpan={11} className="muted" style={{ textAlign: 'center', padding: 24 }}>
                 {t(archived ? 'pd.noArchives' : 'pd.noVersions')}
               </td>
             </tr>
@@ -646,6 +659,22 @@ export default function ProjectDetail() {
           </tbody>
         </table>
       </div>
+
+      {specialVersionDialog !== null && (
+        <SpecialVersionDialog
+          version={specialVersionDialog}
+          value={versions.find((v) => v.version === specialVersionDialog)?.specialVersion ?? ''}
+          options={specialVersionList}
+          canEdit={versions.find((v) => v.version === specialVersionDialog)?.canEditVersionNotes ?? false}
+          current={versions.some((v) => v.version === specialVersionDialog && v.isCurrent)}
+          onClose={() => setSpecialVersionDialog(null)}
+          onSave={async (specialVersion) => {
+            const updated = await api.updateVersionGroup({ projectId, version: specialVersionDialog, specialVersion });
+            const byId = new Map(updated.map((v) => [v.id, v]));
+            setVersions((items) => items.map((item) => byId.get(item.id) ?? item));
+          }}
+        />
+      )}
 
       {notesDialog && (
         <VersionNotesDialog
@@ -880,6 +909,7 @@ function UploadFilesDialog({
   const [queue, setQueue] = useState<UploadQueueItem[]>([]);
   const [version, setVersion] = useState('');
   const [versionNotes, setVersionNotes] = useState('');
+  const [specialVersion, setSpecialVersion] = useState('');
   const [mandatory, setMandatory] = useState(false);
   const [busy, setBusy] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -893,6 +923,7 @@ function UploadFilesDialog({
     defaultChannel,
     ...queue.map((item) => item.channel).filter((value) => uploadChannelPattern.test(value)),
   ])].sort(), [channels, defaultChannel, queue]);
+  const specialVersionOptions = useMemo(() => [...new Set(existingVersions.map((item) => item.specialVersion).filter((value): value is string => !!value))].sort(), [existingVersions]);
   const duplicateIds = useMemo(() => {
     const keys = new Map<string, number>();
     const duplicates = new Set<number>();
@@ -956,6 +987,8 @@ function UploadFilesDialog({
     setConflict(null);
     const previousVersionNotes = existingVersions.find((item) => item.version === version)?.versionNotes ?? '';
     const uploadVersionNotes = versionNotes === previousVersionNotes ? undefined : versionNotes.trim() ? versionNotes : null;
+    const previousSpecialVersion = existingVersions.find((item) => item.version === version)?.specialVersion ?? '';
+    const uploadSpecialVersion = specialVersion.trim() === previousSpecialVersion ? undefined : specialVersion.trim() || null;
     const ids = new Set(items.map((item) => item.id));
     setQueue((all) => all.map((item) => ids.has(item.id) ? { ...item, status: 'waiting', loaded: 0, error: undefined } : item));
     try {
@@ -970,6 +1003,7 @@ function UploadFilesDialog({
             releaseChannel: item.channel,
             notes: item.notes || undefined,
             versionNotes: uploadVersionNotes,
+            specialVersion: uploadSpecialVersion,
             isMandatory: mandatory,
             overwriteExisting: overwriteIds.has(item.id),
             concurrency: 4,
@@ -1199,14 +1233,30 @@ function UploadFilesDialog({
               })}
             </ul>
           ) : <div className="upload-file-empty">{t('pd.fileSelectionHint')}</div>}
-          <label>
-            <span className="lbl">{t('pd.fldVersion')}</span>
-            <VersionField value={version} onChange={(value) => {
-              setVersion(value);
-              setVersionNotes(existingVersions.find((item) => item.version === value)?.versionNotes ?? '');
-              setConflict(null);
-            }} options={versions} disabled={busy || started} />
-          </label>
+          <div className="upload-version-fields">
+            <label>
+              <span className="lbl">{t('pd.fldVersion')}</span>
+              <VersionField value={version} onChange={(value) => {
+                setVersion(value);
+                setVersionNotes(existingVersions.find((item) => item.version === value)?.versionNotes ?? '');
+                setSpecialVersion(existingVersions.find((item) => item.version === value)?.specialVersion ?? '');
+                setConflict(null);
+              }} options={versions} disabled={busy || started} />
+            </label>
+            <label>
+              <span className="lbl">{t('pd.specialVersion')}</span>
+              <SpecialVersionField
+                key={version}
+                value={specialVersion}
+                onChange={setSpecialVersion}
+                options={specialVersionOptions}
+                disabled={busy || started || versionNotesLocked}
+              />
+              <span className="upload-notes-hint">{t(versionNotesLocked
+                ? existingVersions.some((item) => item.version === version && item.isCurrent) ? 'pd.specialVersionCurrentLocked' : 'pd.specialVersionPermissionHint'
+                : 'pd.specialVersionHint')}</span>
+            </label>
+          </div>
           <label>
             <span className="lbl">{t('pd.versionNotes')}</span>
             <textarea
@@ -1258,12 +1308,13 @@ function UploadFilesDialog({
   );
 }
 
-function VersionIcon({ name }: { name: 'download' | 'public' | 'delete' | 'notes' | 'chevron' }) {
+function VersionIcon({ name }: { name: 'download' | 'public' | 'delete' | 'notes' | 'chevron' | 'edit' }) {
   const paths = {
     download: <><path d="M12 3v12m-4-4 4 4 4-4" /><path d="M5 15v5h14v-5" /></>,
     public: <><path d="m10 13 4-4" /><path d="m8 16-1 1a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0m2 1 1-1a4 4 0 0 1 6 6l-4 4a4 4 0 0 1-6 0" transform="translate(1 0)" /></>,
     delete: <><path d="M4 7h16M9 7V4h6v3M6 7l1 14h10l1-14M10 11v6m4-6v6" /></>,
     notes: <><path d="M6 3h9l4 4v14H6zM14 3v5h5M9 12h7m-7 4h5" /></>,
+    edit: <><path d="m15 5 4 4M4 20l4-1L20 7a2.8 2.8 0 0 0-4-4L4 15z" /></>,
     chevron: <path d="m9 5 7 7-7 7" />,
   };
   return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
@@ -1452,6 +1503,98 @@ function VersionNotesDialog({
   );
 }
 
+function SpecialVersionDialog({ version, value, options, canEdit, current, onClose, onSave }: {
+  version: string;
+  value: string;
+  options: string[];
+  canEdit: boolean;
+  current: boolean;
+  onClose: () => void;
+  onSave: (value: string | null) => Promise<void>;
+}) {
+  const { t } = useI18n();
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const savingRef = useRef(false);
+  const [draft, setDraft] = useState(value);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const editable = canEdit && !current;
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    dialog?.showModal();
+    return () => dialog?.close();
+  }, []);
+
+  async function save(e: FormEvent) {
+    e.preventDefault();
+    if (!editable || savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
+    setError(null);
+    try {
+      await onSave(draft.trim() || null);
+      onClose();
+    } catch (e: any) {
+      setError(e?.message ?? String(e));
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  }
+
+  return (
+    <dialog
+      ref={dialogRef}
+      className="dialog version-notes-dialog special-version-dialog"
+      aria-labelledby="special-version-title"
+      onCancel={(e) => { e.preventDefault(); if (!savingRef.current) onClose(); }}
+    >
+      <div className="version-notes-header">
+        <h3 id="special-version-title">{t('pd.specialVersion')} <span className="code">{version}</span></h3>
+        <button type="button" onClick={onClose} disabled={saving} autoFocus>{t('common.close')}</button>
+      </div>
+      <form onSubmit={save}>
+        <label>
+          <span className="lbl">{t('pd.specialVersion')}</span>
+          <SpecialVersionField value={draft} onChange={setDraft} options={options} disabled={saving || !editable} />
+        </label>
+        <p className="notes-layer-description">{t(current ? 'pd.specialVersionCurrentLocked' : !canEdit ? 'pd.specialVersionPermissionHint' : 'pd.specialVersionHint')}</p>
+        {error && <p className="error" role="alert">{error}</p>}
+        {editable && (
+          <div className="dialog-actions">
+            <button type="button" onClick={onClose} disabled={saving}>{t('common.cancel')}</button>
+            <button type="submit" className="primary" disabled={saving}>{saving ? t('pd.savingNotes') : t('common.save')}</button>
+          </div>
+        )}
+      </form>
+    </dialog>
+  );
+}
+
+function SpecialVersionField({ value, onChange, options, disabled = false }: {
+  value: string;
+  onChange: (value: string) => void;
+  options: string[];
+  disabled?: boolean;
+}) {
+  const { t } = useI18n();
+  return (
+    <SelectOrCreateField
+      value={value}
+      onChange={onChange}
+      options={options}
+      disabled={disabled}
+      ariaLabel={t('pd.specialVersion')}
+      maxLength={128}
+      allowAny
+      anyLabel={t('pd.specialVersionNone')}
+      newLabel={t('pd.specialVersionNew')}
+      backLabel={t('pd.specialVersionBack')}
+    />
+  );
+}
+
 function ChannelField({
   value,
   onChange,
@@ -1525,6 +1668,7 @@ function SelectOrCreateField({
   allowAny = false,
   disabled = false,
   pattern,
+  maxLength,
   required = false,
   anyLabel,
   emptyLabel,
@@ -1540,6 +1684,7 @@ function SelectOrCreateField({
   allowAny?: boolean;
   disabled?: boolean;
   pattern?: string;
+  maxLength?: number;
   required?: boolean;
   anyLabel?: string;
   emptyLabel?: string;
@@ -1549,7 +1694,8 @@ function SelectOrCreateField({
   id?: string;
   ariaLabel?: string;
 }) {
-  const NEW = '__new__';
+  let NEW = '__new__';
+  while (options.includes(NEW)) NEW += '_';
   // Start in "create" mode if the current value is not in the existing choices.
   const [creating, setCreating] = useState(() => value !== '' && !options.includes(value));
 
@@ -1562,6 +1708,7 @@ function SelectOrCreateField({
           value={value}
           onChange={(e) => onChange(e.target.value)}
           pattern={pattern}
+          maxLength={maxLength}
           required={required}
           disabled={disabled}
           autoFocus

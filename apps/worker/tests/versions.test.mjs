@@ -17,13 +17,14 @@ const migrationsDir = new URL('../migrations/', import.meta.url);
 const migrations = readdirSync(migrationsDir).filter((name) => name.endsWith('.sql')).sort();
 const secret = 'isolated-version-regression-tests';
 
-async function fixture(t, { beforeCurrentMigration = false, beforeMultiFileMigration = false, beforeVersionNotesMigration = false } = {}) {
+async function fixture(t, { beforeCurrentMigration = false, beforeMultiFileMigration = false, beforeVersionNotesMigration = false, beforeSpecialVersionMigration = false } = {}) {
   const db = createSqliteD1(':memory:');
   t.after(() => db._db.close());
   for (const migration of migrations) {
     if (beforeCurrentMigration && migration >= '0007_') continue;
     if (beforeMultiFileMigration && migration >= '0008_') continue;
     if (beforeVersionNotesMigration && migration >= '0009_') continue;
+    if (beforeSpecialVersionMigration && migration >= '0011_') continue;
     db._db.exec(readFileSync(new URL(migration, migrationsDir), 'utf8'));
   }
   db._db.exec(`
@@ -1051,3 +1052,215 @@ for (const timing of ['during storage completion', 'before the final database ba
     assert.ok(!stored.objects.has(initialized.key));
   });
 }
+
+test('special-version migration preserves existing notes, owners, current selections and upload sessions', async (t) => {
+  const f = await fixture(t, { beforeSpecialVersionMigration: true });
+  const id = f.version('v1', 'ota', { uploadedBy: 2, notes: 'Original file note' });
+  f.db._db.exec(`
+    UPDATE version_metadata SET notes = 'Original version note' WHERE project_id = 1 AND version = 'v1';
+    INSERT INTO project_current_versions (project_id, version) VALUES (1, 'v1');
+    UPDATE projects SET current_version = 'v1' WHERE id = 1;
+    CREATE TABLE _node_migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);
+  `);
+  f.db._db.prepare(`
+    INSERT INTO upload_sessions (id, project_id, version_id, r2_key, filename, total_size, part_size,
+      upload_id, target_version, release_channel, notes, version_notes, has_version_notes, status, initiated_by, created_at)
+    VALUES (71, 1, ?, 'old/session/key', 'v1-ota.bin', 1024, 1024, 'old-upload', 'v1', 'ota',
+      'Pending file note', 'Pending version note', 1, 'in_progress', 2, 777)
+  `).run(id);
+  const beforeMetadata = versionMetadata(f);
+  const beforeFile = f.row(id);
+  for (const migration of migrations.filter((name) => name < '0011_')) {
+    f.db._db.prepare('INSERT INTO _node_migrations (name, applied_at) VALUES (?, 1)').run(migration);
+  }
+  assert.ok(migrations.some((name) => name.startsWith('0011_')), 'special-version migration must exist');
+  runMigrations(f.db, fileURLToPath(migrationsDir));
+  assert.deepEqual(versionMetadata(f), { ...beforeMetadata, special_version: null });
+  assert.deepEqual(f.row(id), beforeFile);
+  const session = await f.db.prepare('SELECT special_version, has_special_version, notes, version_notes, has_version_notes FROM upload_sessions WHERE id = 71').first();
+  assert.deepEqual(session, { special_version: null, has_special_version: 0, notes: 'Pending file note', version_notes: 'Pending version note', has_version_notes: 1 });
+  const detail = await f.request(`/api/versions/${id}`);
+  assert.equal(detail.specialVersion, null);
+  assert.equal(detail.versionNotes, 'Original version note');
+  assert.deepEqual(await f.current(), ['v1']);
+});
+
+test('specialVersion is shared text independent of file identity and both note fields', async (t) => {
+  const f = await fixture(t);
+  const first = f.version('v1', 'ota', { filename: 'first.bin', uploadedBy: 2, notes: 'First file note' });
+  const second = f.version('v1', 'ota', { filename: 'second.bin', uploadedBy: 7, notes: 'Second file note' });
+  await f.group('v1', { versionNotes: 'Version summary' }, 1, { userId: 2 });
+  const specialVersion = '客户 A / HW-B 特别版 2';
+  const changed = await f.group('v1', { specialVersion: `  ${specialVersion}  ` }, 1, { userId: 2 });
+  assert.ok(changed.every((v) => v.specialVersion === specialVersion && v.versionNotes === 'Version summary'));
+  assert.equal(f.row(first).notes, 'First file note');
+  assert.equal(f.row(second).notes, 'Second file note');
+  for (const path of ['/api/versions?projectId=1', '/api/versions/accessible']) {
+    const rows = await f.request(path, { userId: 2 });
+    assert.equal(rows.length, 2);
+    assert.ok(rows.every((v) => v.specialVersion === specialVersion && v.version === 'v1'));
+  }
+  assert.equal((await f.request(`/api/versions/${second}`, { userId: 2 })).specialVersion, specialVersion);
+  await f.group('v1', { specialVersion: false, versionNotes: 'Must not change' }, 1, { userId: 2, status: 400 });
+  assert.equal(versionMetadata(f).special_version, specialVersion);
+  assert.equal(versionMetadata(f).notes, 'Version summary');
+  await f.group('v1', { specialVersion: null }, 1, { userId: 2 });
+  assert.equal(versionMetadata(f).special_version, null);
+  assert.equal(versionMetadata(f).notes, 'Version summary');
+  assert.equal(f.row(first).notes, 'First file note');
+  assert.equal(await f.db.prepare('SELECT COUNT(*) AS count FROM versions').first('count'), 2);
+});
+
+test('specialVersion validates text consistently for group edits and upload initialization', async (t) => {
+  const f = await fixture(t);
+  f.version('v1', 'ota', { uploadedBy: 2 });
+  await f.group('v1', { specialVersion: 'Original edition' }, 1, { userId: 2 });
+  for (const invalid of [true, 123, { label: 'Invalid object' }, 'First line\nSecond line', 'x'.repeat(129)]) {
+    await f.group('v1', { specialVersion: invalid }, 1, { userId: 2, status: 400 });
+    await initFile(f, 'invalid.bin', { specialVersion: invalid, status: 400 });
+  }
+  assert.equal(versionMetadata(f).special_version, 'Original edition');
+  assert.deepEqual(f.storageCalls, []);
+  const cleared = await f.group('v1', { specialVersion: '   ' }, 1, { userId: 2 });
+  assert.ok(cleared.every((v) => v.specialVersion === null));
+});
+
+test('specialVersion edits require the version creator or admin and current usage locks every file', async (t) => {
+  const f = await fixture(t);
+  const first = f.version('v1', 'ota', { uploadedBy: 2, notes: 'Published file note' });
+  const archived = f.version('v1', 'flash', { uploadedBy: 7, status: 'archived' });
+  f.version('v1', 'ota', { projectId: 2, uploadedBy: 7 });
+  await f.group('v1', { specialVersion: 'Creator edition' }, 1, { userId: 2 });
+  for (const userId of [3, 4, 7]) await f.group('v1', { specialVersion: 'Denied' }, 1, { userId, status: 403 });
+  await f.group('v1', { specialVersion: 'Wrong project' }, 2, { userId: 2, status: 403 });
+  assert.equal(versionMetadata(f, 'v1', 2).special_version, null);
+  for (const userId of [1, 5, 6]) await f.group('v1', { specialVersion: `Admin edition ${userId}` }, 1, { userId });
+  await f.group('v1', { isCurrent: true });
+  const beforeMetadata = versionMetadata(f);
+  const beforeFile = f.row(first);
+  for (const userId of [1, 2, 5, 6]) {
+    await f.group('v1', { specialVersion: 'Locked edition' }, 1, { userId, status: 409 });
+    assert.equal((await f.request(`/api/versions/${archived}`, { userId })).canEditVersionNotes, false);
+  }
+  await f.group('v1', { specialVersion: 'Combined bypass', isCurrent: false, status: 'archived' }, 1, { userId: 2, status: 409 });
+  assert.deepEqual(versionMetadata(f), beforeMetadata);
+  assert.deepEqual(f.row(first), beforeFile);
+  assert.deepEqual(await f.current(), ['v1']);
+  await f.group('v1', { isCurrent: false });
+  await f.group('v1', { specialVersion: 'Editable again' }, 1, { userId: 2 });
+  assert.equal(versionMetadata(f).special_version, 'Editable again');
+});
+
+test('upload specialVersion persists across requests with independent omit, same-value and null semantics', async (t) => {
+  const f = await fixture(t);
+  trackStoredObjects(f);
+  await initFile(f, 'invalid.bin', { specialVersion: true, status: 400 });
+  const initialized = await initFile(f, 'first.bin', { notes: 'File instructions', versionNotes: 'Version summary', specialVersion: '硬件 B 专用版' });
+  const persisted = await f.db.prepare('SELECT special_version, has_special_version FROM upload_sessions WHERE id = ?').bind(initialized.sessionId).first();
+  assert.deepEqual(persisted, { special_version: '硬件 B 专用版', has_special_version: 1 });
+  const first = await completeFile(f, initialized);
+  assert.equal(first.specialVersion, '硬件 B 专用版');
+  assert.equal(first.versionNotes, 'Version summary');
+  assert.equal(first.notes, 'File instructions');
+  const parent = versionMetadata(f);
+  const omitted = await completeFile(f, await initFile(f, 'second.bin', { userId: 7, notes: 'Second file instructions' }), { userId: 7 });
+  const same = await completeFile(f, await initFile(f, 'third.bin', { userId: 7, specialVersion: '硬件 B 专用版' }), { userId: 7 });
+  assert.equal(omitted.specialVersion, '硬件 B 专用版');
+  assert.equal(same.specialVersion, '硬件 B 专用版');
+  assert.deepEqual(versionMetadata(f), parent);
+  const cleared = await completeFile(f, await initFile(f, 'clear.bin', { specialVersion: null }));
+  assert.equal(cleared.specialVersion, null);
+  assert.equal(cleared.versionNotes, 'Version summary');
+  assert.equal(versionMetadata(f).created_by, 2);
+  assert.equal(f.row(first.id).notes, 'File instructions');
+  await f.group('v1', { specialVersion: 'Restored edition' }, 1, { userId: 2 });
+  const overwritten = await completeFile(f, await initFile(f, 'first.bin', { overwriteExisting: true }));
+  assert.equal(overwritten.specialVersion, 'Restored edition');
+  assert.equal(overwritten.versionNotes, 'Version summary');
+  assert.equal(overwritten.notes, 'File instructions');
+});
+
+test('upload specialVersion changes recheck creator permission and current usage at init and complete', async (t) => {
+  const f = await fixture(t);
+  trackStoredObjects(f);
+  await completeFile(f, await initFile(f, 'original.bin', { specialVersion: 'Published edition' }));
+  await initFile(f, 'denied.bin', { userId: 7, specialVersion: 'Unauthorized edition', status: 403 });
+  await f.group('v1', { isCurrent: true });
+  await initFile(f, 'locked.bin', { specialVersion: null, status: 409 });
+  const allowed = await completeFile(f, await initFile(f, 'same.bin', { userId: 7, specialVersion: 'Published edition' }), { userId: 7 });
+  assert.equal(allowed.specialVersion, 'Published edition');
+  await f.group('v1', { isCurrent: false });
+  const pending = await initFile(f, 'pending.bin', { specialVersion: 'New edition' });
+  await completeFile(f, pending, { userId: 7, status: 403 });
+  await f.group('v1', { isCurrent: true });
+  await completeFile(f, pending, { status: 409 });
+  assert.equal(versionMetadata(f).special_version, 'Published edition');
+  assert.equal(await f.db.prepare("SELECT COUNT(*) AS count FROM versions WHERE filename = 'pending.bin'").first('count'), 0);
+});
+
+test('a concurrent current selection rejects group specialVersion edits without cancelling or archiving', async (t) => {
+  const f = await fixture(t);
+  const id = f.version('v1', 'ota', { uploadedBy: 2 });
+  await f.group('v1', { specialVersion: 'Original edition' }, 1, { userId: 2 });
+  const beforeMetadata = versionMetadata(f);
+  const beforeFile = f.row(id);
+  const batch = f.db.batch.bind(f.db);
+  f.db.batch = async (queries) => {
+    f.db.batch = batch;
+    f.db._db.prepare('INSERT INTO project_current_versions (project_id, version) VALUES (1, ?)').run('v1');
+    return batch(queries);
+  };
+  await f.group('v1', { specialVersion: 'Racing edition', isCurrent: false, status: 'archived' }, 1, { userId: 2, status: 409 });
+  assert.deepEqual(versionMetadata(f), beforeMetadata);
+  assert.deepEqual(f.row(id), beforeFile);
+  assert.deepEqual(await f.current(), ['v1']);
+});
+
+test('a final-batch current race blocks uploading a specialVersion change and the associated file atomically', async (t) => {
+  const f = await fixture(t);
+  const stored = trackStoredObjects(f);
+  const original = await completeFile(f, await initFile(f, 'original.bin', { specialVersion: 'Original edition', versionNotes: 'Keep summary' }));
+  const beforeMetadata = versionMetadata(f);
+  const initialized = await initFile(f, 'new.bin', { specialVersion: 'New edition' });
+  const batch = f.db.batch.bind(f.db);
+  f.db.batch = async (queries) => {
+    f.db.batch = batch;
+    f.db._db.prepare('INSERT INTO project_current_versions (project_id, version) VALUES (1, ?)').run('v1');
+    return batch(queries);
+  };
+  await completeFile(f, initialized, { status: 409 });
+  assert.deepEqual(versionMetadata(f), beforeMetadata);
+  assert.equal(await f.db.prepare('SELECT COUNT(*) AS count FROM versions').first('count'), 1);
+  assert.deepEqual(await f.current(), ['v1']);
+  assert.ok(stored.objects.has(original.r2Key));
+  assert.ok(!stored.objects.has(initialized.key));
+});
+
+test('a same-filename upload conflict retains only the successful specialVersion value', async (t) => {
+  const f = await fixture(t);
+  const stored = trackStoredObjects(f);
+  await completeFile(f, await initFile(f, 'original.bin', { specialVersion: 'Original edition', versionNotes: 'Keep summary' }));
+  const first = await initFile(f, 'same.bin', { specialVersion: 'First edition' });
+  const second = await initFile(f, 'same.bin', { specialVersion: 'Second edition' });
+  const complete = f.storage.completeMultipartUpload;
+  let release;
+  let arrivals = 0;
+  const bothInStorage = new Promise((resolve) => { release = resolve; });
+  f.storage.completeMultipartUpload = async (...args) => {
+    const result = await complete(...args);
+    if (++arrivals === 2) release();
+    await bothInStorage;
+    return result;
+  };
+  const results = await Promise.all([completeFile(f, first, { status: [201, 409] }), completeFile(f, second, { status: [201, 409] })]);
+  const winners = results.filter((v) => typeof v.id === 'number');
+  assert.equal(winners.length, 1);
+  assert.equal(results.filter((v) => v.error).length, 1);
+  const winner = winners[0];
+  const expected = winner.r2Key === first.key ? 'First edition' : 'Second edition';
+  assert.equal(versionMetadata(f).special_version, expected);
+  assert.equal(winner.specialVersion, expected);
+  assert.equal(versionMetadata(f).notes, 'Keep summary');
+  assert.ok(stored.objects.has(winner.r2Key));
+  assert.ok(!stored.objects.has(winner.r2Key === first.key ? second.key : first.key));
+});

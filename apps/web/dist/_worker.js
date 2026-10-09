@@ -28069,6 +28069,15 @@ function escapeXml(s) {
 }
 
 // apps/worker/src/lib/version-notes.ts
+function normalizeSpecialVersion(value) {
+  if (value === void 0 || value === null) return value;
+  if (typeof value !== "string") throw badRequest("specialVersion must be a string or null");
+  const normalized = value.trim();
+  if (/[\r\n\u2028\u2029\0]/.test(value) || normalized.length > 128) {
+    throw badRequest("specialVersion must be a single line of at most 128 characters");
+  }
+  return normalized || null;
+}
 async function notesContexts(db, user, projectIds) {
   const contexts = /* @__PURE__ */ new Map();
   for (let offset = 0; offset < projectIds.length; offset += 80) {
@@ -28082,7 +28091,7 @@ async function notesContexts(db, user, projectIds) {
          WHERE p.id IN (${placeholders})`
       ).bind(user.id, user.id, ...ids).all(),
       db.prepare(`SELECT project_id, version FROM project_current_versions WHERE project_id IN (${placeholders})`).bind(...ids).all(),
-      db.prepare(`SELECT project_id, version, notes, created_by FROM version_metadata WHERE project_id IN (${placeholders})`).bind(...ids).all()
+      db.prepare(`SELECT project_id, version, notes, special_version, created_by FROM version_metadata WHERE project_id IN (${placeholders})`).bind(...ids).all()
     ]);
     for (const project of projects.results ?? []) {
       const globalAdmin = user.role === "super_admin" || user.role === "admin";
@@ -28111,6 +28120,7 @@ async function withNotePermissions(db, user, rows) {
       notes_locked: locked,
       can_edit_notes: canManage && (!!context?.isAdmin || row.uploaded_by === user.id),
       version_notes: metadata?.notes ?? null,
+      special_version: metadata?.special_version ?? null,
       version_notes_creator: metadata?.created_by ?? null,
       can_edit_version_notes: canManage && !!metadata && (!!context?.isAdmin || metadata.created_by === user.id)
     };
@@ -28160,6 +28170,7 @@ function versionDto(r) {
     notes: r.notes,
     canEditNotes: !!r.can_edit_notes,
     versionNotes: r.version_notes ?? null,
+    specialVersion: r.special_version ?? null,
     canEditVersionNotes: !!r.can_edit_version_notes,
     isMandatory: !!r.is_mandatory,
     isCurrent: !!r.is_current,
@@ -28275,6 +28286,7 @@ versionRoutes.patch("/group", async (c) => {
     throw badRequest("valid version required");
   }
   validateVersionPatch(body);
+  if (body.specialVersion !== void 0) body.specialVersion = normalizeSpecialVersion(body.specialVersion);
   const proj = await requireProjectAccess(c.env.DB, c.get("user"), body.projectId, "manage_versions");
   const existing = await c.env.DB.prepare(
     `SELECT id, status, project_id, version, uploaded_by FROM versions WHERE project_id = ? AND version = ? AND status != 'pending'`
@@ -28282,8 +28294,9 @@ versionRoutes.patch("/group", async (c) => {
   const rows = existing.results ?? [];
   if (rows.length === 0) throw notFound("version not found");
   if (body.notes !== void 0) await requireNotesEdit(c.env.DB, c.get("user"), rows);
-  const versionCreator = body.versionNotes !== void 0 ? await requireVersionNotesEdit(c.env.DB, c.get("user"), rows[0]) : void 0;
-  const editsNotes = body.notes !== void 0 || body.versionNotes !== void 0;
+  const editsParent = body.versionNotes !== void 0 || body.specialVersion !== void 0;
+  const versionCreator = editsParent ? await requireVersionNotesEdit(c.env.DB, c.get("user"), rows[0]) : void 0;
+  const editsNotes = body.notes !== void 0 || editsParent;
   const creatorGuard = versionCreator === void 0 ? "" : `AND EXISTS (
     SELECT 1 FROM version_metadata vm
      WHERE vm.project_id = versions.project_id AND vm.version = versions.version AND vm.created_by = ?
@@ -28295,12 +28308,22 @@ versionRoutes.patch("/group", async (c) => {
   const now = Date.now();
   const changes = [];
   const noteChangeIndexes = [];
-  if (body.versionNotes !== void 0) {
+  if (editsParent) {
+    const sets = [];
+    const args = [];
+    if (body.versionNotes !== void 0) {
+      sets.push("notes = ?");
+      args.push(body.versionNotes);
+    }
+    if (body.specialVersion !== void 0) {
+      sets.push("special_version = ?");
+      args.push(body.specialVersion);
+    }
     noteChangeIndexes.push(changes.length);
     changes.push(c.env.DB.prepare(
-      `UPDATE version_metadata SET notes = ?, updated_at = ?
+      `UPDATE version_metadata SET ${sets.join(", ")}, updated_at = ?
         WHERE project_id = ? AND version = ? AND created_by = ? AND ${VERSION_NOTES_UNLOCKED_SQL}`
-    ).bind(body.versionNotes, now, body.projectId, body.version, versionCreator));
+    ).bind(...args, now, body.projectId, body.version, versionCreator));
   }
   if (body.notes !== void 0) {
     noteChangeIndexes.push(changes.length);
@@ -28957,6 +28980,7 @@ function sessionDto(r) {
     contentType: r.content_type,
     notes: r.notes,
     ...r.has_version_notes ? { versionNotes: r.version_notes } : {},
+    ...r.has_special_version ? { specialVersion: r.special_version } : {},
     isMandatory: !!r.is_mandatory,
     minVersion: r.min_version,
     maxVersion: r.max_version,
@@ -28967,11 +28991,11 @@ function sessionDto(r) {
     completedAt: r.completed_at
   };
 }
-async function uploadNotesPermission(db, user, projectId, version, hasVersionNotes, versionNotes, uploadedBy = user.id) {
+async function uploadNotesPermission(db, user, projectId, version, hasVersionNotes, versionNotes, hasSpecialVersion, specialVersion, uploadedBy = user.id) {
   const [permission] = await withNotePermissions(db, user, [
     { project_id: projectId, version, uploaded_by: uploadedBy }
   ]);
-  if (hasVersionNotes && permission.version_notes !== versionNotes) {
+  if (hasVersionNotes && permission.version_notes !== versionNotes || hasSpecialVersion && permission.special_version !== specialVersion) {
     if (permission.notes_locked) throw conflict("cancel current usage before editing version notes");
     if (permission.version_notes_creator !== null && !permission.can_edit_version_notes) {
       throw forbidden("only the version creator or an administrator can edit version notes");
@@ -29007,6 +29031,7 @@ uploadRoutes.post("/init", async (c) => {
   if (body.versionNotes !== void 0 && body.versionNotes !== null && typeof body.versionNotes !== "string") {
     throw badRequest("versionNotes must be a string or null");
   }
+  if (body.specialVersion !== void 0) body.specialVersion = normalizeSpecialVersion(body.specialVersion);
   const project = await requireProjectAccess(c.env.DB, me, body.projectId, "upload");
   const customer = await c.env.DB.prepare("SELECT code FROM customers WHERE id = ?").bind(project.customer_id).first();
   if (!customer) throw notFound("customer not found");
@@ -29023,7 +29048,9 @@ uploadRoutes.post("/init", async (c) => {
     body.projectId,
     body.version,
     body.versionNotes !== void 0,
-    body.versionNotes ?? null
+    body.versionNotes ?? null,
+    body.specialVersion !== void 0,
+    body.specialVersion ?? null
   );
   const totalSize = body.totalSize;
   const partSize = clampPartSize(body.partSizeHint, totalSize);
@@ -29036,9 +29063,10 @@ uploadRoutes.post("/init", async (c) => {
   const r = await c.env.DB.prepare(
     `INSERT INTO upload_sessions
        (project_id, r2_key, filename, total_size, part_size, upload_id, expected_sha256, release_channel,
-        target_version, content_type, notes, version_notes, has_version_notes, is_mandatory, min_version, max_version, rollout_percentage, version_id,
+        target_version, content_type, notes, version_notes, has_version_notes, special_version, has_special_version,
+        is_mandatory, min_version, max_version, rollout_percentage, version_id,
         status, initiated_by, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?)`
   ).bind(
     body.projectId,
     key,
@@ -29053,6 +29081,8 @@ uploadRoutes.post("/init", async (c) => {
     notes,
     body.versionNotes ?? null,
     body.versionNotes === void 0 ? 0 : 1,
+    body.specialVersion ?? null,
+    body.specialVersion === void 0 ? 0 : 1,
     body.isMandatory ? 1 : 0,
     body.minVersion ?? null,
     body.maxVersion ?? null,
@@ -29129,7 +29159,9 @@ uploadRoutes.post("/complete", async (c) => {
     session.project_id,
     session.target_version,
     !!session.has_version_notes,
-    session.version_notes
+    session.version_notes,
+    !!session.has_special_version,
+    session.special_version
   );
   const s3 = makeStorage(c.env);
   let completeRes;
@@ -29176,6 +29208,8 @@ uploadRoutes.post("/complete", async (c) => {
       session.target_version,
       !!session.has_version_notes,
       session.version_notes,
+      !!session.has_special_version,
+      session.special_version,
       existing?.uploaded_by
     );
     const oldKey = existing?.r2_key ?? null;
@@ -29205,12 +29239,16 @@ uploadRoutes.post("/complete", async (c) => {
       )`);
       guardArgs.push(session.project_id, session.target_version, session.release_channel, session.filename);
     }
-    if (session.has_version_notes) {
+    const parentFields = [
+      { column: "notes", provided: session.has_version_notes, value: session.version_notes },
+      { column: "special_version", provided: session.has_special_version, value: session.special_version }
+    ];
+    for (const field of parentFields.filter((field2) => field2.provided)) {
       guards.push(`(
         NOT EXISTS (SELECT 1 FROM version_metadata WHERE project_id = ? AND version = ?)
         OR EXISTS (
           SELECT 1 FROM version_metadata vm WHERE vm.project_id = ? AND vm.version = ?
-            AND (vm.notes IS ? OR (? = 1 AND vm.created_by = ? AND ${unlocked}))
+            AND (vm.${field.column} IS ? OR (? = 1 AND vm.created_by = ? AND ${unlocked}))
         )
       )`);
       guardArgs.push(
@@ -29218,7 +29256,7 @@ uploadRoutes.post("/complete", async (c) => {
         session.target_version,
         session.project_id,
         session.target_version,
-        session.version_notes,
+        field.value,
         notesPermission.can_edit_version_notes ? 1 : 0,
         notesPermission.version_notes_creator ?? -1,
         session.project_id,
@@ -29227,23 +29265,31 @@ uploadRoutes.post("/complete", async (c) => {
     }
     const guardSql = guards.join(" AND ");
     const metadataWrite = c.env.DB.prepare(
-      `INSERT INTO version_metadata (project_id, version, notes, created_by, created_at, updated_at)
-       SELECT ?, ?, ?, COALESCE((
+      `INSERT INTO version_metadata (project_id, version, notes, special_version, created_by, created_at, updated_at)
+       SELECT ?, ?, ?, ?, COALESCE((
          SELECT uploaded_by FROM versions WHERE project_id = ? AND version = ? ORDER BY created_at, id LIMIT 1
        ), ?), ?, ? WHERE ${guardSql}
-       ON CONFLICT (project_id, version) DO UPDATE SET notes = excluded.notes, updated_at = excluded.updated_at
-       WHERE ? = 1 AND version_metadata.notes IS NOT excluded.notes`
+       ON CONFLICT (project_id, version) DO UPDATE SET
+         notes = CASE WHEN ? = 1 THEN excluded.notes ELSE version_metadata.notes END,
+         special_version = CASE WHEN ? = 1 THEN excluded.special_version ELSE version_metadata.special_version END,
+         updated_at = excluded.updated_at
+       WHERE (? = 1 AND version_metadata.notes IS NOT excluded.notes)
+          OR (? = 1 AND version_metadata.special_version IS NOT excluded.special_version)`
     ).bind(
       session.project_id,
       session.target_version,
       session.has_version_notes ? session.version_notes : null,
+      session.has_special_version ? session.special_version : null,
       session.project_id,
       session.target_version,
       session.initiated_by,
       now,
       now,
       ...guardArgs,
-      session.has_version_notes ? 1 : 0
+      session.has_version_notes ? 1 : 0,
+      session.has_special_version ? 1 : 0,
+      session.has_version_notes ? 1 : 0,
+      session.has_special_version ? 1 : 0
     );
     const artifactWrite = existing ? c.env.DB.prepare(
       `UPDATE versions
@@ -29870,6 +29916,9 @@ var version_metadata_default = "-- Version-label notes are independent of each u
 // apps/worker/migrations/0010_upload_version_notes.sql
 var upload_version_notes_default = "-- Omitted parent notes preserve the existing value; explicit NULL clears it.\nALTER TABLE upload_sessions ADD COLUMN version_notes TEXT;\nALTER TABLE upload_sessions ADD COLUMN has_version_notes INTEGER NOT NULL DEFAULT 0;\n";
 
+// apps/worker/migrations/0011_special_version.sql
+var special_version_default = "-- Optional metadata shared by all files of a version label. Existing values\n-- remain empty; upload sessions distinguish omission from explicit clearing.\nALTER TABLE version_metadata ADD COLUMN special_version TEXT;\nALTER TABLE upload_sessions ADD COLUMN special_version TEXT;\nALTER TABLE upload_sessions ADD COLUMN has_special_version INTEGER NOT NULL DEFAULT 0;\n";
+
 // apps/worker/pages-entry.ts
 function statements(sql) {
   return sql.replace(/--[^\n]*/g, "").split(";").map((s) => s.trim()).filter((s) => s.length > 0 && !/^PRAGMA/i.test(s));
@@ -29894,6 +29943,7 @@ async function ensureSchema(env) {
     await ensureMultipleFiles(env);
     await ensureVersionMetadata(env);
     await ensureUploadVersionNotes(env);
+    await ensureSpecialVersion(env);
     schemaReady = true;
     console.log("[schema] initialized D1 tables on first run");
     return;
@@ -29906,6 +29956,7 @@ async function ensureSchema(env) {
   await ensureMultipleFiles(env);
   await ensureVersionMetadata(env);
   await ensureUploadVersionNotes(env);
+  await ensureSpecialVersion(env);
   schemaReady = true;
 }
 async function ensureColumn(env, table, column, stmts) {
@@ -29956,6 +30007,13 @@ async function ensureUploadVersionNotes(env) {
   if (row && !row.sql.includes("has_version_notes")) {
     await env.DB.batch(statements(upload_version_notes_default).map((stmt) => env.DB.prepare(stmt)));
     console.log("[schema] added upload version notes");
+  }
+}
+async function ensureSpecialVersion(env) {
+  const row = await env.DB.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'upload_sessions'").first();
+  if (row && !row.sql.includes("has_special_version")) {
+    await env.DB.batch(statements(special_version_default).map((stmt) => env.DB.prepare(stmt)));
+    console.log("[schema] added optional special version");
   }
 }
 var pages_entry_default = {
