@@ -13,6 +13,7 @@ import { apiTokenRoutes } from './routes/api-tokens';
 import { uploadRoutes } from './routes/upload';
 import { storageRoutes } from './routes/storage';
 import { auditRoutes } from './routes/audit';
+import { announcementRoutes } from './routes/announcements';
 import { ensureAdminSeed } from './lib/bootstrap';
 
 const app = new Hono<AppEnv>();
@@ -59,6 +60,7 @@ app.route('/api/download', downloadRoutes);
 app.route('/api/public', publicRoutes);
 app.route('/api/api-tokens', apiTokenRoutes);
 app.route('/api/audit', auditRoutes);
+app.route('/api/announcements', announcementRoutes);
 
 app.onError((err, c) => {
   if (err instanceof HttpError) {

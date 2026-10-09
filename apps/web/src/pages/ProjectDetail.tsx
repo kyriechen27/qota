@@ -6,6 +6,7 @@ import { startUpload, type UploadJobHandle } from '../lib/upload';
 import { formatBytes } from '../lib/utils';
 import { useI18n } from '../lib/i18n';
 import VersionNotesPreview from '../components/VersionNotesPreview';
+import AnnouncementBoard from '../components/AnnouncementBoard';
 import type { ApiToken, Project, Version } from '@qota/shared';
 
 export default function ProjectDetail() {
@@ -17,6 +18,8 @@ export default function ProjectDetail() {
   const [expandedVersionGroups, setExpandedVersionGroups] = useState<Set<string>>(() => new Set());
   const [notesDialog, setNotesDialog] = useState<{ version: string; items: Version[]; scope: 'version' | 'file' } | null>(null);
   const [specialVersionDialog, setSpecialVersionDialog] = useState<string | null>(null);
+  const [announcementRefresh, setAnnouncementRefresh] = useState(0);
+  const [canPublishAnnouncements, setCanPublishAnnouncements] = useState(false);
   const [versionBusy, setVersionBusy] = useState(false);
   const versionBusyRef = useRef(false);
   const [tokens, setTokens] = useState<ApiToken[]>([]);
@@ -76,6 +79,7 @@ export default function ProjectDetail() {
       ]);
       setVersions(v);
       setTokens(tk);
+      setAnnouncementRefresh((value) => value + 1);
     } catch (e: any) {
       setErr(e?.message);
     }
@@ -558,13 +562,20 @@ export default function ProjectDetail() {
         </div>
       )}
 
+      <AnnouncementBoard
+        key={projectId}
+        projectId={projectId}
+        refreshKey={announcementRefresh}
+        onPublishPermissionChange={setCanPublishAnnouncements}
+      />
+
       <div className="card version-card">
         <div className="version-card-header">
           <div className="version-section-title"><h3>{t('pd.versions')}</h3><span className="version-count">{versionGroups.length}</span></div>
           <div className="version-actions">
-            <button className="primary" onClick={() => setShowUpload(true)}>
+            {canPublishAnnouncements && <button className="primary" onClick={() => setShowUpload(true)}>
               {t('pd.uploadNew')}
-            </button>
+            </button>}
           </div>
         </div>
         {renderVersionsTable(versionGroups)}
@@ -910,6 +921,9 @@ function UploadFilesDialog({
   const [version, setVersion] = useState('');
   const [versionNotes, setVersionNotes] = useState('');
   const [specialVersion, setSpecialVersion] = useState('');
+  const [publishAnnouncement, setPublishAnnouncement] = useState(false);
+  const [announcementContent, setAnnouncementContent] = useState('');
+  const announcementBatchKey = useRef<string | null>(null);
   const [mandatory, setMandatory] = useState(false);
   const [busy, setBusy] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -983,6 +997,7 @@ function UploadFilesDialog({
   }
 
   async function runQueue(items: UploadQueueItem[], overwriteIds: Set<number>) {
+    if (publishAnnouncement && !announcementBatchKey.current) announcementBatchKey.current = crypto.randomUUID();
     setStarted(true);
     setConflict(null);
     const previousVersionNotes = existingVersions.find((item) => item.version === version)?.versionNotes ?? '';
@@ -1004,6 +1019,7 @@ function UploadFilesDialog({
             notes: item.notes || undefined,
             versionNotes: uploadVersionNotes,
             specialVersion: uploadSpecialVersion,
+            announcement: publishAnnouncement ? { batchKey: announcementBatchKey.current!, content: announcementContent.trim() } : undefined,
             isMandatory: mandatory,
             overwriteExisting: overwriteIds.has(item.id),
             concurrency: 4,
@@ -1048,6 +1064,10 @@ function UploadFilesDialog({
   async function prepareUpload(e: FormEvent) {
     e.preventDefault();
     if (busyRef.current || !version) return;
+    if (publishAnnouncement && !announcementContent.trim()) {
+      setError(t('pd.uploadAnnouncementRequired'));
+      return;
+    }
     if (duplicateIds.size) {
       setError(t('pd.duplicateFileChannels'));
       return;
@@ -1093,6 +1113,10 @@ function UploadFilesDialog({
 
   async function confirmOverwrite() {
     if (!conflict || busyRef.current || duplicateIds.size) return;
+    if (publishAnnouncement && !announcementContent.trim()) {
+      setError(t('pd.uploadAnnouncementRequired'));
+      return;
+    }
     busyRef.current = true;
     cancelRef.current = false;
     setBusy(true);
@@ -1117,6 +1141,9 @@ function UploadFilesDialog({
     setSelectionError(null);
     setError(null);
     setConflict(null);
+    setPublishAnnouncement(false);
+    setAnnouncementContent('');
+    announcementBatchKey.current = null;
   }
 
   const readyCount = queue.filter((item) => ['waiting', 'error', 'cancelled'].includes(item.status)).length;
@@ -1273,6 +1300,37 @@ function UploadFilesDialog({
               : 'pd.uploadVersionNotesHint')}</span>
           </label>
           <label className="upload-mandatory"><input type="checkbox" checked={mandatory} onChange={(e) => setMandatory(e.target.checked)} disabled={busy || started} /> {t('pd.fldMandatory')}</label>
+          <section className={`upload-announcement${publishAnnouncement ? ' is-enabled' : ''}`}>
+            <label className="upload-announcement-toggle">
+              <input
+                type="checkbox"
+                checked={publishAnnouncement}
+                onChange={(e) => { setPublishAnnouncement(e.target.checked); setError(null); setConflict(null); }}
+                disabled={busy || started}
+              />
+              <span>{t('pd.uploadAnnouncement')}</span>
+            </label>
+            {publishAnnouncement && (
+              <>
+                <p className="upload-notes-hint">{t('pd.uploadAnnouncementHint')}</p>
+                <label>
+                  <span className="lbl">{t('pd.uploadAnnouncementContent')}</span>
+                  <textarea
+                    className="upload-announcement-content"
+                    aria-label={t('pd.uploadAnnouncementContent')}
+                    value={announcementContent}
+                    onChange={(e) => { setAnnouncementContent(e.target.value); setConflict(null); }}
+                    rows={4}
+                    maxLength={10000}
+                    required
+                    disabled={busy || started}
+                  />
+                  <span className="upload-announcement-count">{announcementContent.length.toLocaleString()} / 10,000</span>
+                </label>
+                {successCount > 0 && <p className="success upload-announcement-success" role="status">{t('pd.uploadAnnouncementPublished')}</p>}
+              </>
+            )}
+          </section>
           {started && <p className="upload-batch-lock-hint">{t('pd.batchSettingsLocked')}</p>}
           {error && <p className="error" role="alert">{error}</p>}
           {conflict && (

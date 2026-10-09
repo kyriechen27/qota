@@ -20,6 +20,7 @@ import { audit } from '../lib/audit';
 import { versionDto } from './versions';
 import { IS_CURRENT_SQL } from '../lib/current-versions';
 import { requireNotesEdit, withNotePermissions, normalizeSpecialVersion } from '../lib/version-notes';
+import { uploadAnnouncement, createUploadAnnouncement, requireAnnouncementAuthor, ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL } from '../lib/announcements';
 
 export const uploadRoutes = new Hono<AppEnv>();
 
@@ -75,6 +76,8 @@ interface SessionRow {
   has_version_notes: number;
   special_version: string | null;
   has_special_version: number;
+  announcement_content: string | null;
+  announcement_batch_key: string | null;
   is_mandatory: number;
   min_version: string | null;
   max_version: string | null;
@@ -102,6 +105,7 @@ function sessionDto(r: SessionRow) {
     notes: r.notes,
     ...(r.has_version_notes ? { versionNotes: r.version_notes } : {}),
     ...(r.has_special_version ? { specialVersion: r.special_version } : {}),
+    ...(r.announcement_batch_key ? { announcement: { batchKey: r.announcement_batch_key, content: r.announcement_content! } } : {}),
     isMandatory: !!r.is_mandatory,
     minVersion: r.min_version,
     maxVersion: r.max_version,
@@ -147,6 +151,7 @@ uploadRoutes.post('/init', async (c) => {
     notes?: string | null;
     versionNotes?: string | null;
     specialVersion?: string | null;
+    announcement?: unknown;
     isMandatory?: boolean;
     minVersion?: string | null;
     maxVersion?: string | null;
@@ -184,6 +189,7 @@ uploadRoutes.post('/init', async (c) => {
     throw badRequest('versionNotes must be a string or null');
   }
   if (body.specialVersion !== undefined) body.specialVersion = normalizeSpecialVersion(body.specialVersion);
+  const announcement = uploadAnnouncement(body.announcement);
   const project = await requireProjectAccess(c.env.DB, me, body.projectId, 'upload');
   const customer = await c.env.DB.prepare('SELECT code FROM customers WHERE id = ?')
     .bind(project.customer_id)
@@ -202,6 +208,16 @@ uploadRoutes.post('/init', async (c) => {
   await uploadNotesPermission(c.env.DB, me, body.projectId, body.version,
     body.versionNotes !== undefined, body.versionNotes ?? null,
     body.specialVersion !== undefined, body.specialVersion ?? null);
+  if (announcement) {
+    const reused = await c.env.DB.prepare(
+      `SELECT 1 FROM upload_sessions
+        WHERE project_id = ? AND initiated_by = ? AND announcement_batch_key = ? AND target_version != ?
+       UNION ALL SELECT 1 FROM announcements
+        WHERE project_id = ? AND author_id = ? AND upload_batch_key = ? AND version IS NOT ? LIMIT 1`,
+    ).bind(body.projectId, me.id, announcement.batchKey, body.version,
+      body.projectId, me.id, announcement.batchKey, body.version).first();
+    if (reused) throw conflict('announcement batchKey already belongs to another version');
+  }
 
   const totalSize = body.totalSize!;
   const partSize = clampPartSize(body.partSizeHint, totalSize);
@@ -218,8 +234,8 @@ uploadRoutes.post('/init', async (c) => {
        (project_id, r2_key, filename, total_size, part_size, upload_id, expected_sha256, release_channel,
         target_version, content_type, notes, version_notes, has_version_notes, special_version, has_special_version,
         is_mandatory, min_version, max_version, rollout_percentage, version_id,
-        status, initiated_by, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?)`,
+        status, initiated_by, created_at, announcement_content, announcement_batch_key)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?)`,
   )
     .bind(
       body.projectId,
@@ -244,6 +260,8 @@ uploadRoutes.post('/init', async (c) => {
       existing?.id ?? null,
       me.id,
       now,
+      announcement?.content ?? null,
+      announcement?.batchKey ?? null,
     )
     .run();
   const sessionId = Number(r.meta.last_row_id);
@@ -327,6 +345,9 @@ uploadRoutes.post('/complete', async (c) => {
     throw badRequest(`session not in_progress (status=${session.status})`);
   }
   const project = await requireProjectAccess(c.env.DB, me, session.project_id, 'upload');
+  if (session.announcement_batch_key) {
+    await requireAnnouncementAuthor(c.env.DB, session.project_id, session.initiated_by);
+  }
   if (session.expected_sha256 && body.sha256 && session.expected_sha256.toLowerCase() !== body.sha256.toLowerCase()) {
     throw badRequest('sha256 mismatch with init expectedSha256');
   }
@@ -409,6 +430,16 @@ uploadRoutes.post('/complete', async (c) => {
     )`;
     const guards = [`EXISTS (SELECT 1 FROM upload_sessions WHERE id = ? AND status = 'in_progress')`];
     const guardArgs: unknown[] = [session.id];
+    if (session.announcement_batch_key) {
+      guards.push(ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL);
+      guardArgs.push(session.project_id, session.initiated_by);
+      // Close the race between two differently versioned init requests that
+      // attempt to claim the same author's batch key at the same time.
+      guards.push(`NOT EXISTS (
+        SELECT 1 FROM announcements WHERE project_id = ? AND author_id = ? AND upload_batch_key = ? AND version IS NOT ?
+      )`);
+      guardArgs.push(session.project_id, session.initiated_by, session.announcement_batch_key, session.target_version);
+    }
     if (existing) {
       guards.push(`EXISTS (
         SELECT 1 FROM versions v WHERE v.id = ? AND v.project_id = ? AND v.uploaded_by = ? AND v.r2_key = ?
@@ -524,11 +555,22 @@ uploadRoutes.post('/complete', async (c) => {
     ).bind(now, session.project_id, session.r2_key, session.id);
     // changes() links the session transition to the preceding artifact write,
     // including legacy sessions whose object key may match the existing file.
-    const [, artifactResult] = await c.env.DB.batch([metadataWrite, artifactWrite, completeSession]);
+    const writes = [metadataWrite, artifactWrite, completeSession];
+    if (session.announcement_batch_key) writes.push(createUploadAnnouncement(c.env.DB, session.id, now));
+    const [, artifactResult, , announcementResult] = await c.env.DB.batch(writes);
     if (!artifactResult || artifactResult.meta.changes === 0) {
       throw conflict('version or filename changed; refresh before retrying the upload');
     }
     if (!existing) versionId = Number(artifactResult.meta.last_row_id);
+
+    if (announcementResult?.meta.changes) {
+      await audit(c, {
+        action: 'announcement.create', actorType: 'user', actorId: session.initiated_by,
+        customerId: project.customer_id, projectId: session.project_id,
+        targetType: 'announcement', targetId: Number(announcementResult.meta.last_row_id),
+        meta: { source: 'upload', sessionId: session.id, version: session.target_version, completedBy: me.id },
+      });
+    }
 
     await audit(c, {
       action: 'version.upload.complete',

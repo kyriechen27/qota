@@ -28094,11 +28094,11 @@ async function notesContexts(db, user, projectIds) {
       db.prepare(`SELECT project_id, version, notes, special_version, created_by FROM version_metadata WHERE project_id IN (${placeholders})`).bind(...ids).all()
     ]);
     for (const project of projects.results ?? []) {
-      const globalAdmin = user.role === "super_admin" || user.role === "admin";
-      const canManage = globalAdmin || user.role !== "observer" && !!project.role && roleHas(project.role, "manage_versions");
+      const globalAdmin2 = user.role === "super_admin" || user.role === "admin";
+      const canManage = globalAdmin2 || user.role !== "observer" && !!project.role && roleHas(project.role, "manage_versions");
       contexts.set(project.id, {
         canManage,
-        isAdmin: globalAdmin || canManage && project.role === "customer_admin",
+        isAdmin: globalAdmin2 || canManage && project.role === "customer_admin",
         current: /* @__PURE__ */ new Set(),
         metadata: /* @__PURE__ */ new Map()
       });
@@ -28936,6 +28936,47 @@ publicRoutes.get("/download/:slug", async (c) => {
   return c.redirect(url, 302);
 });
 
+// apps/worker/src/lib/announcements.ts
+var ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL = `EXISTS (
+  SELECT 1 FROM users au JOIN projects ap ON ap.id = ?
+  LEFT JOIN user_global_roles agr ON agr.user_id = au.id
+  LEFT JOIN project_memberships apm ON apm.project_id = ap.id AND apm.user_id = au.id
+  LEFT JOIN memberships acm ON acm.customer_id = ap.customer_id AND acm.user_id = au.id
+  WHERE au.id = ? AND au.is_active = 1 AND (
+    COALESCE(agr.role, au.role) IN ('super_admin', 'admin') OR
+    (COALESCE(agr.role, au.role) = 'developer' AND COALESCE(apm.role, acm.role) IN ('developer', 'customer_admin'))
+  )
+)`;
+async function requireAnnouncementAuthor(db, projectId, authorId) {
+  const row = await db.prepare(`SELECT ${ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL} AS allowed`).bind(projectId, authorId).first();
+  if (!row?.allowed) throw forbidden("the announcement author no longer has permission to publish");
+}
+function announcementContent(value) {
+  if (typeof value !== "string") throw badRequest("announcement content must be a string");
+  const content = value.trim();
+  if (!content || content.length > 1e4) throw badRequest("announcement content must contain 1-10000 characters");
+  return content;
+}
+function uploadAnnouncement(value) {
+  if (value === void 0) return void 0;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw badRequest("announcement must contain batchKey and content");
+  const announcement = value;
+  if (typeof announcement.batchKey !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(announcement.batchKey)) {
+    throw badRequest("announcement batchKey must be a UUID");
+  }
+  return { batchKey: announcement.batchKey.toLowerCase(), content: announcementContent(announcement.content) };
+}
+function createUploadAnnouncement(db, sessionId, now) {
+  return db.prepare(
+    `INSERT INTO announcements (project_id, version, content, author_id, created_at, updated_at, upload_batch_key)
+     SELECT project_id, target_version, announcement_content, initiated_by, ?, ?, announcement_batch_key
+       FROM upload_sessions
+      WHERE id = ? AND status = 'completed' AND changes() = 1
+        AND announcement_content IS NOT NULL AND announcement_batch_key IS NOT NULL
+     ON CONFLICT (project_id, author_id, upload_batch_key) DO NOTHING`
+  ).bind(now, now, sessionId);
+}
+
 // apps/worker/src/routes/upload.ts
 var uploadRoutes = new Hono2();
 uploadRoutes.use("*", requireUser);
@@ -28981,6 +29022,7 @@ function sessionDto(r) {
     notes: r.notes,
     ...r.has_version_notes ? { versionNotes: r.version_notes } : {},
     ...r.has_special_version ? { specialVersion: r.special_version } : {},
+    ...r.announcement_batch_key ? { announcement: { batchKey: r.announcement_batch_key, content: r.announcement_content } } : {},
     isMandatory: !!r.is_mandatory,
     minVersion: r.min_version,
     maxVersion: r.max_version,
@@ -29032,6 +29074,7 @@ uploadRoutes.post("/init", async (c) => {
     throw badRequest("versionNotes must be a string or null");
   }
   if (body.specialVersion !== void 0) body.specialVersion = normalizeSpecialVersion(body.specialVersion);
+  const announcement = uploadAnnouncement(body.announcement);
   const project = await requireProjectAccess(c.env.DB, me, body.projectId, "upload");
   const customer = await c.env.DB.prepare("SELECT code FROM customers WHERE id = ?").bind(project.customer_id).first();
   if (!customer) throw notFound("customer not found");
@@ -29052,6 +29095,24 @@ uploadRoutes.post("/init", async (c) => {
     body.specialVersion !== void 0,
     body.specialVersion ?? null
   );
+  if (announcement) {
+    const reused = await c.env.DB.prepare(
+      `SELECT 1 FROM upload_sessions
+        WHERE project_id = ? AND initiated_by = ? AND announcement_batch_key = ? AND target_version != ?
+       UNION ALL SELECT 1 FROM announcements
+        WHERE project_id = ? AND author_id = ? AND upload_batch_key = ? AND version IS NOT ? LIMIT 1`
+    ).bind(
+      body.projectId,
+      me.id,
+      announcement.batchKey,
+      body.version,
+      body.projectId,
+      me.id,
+      announcement.batchKey,
+      body.version
+    ).first();
+    if (reused) throw conflict("announcement batchKey already belongs to another version");
+  }
   const totalSize = body.totalSize;
   const partSize = clampPartSize(body.partSizeHint, totalSize);
   const partCount = Math.ceil(totalSize / partSize);
@@ -29065,8 +29126,8 @@ uploadRoutes.post("/init", async (c) => {
        (project_id, r2_key, filename, total_size, part_size, upload_id, expected_sha256, release_channel,
         target_version, content_type, notes, version_notes, has_version_notes, special_version, has_special_version,
         is_mandatory, min_version, max_version, rollout_percentage, version_id,
-        status, initiated_by, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?)`
+        status, initiated_by, created_at, announcement_content, announcement_batch_key)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?)`
   ).bind(
     body.projectId,
     key,
@@ -29089,7 +29150,9 @@ uploadRoutes.post("/init", async (c) => {
     body.rolloutPercentage === void 0 ? 100 : Math.floor(body.rolloutPercentage),
     existing?.id ?? null,
     me.id,
-    now
+    now,
+    announcement?.content ?? null,
+    announcement?.batchKey ?? null
   ).run();
   const sessionId = Number(r.meta.last_row_id);
   await audit(c, {
@@ -29143,6 +29206,9 @@ uploadRoutes.post("/complete", async (c) => {
     throw badRequest(`session not in_progress (status=${session.status})`);
   }
   const project = await requireProjectAccess(c.env.DB, me, session.project_id, "upload");
+  if (session.announcement_batch_key) {
+    await requireAnnouncementAuthor(c.env.DB, session.project_id, session.initiated_by);
+  }
   if (session.expected_sha256 && body.sha256 && session.expected_sha256.toLowerCase() !== body.sha256.toLowerCase()) {
     throw badRequest("sha256 mismatch with init expectedSha256");
   }
@@ -29218,6 +29284,14 @@ uploadRoutes.post("/complete", async (c) => {
     )`;
     const guards = [`EXISTS (SELECT 1 FROM upload_sessions WHERE id = ? AND status = 'in_progress')`];
     const guardArgs = [session.id];
+    if (session.announcement_batch_key) {
+      guards.push(ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL);
+      guardArgs.push(session.project_id, session.initiated_by);
+      guards.push(`NOT EXISTS (
+        SELECT 1 FROM announcements WHERE project_id = ? AND author_id = ? AND upload_batch_key = ? AND version IS NOT ?
+      )`);
+      guardArgs.push(session.project_id, session.initiated_by, session.announcement_batch_key, session.target_version);
+    }
     if (existing) {
       guards.push(`EXISTS (
         SELECT 1 FROM versions v WHERE v.id = ? AND v.project_id = ? AND v.uploaded_by = ? AND v.r2_key = ?
@@ -29353,11 +29427,25 @@ uploadRoutes.post("/complete", async (c) => {
          SELECT id FROM versions WHERE project_id = ? AND r2_key = ? LIMIT 1
        ) WHERE id = ? AND status = 'in_progress' AND changes() = 1`
     ).bind(now, session.project_id, session.r2_key, session.id);
-    const [, artifactResult] = await c.env.DB.batch([metadataWrite, artifactWrite, completeSession]);
+    const writes = [metadataWrite, artifactWrite, completeSession];
+    if (session.announcement_batch_key) writes.push(createUploadAnnouncement(c.env.DB, session.id, now));
+    const [, artifactResult, , announcementResult] = await c.env.DB.batch(writes);
     if (!artifactResult || artifactResult.meta.changes === 0) {
       throw conflict("version or filename changed; refresh before retrying the upload");
     }
     if (!existing) versionId = Number(artifactResult.meta.last_row_id);
+    if (announcementResult?.meta.changes) {
+      await audit(c, {
+        action: "announcement.create",
+        actorType: "user",
+        actorId: session.initiated_by,
+        customerId: project.customer_id,
+        projectId: session.project_id,
+        targetType: "announcement",
+        targetId: Number(announcementResult.meta.last_row_id),
+        meta: { source: "upload", sessionId: session.id, version: session.target_version, completedBy: me.id }
+      });
+    }
     await audit(c, {
       action: "version.upload.complete",
       customerId: project.customer_id,
@@ -29579,6 +29667,136 @@ auditRoutes.get("/", async (c) => {
   return c.json((rows.results ?? []).map(dto6));
 });
 
+// apps/worker/src/routes/announcements.ts
+var announcementRoutes = new Hono2();
+announcementRoutes.use("*", requireUser);
+var SELECT_ANNOUNCEMENTS = `SELECT a.id, a.project_id, p.name AS project_name, c.name AS customer_name,
+  a.version, a.content, a.author_id, COALESCE(NULLIF(u.display_name, ''), u.email) AS author_name,
+  a.created_at, a.updated_at, COALESCE(pm.role, cm.role) AS project_role
+  FROM announcements a
+  JOIN projects p ON p.id = a.project_id
+  JOIN customers c ON c.id = p.customer_id
+  JOIN users u ON u.id = a.author_id
+  LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = ?
+  LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = ?`;
+function globalAdmin(user) {
+  return user.role === "admin" || user.role === "super_admin";
+}
+function dto7(row, user) {
+  const canManage = row.author_id === user.id || globalAdmin(user) || user.role !== "observer" && row.project_role === "customer_admin";
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    projectName: row.project_name,
+    customerName: row.customer_name,
+    version: row.version,
+    content: row.content,
+    authorId: row.author_id,
+    authorName: row.author_name,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    canEdit: canManage,
+    canDelete: canManage
+  };
+}
+function positiveInteger(value, name) {
+  if (typeof value !== "number" && typeof value !== "string" || !/^\d+$/.test(String(value))) {
+    throw badRequest(`valid ${name} required`);
+  }
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number <= 0) throw badRequest(`valid ${name} required`);
+  return number;
+}
+async function loadAnnouncement(db, user, id) {
+  const row = await db.prepare(`${SELECT_ANNOUNCEMENTS} WHERE a.id = ? AND a.deleted_at IS NULL`).bind(user.id, user.id, id).first();
+  if (!row) throw notFound("announcement not found");
+  const project = await requireProjectAccess(db, user, row.project_id, "view");
+  return { row, project, announcement: dto7(row, user) };
+}
+announcementRoutes.get("/", async (c) => {
+  const user = c.get("user");
+  const projectIdQ = c.req.query("projectId");
+  const cursorQ = c.req.query("cursor");
+  const limit = positiveInteger(c.req.query("limit") ?? 20, "limit");
+  if (limit > 100) throw badRequest("limit must be at most 100");
+  const where = ["a.deleted_at IS NULL"];
+  const args = [user.id, user.id];
+  if (!globalAdmin(user) && user.role !== "observer") where.push("COALESCE(pm.role, cm.role) IS NOT NULL");
+  if (projectIdQ !== void 0) {
+    const projectId = positiveInteger(projectIdQ, "projectId");
+    await requireProjectAccess(c.env.DB, user, projectId, "view");
+    where.push("a.project_id = ?");
+    args.push(projectId);
+  }
+  if (cursorQ !== void 0) {
+    where.push("a.id < ?");
+    args.push(positiveInteger(cursorQ, "cursor"));
+  }
+  const [announcements, projects] = await Promise.all([
+    c.env.DB.prepare(`${SELECT_ANNOUNCEMENTS} WHERE ${where.join(" AND ")} ORDER BY a.id DESC LIMIT ?`).bind(...args, limit + 1).all(),
+    c.env.DB.prepare(
+      `SELECT p.id, p.name, c.name AS customer_name FROM projects p
+       JOIN customers c ON c.id = p.customer_id
+       LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = ?
+       LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = ?
+       WHERE ? = 1 OR (? = 1 AND COALESCE(pm.role, cm.role) IN ('developer', 'customer_admin'))
+       ORDER BY c.name, p.name, p.id`
+    ).bind(user.id, user.id, globalAdmin(user) ? 1 : 0, user.role === "developer" ? 1 : 0).all()
+  ]);
+  const rows = announcements.results ?? [];
+  const items = rows.slice(0, limit).map((row) => dto7(row, user));
+  return c.json({
+    items,
+    nextCursor: rows.length > limit ? String(items[items.length - 1].id) : null,
+    publishableProjects: (projects.results ?? []).map((project) => ({
+      id: project.id,
+      name: project.name,
+      customerName: project.customer_name
+    }))
+  });
+});
+announcementRoutes.post("/", async (c) => {
+  const user = c.get("user");
+  const body = await c.req.json().catch(() => null);
+  if (!body) throw badRequest("projectId and content required");
+  const projectId = positiveInteger(body.projectId, "projectId");
+  const content = announcementContent(body.content);
+  const project = await requireProjectAccess(c.env.DB, user, projectId, "upload");
+  const now = Date.now();
+  const result = await c.env.DB.prepare(
+    `INSERT INTO announcements (project_id, content, author_id, created_at, updated_at)
+     SELECT ?, ?, ?, ?, ? WHERE ${ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL}`
+  ).bind(projectId, content, user.id, now, now, projectId, user.id).run();
+  if (!result.meta.changes) throw forbidden("no permission to publish announcements");
+  const id = Number(result.meta.last_row_id);
+  await audit(c, { action: "announcement.create", projectId, customerId: project.customer_id, targetType: "announcement", targetId: id });
+  return c.json((await loadAnnouncement(c.env.DB, user, id)).announcement, 201);
+});
+announcementRoutes.patch("/:id", async (c) => {
+  const user = c.get("user");
+  const id = positiveInteger(c.req.param("id"), "id");
+  const body = await c.req.json().catch(() => null);
+  const content = announcementContent(body?.content);
+  const { row, project, announcement } = await loadAnnouncement(c.env.DB, user, id);
+  if (!announcement.canEdit) throw forbidden("only the author or an administrator can edit this announcement");
+  const updatedAt = Date.now();
+  const result = await c.env.DB.prepare("UPDATE announcements SET content = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL").bind(content, updatedAt, id).run();
+  if (!result.meta.changes) throw notFound("announcement not found");
+  await audit(c, { action: "announcement.update", projectId: row.project_id, customerId: project.customer_id, targetType: "announcement", targetId: id });
+  return c.json({ ...announcement, content, updatedAt });
+});
+announcementRoutes.delete("/:id", async (c) => {
+  const user = c.get("user");
+  const id = positiveInteger(c.req.param("id"), "id");
+  const { row, project, announcement } = await loadAnnouncement(c.env.DB, user, id);
+  if (!announcement.canDelete) throw forbidden("only the author or an administrator can delete this announcement");
+  const now = Date.now();
+  const result = await c.env.DB.prepare("UPDATE announcements SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL").bind(now, now, id).run();
+  if (!result.meta.changes) throw notFound("announcement not found");
+  await audit(c, { action: "announcement.delete", projectId: row.project_id, customerId: project.customer_id, targetType: "announcement", targetId: id });
+  return c.json({ ok: true });
+});
+
 // apps/worker/src/lib/bootstrap.ts
 var seeded = false;
 async function ensureAdminSeed(env) {
@@ -29643,6 +29861,7 @@ app.route("/api/download", downloadRoutes);
 app.route("/api/public", publicRoutes);
 app.route("/api/api-tokens", apiTokenRoutes);
 app.route("/api/audit", auditRoutes);
+app.route("/api/announcements", announcementRoutes);
 app.onError((err, c) => {
   if (err instanceof HttpError) {
     return c.json({ error: err.code, message: err.message }, err.status);
@@ -29919,6 +30138,9 @@ var upload_version_notes_default = "-- Omitted parent notes preserve the existin
 // apps/worker/migrations/0011_special_version.sql
 var special_version_default = "-- Optional metadata shared by all files of a version label. Existing values\n-- remain empty; upload sessions distinguish omission from explicit clearing.\nALTER TABLE version_metadata ADD COLUMN special_version TEXT;\nALTER TABLE upload_sessions ADD COLUMN special_version TEXT;\nALTER TABLE upload_sessions ADD COLUMN has_special_version INTEGER NOT NULL DEFAULT 0;\n";
 
+// apps/worker/migrations/0012_announcements.sql
+var announcements_default = "CREATE TABLE announcements (\n  id INTEGER PRIMARY KEY AUTOINCREMENT,\n  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  version TEXT,\n  content TEXT NOT NULL,\n  author_id INTEGER NOT NULL REFERENCES users(id),\n  created_at INTEGER NOT NULL,\n  updated_at INTEGER NOT NULL,\n  deleted_at INTEGER,\n  upload_batch_key TEXT,\n  UNIQUE (project_id, author_id, upload_batch_key)\n);\nCREATE INDEX idx_announcements_project ON announcements(project_id, id DESC);\n\n-- Keep the announcement key after soft deletion, so remaining files from a\n-- published upload batch cannot recreate an announcement the user removed.\nALTER TABLE upload_sessions ADD COLUMN announcement_content TEXT;\nALTER TABLE upload_sessions ADD COLUMN announcement_batch_key TEXT;\nCREATE INDEX idx_upload_sessions_announcement ON upload_sessions(project_id, initiated_by, announcement_batch_key);\n";
+
 // apps/worker/pages-entry.ts
 function statements(sql) {
   return sql.replace(/--[^\n]*/g, "").split(";").map((s) => s.trim()).filter((s) => s.length > 0 && !/^PRAGMA/i.test(s));
@@ -29944,6 +30166,7 @@ async function ensureSchema(env) {
     await ensureVersionMetadata(env);
     await ensureUploadVersionNotes(env);
     await ensureSpecialVersion(env);
+    await ensureAnnouncements(env);
     schemaReady = true;
     console.log("[schema] initialized D1 tables on first run");
     return;
@@ -29957,6 +30180,7 @@ async function ensureSchema(env) {
   await ensureVersionMetadata(env);
   await ensureUploadVersionNotes(env);
   await ensureSpecialVersion(env);
+  await ensureAnnouncements(env);
   schemaReady = true;
 }
 async function ensureColumn(env, table, column, stmts) {
@@ -30014,6 +30238,13 @@ async function ensureSpecialVersion(env) {
   if (row && !row.sql.includes("has_special_version")) {
     await env.DB.batch(statements(special_version_default).map((stmt) => env.DB.prepare(stmt)));
     console.log("[schema] added optional special version");
+  }
+}
+async function ensureAnnouncements(env) {
+  const row = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'announcements'").first();
+  if (!row) {
+    await env.DB.batch(statements(announcements_default).map((stmt) => env.DB.prepare(stmt)));
+    console.log("[schema] added project announcements");
   }
 }
 var pages_entry_default = {

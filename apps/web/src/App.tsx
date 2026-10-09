@@ -3,6 +3,7 @@ import { useAuth } from './lib/auth';
 import Login from './pages/Login';
 import Layout from './components/Layout';
 import Dashboard from './pages/Dashboard';
+import Announcements from './pages/Announcements';
 import Customers from './pages/Customers';
 import Projects from './pages/Projects';
 import ProjectDetail from './pages/ProjectDetail';
@@ -40,7 +41,8 @@ export default function App() {
     <>
       <Layout>
         <Routes>
-          <Route path="/" element={<Dashboard />} />
+          <Route path="/" element={<Announcements />} />
+          <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/customers" element={<Customers />} />
           <Route path="/projects" element={<Projects />} />
           <Route path="/projects/:id" element={<ProjectDetail />} />

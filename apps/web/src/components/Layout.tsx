@@ -12,6 +12,9 @@ export default function Layout({ children }: { children: ReactNode }) {
       <aside className="sidebar">
         <div className="brand">📦 qota</div>
         <NavLink to="/" end className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
+          {t('nav.announcements')}
+        </NavLink>
+        <NavLink to="/dashboard" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
           {t('nav.dashboard')}
         </NavLink>
         <NavLink to="/customers" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>

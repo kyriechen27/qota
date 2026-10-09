@@ -1,5 +1,7 @@
 import type {
   AccessibleVersion,
+  Announcement,
+  AnnouncementListResponse,
   ApiToken,
   AuditLog,
   Customer,
@@ -132,6 +134,21 @@ export const api = {
     }),
   deleteMembership: (id: number, scope: 'customer' | 'project') =>
     request<{ ok: true }>(`/api/memberships/${id}?scope=${scope}`, { method: 'DELETE' }),
+
+  // Announcements
+  listAnnouncements: (opts?: { projectId?: number; cursor?: string; limit?: number }) => {
+    const qs = new URLSearchParams();
+    if (opts?.projectId !== undefined) qs.set('projectId', String(opts.projectId));
+    if (opts?.cursor !== undefined) qs.set('cursor', opts.cursor);
+    if (opts?.limit !== undefined) qs.set('limit', String(opts.limit));
+    return request<AnnouncementListResponse>(`/api/announcements${qs.size ? `?${qs}` : ''}`);
+  },
+  createAnnouncement: (body: { projectId: number; content: string }) =>
+    request<Announcement>('/api/announcements', { method: 'POST', body: JSON.stringify(body) }),
+  updateAnnouncement: (id: number, body: { content: string }) =>
+    request<Announcement>(`/api/announcements/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  deleteAnnouncement: (id: number) =>
+    request<{ ok: true }>(`/api/announcements/${id}`, { method: 'DELETE' }),
 
   // Versions
   // Cross-project catalog of everything the logged-in user may download.

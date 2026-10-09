@@ -20,6 +20,7 @@ export interface UploadJobOptions {
   notes?: string;
   versionNotes?: string | null;
   specialVersion?: string | null;
+  announcement?: { batchKey: string; content: string };
   isMandatory?: boolean;
   minVersion?: string | null;
   maxVersion?: string | null;
@@ -130,6 +131,7 @@ export function startUpload(opts: UploadJobOptions): UploadJobHandle {
       notes: opts.notes,
       versionNotes: opts.versionNotes,
       specialVersion: opts.specialVersion,
+      announcement: opts.announcement,
       isMandatory: opts.isMandatory,
       minVersion: opts.minVersion,
       maxVersion: opts.maxVersion,

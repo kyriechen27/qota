@@ -418,6 +418,15 @@ tr:hover td { background: #1a1f2a; }
 .upload-file-notes textarea { display: block; width: 100%; margin-top: 5px; font-size: 12px; line-height: 1.6; resize: vertical; }
 .upload-version-notes { width: 100%; line-height: 1.6; }
 .upload-version-notes:read-only { color: #92a1b7; }
+.upload-announcement { margin-top: 16px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 8px; background: #181f2a; }
+.upload-announcement.is-enabled { border-color: #354b69; }
+.upload-announcement .upload-announcement-toggle { display: flex; align-items: center; gap: 9px; margin: 0; cursor: pointer; font-size: 13px; font-weight: 500; }
+.upload-announcement-toggle input { margin: 0; width: 15px; height: 15px; accent-color: var(--accent); }
+.upload-announcement > .upload-notes-hint { margin: 10px 0 14px; line-height: 1.6; }
+.upload-announcement > label:last-child { margin-bottom: 0; }
+.upload-announcement-content { width: 100%; min-height: 96px; line-height: 1.7; }
+.upload-announcement-count { display: block; margin-top: 5px; text-align: right; color: var(--muted); font-size: 11px; }
+.upload-announcement-success { margin: 10px 0 0; font-size: 12px; }
 .upload-notes-hint { display: block; color: #8390a5; font-size: 11px; margin-top: 5px; }
 .upload-file-error { margin: 7px 0 0 42px; color: #f19090; font-size: 12px; overflow-wrap: anywhere; }
 .upload-mandatory { display: flex; align-items: center; gap: 7px; font-size: 12px; color: #abb7c8; margin-bottom: 0; }

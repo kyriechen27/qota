@@ -25,6 +25,7 @@ import migration0008 from './migrations/0008_multiple_files.sql';
 import migration0009 from './migrations/0009_version_metadata.sql';
 import migration0010 from './migrations/0010_upload_version_notes.sql';
 import migration0011 from './migrations/0011_special_version.sql';
+import migration0012 from './migrations/0012_announcements.sql';
 
 interface PagesEnv extends Bindings {
   ASSETS: Fetcher;
@@ -66,6 +67,7 @@ async function ensureSchema(env: PagesEnv): Promise<void> {
     await ensureVersionMetadata(env);
     await ensureUploadVersionNotes(env);
     await ensureSpecialVersion(env);
+    await ensureAnnouncements(env);
     schemaReady = true;
     console.log('[schema] initialized D1 tables on first run');
     return;
@@ -82,6 +84,7 @@ async function ensureSchema(env: PagesEnv): Promise<void> {
   await ensureVersionMetadata(env);
   await ensureUploadVersionNotes(env);
   await ensureSpecialVersion(env);
+  await ensureAnnouncements(env);
   schemaReady = true;
 }
 
@@ -155,6 +158,14 @@ async function ensureSpecialVersion(env: PagesEnv): Promise<void> {
   if (row && !row.sql.includes('has_special_version')) {
     await env.DB.batch(statements(migration0011).map((stmt) => env.DB.prepare(stmt)));
     console.log('[schema] added optional special version');
+  }
+}
+
+async function ensureAnnouncements(env: PagesEnv): Promise<void> {
+  const row = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'announcements'").first();
+  if (!row) {
+    await env.DB.batch(statements(migration0012).map((stmt) => env.DB.prepare(stmt)));
+    console.log('[schema] added project announcements');
   }
 }
 

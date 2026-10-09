@@ -60,6 +60,34 @@ export interface Project {
 
 export type VersionStatus = 'pending' | 'ready' | 'archived';
 
+export interface Announcement {
+  id: number;
+  projectId: number;
+  projectName: string;
+  customerName: string;
+  /** Uploaded version label, retained if its files are later removed. */
+  version: string | null;
+  content: string;
+  authorId: number;
+  authorName: string;
+  createdAt: number;
+  updatedAt: number;
+  canEdit: boolean;
+  canDelete: boolean;
+}
+
+export interface AnnouncementListResponse {
+  items: Announcement[];
+  nextCursor: string | null;
+  publishableProjects: { id: number; name: string; customerName: string }[];
+}
+
+export interface UploadAnnouncement {
+  /** One UUID shared by all files and retries of the same upload batch. */
+  batchKey: string;
+  content: string;
+}
+
 export interface Version {
   id: number;
   projectId: number;
@@ -160,6 +188,7 @@ export interface UploadSession {
   targetVersion: string;
   contentType: string | null;
   notes: string | null;
+  announcement?: UploadAnnouncement;
   isMandatory: boolean;
   minVersion: string | null;
   maxVersion: string | null;
@@ -214,6 +243,8 @@ export interface UploadInitRequest {
   versionNotes?: string | null;
   /** Single-line version metadata, max 128 chars. Omit to preserve; null clears. */
   specialVersion?: string | null;
+  /** Publish once when the first file in this batch completes successfully. */
+  announcement?: UploadAnnouncement;
   isMandatory?: boolean;
   minVersion?: string | null;
   maxVersion?: string | null;
