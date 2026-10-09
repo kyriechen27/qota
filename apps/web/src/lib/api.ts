@@ -161,7 +161,7 @@ export const api = {
     version: string;
     isCurrent?: boolean;
     status?: 'ready' | 'archived';
-    notes?: string | null;
+    versionNotes?: string | null;
   }) => request<Version[]>('/api/versions/group', { method: 'PATCH', body: JSON.stringify(body) }),
   archiveAllVersions: (projectId: number) =>
     request<{ ok: true }>('/api/versions/archive-all', {

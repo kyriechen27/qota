@@ -18,6 +18,7 @@ export interface UploadJobOptions {
   version: string;
   releaseChannel?: string;
   notes?: string;
+  versionNotes?: string | null;
   isMandatory?: boolean;
   minVersion?: string | null;
   maxVersion?: string | null;
@@ -126,6 +127,7 @@ export function startUpload(opts: UploadJobOptions): UploadJobHandle {
       version: opts.version,
       releaseChannel: opts.releaseChannel,
       notes: opts.notes,
+      versionNotes: opts.versionNotes,
       isMandatory: opts.isMandatory,
       minVersion: opts.minVersion,
       maxVersion: opts.maxVersion,

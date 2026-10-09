@@ -11,7 +11,7 @@ import { makeStorage } from '../lib/s3';
 import { audit } from '../lib/audit';
 import { base64UrlEncode } from '../utils/encoding';
 import { IS_CURRENT_SQL, NOTES_UNLOCKED_SQL, setCurrentVersion, clearUnusedCurrentVersions, syncLegacyCurrentVersion } from '../lib/current-versions';
-import { withNotePermissions, requireNotesEdit } from '../lib/version-notes';
+import { withNotePermissions, requireNotesEdit, requireVersionNotesEdit, VERSION_NOTES_UNLOCKED_SQL, clearUnusedVersionMetadata } from '../lib/version-notes';
 
 export const versionRoutes = new Hono<AppEnv>();
 
@@ -30,6 +30,8 @@ interface VersionRow {
   content_type: string | null;
   notes: string | null;
   can_edit_notes?: boolean;
+  version_notes?: string | null;
+  can_edit_version_notes?: boolean;
   is_mandatory: number;
   is_current: number;
   min_version: string | null;
@@ -57,6 +59,8 @@ export function versionDto(r: VersionRow) {
     contentType: r.content_type,
     notes: r.notes,
     canEditNotes: !!r.can_edit_notes,
+    versionNotes: r.version_notes ?? null,
+    canEditVersionNotes: !!r.can_edit_version_notes,
     isMandatory: !!r.is_mandatory,
     isCurrent: !!r.is_current,
     minVersion: r.min_version,
@@ -176,13 +180,17 @@ type GroupPatchBody = {
   projectId: number;
   version: string;
   notes?: string | null;
+  versionNotes?: string | null;
   isCurrent?: boolean;
   status?: 'ready' | 'archived';
 };
 
-function validateVersionPatch(body: { notes?: string | null; isCurrent?: boolean; status?: string }) {
+function validateVersionPatch(body: { notes?: string | null; versionNotes?: string | null; isCurrent?: boolean; status?: string }) {
   if (body.notes !== undefined && body.notes !== null && typeof body.notes !== 'string') {
     throw badRequest('notes must be a string or null');
+  }
+  if (body.versionNotes !== undefined && body.versionNotes !== null && typeof body.versionNotes !== 'string') {
+    throw badRequest('versionNotes must be a string or null');
   }
   if (body.isCurrent !== undefined && typeof body.isCurrent !== 'boolean') {
     throw badRequest('isCurrent must be a boolean');
@@ -210,33 +218,53 @@ versionRoutes.patch('/group', async (c) => {
   const rows = existing.results ?? [];
   if (rows.length === 0) throw notFound('version not found');
   if (body.notes !== undefined) await requireNotesEdit(c.env.DB, c.get('user')!, rows);
+  const versionCreator = body.versionNotes !== undefined
+    ? await requireVersionNotesEdit(c.env.DB, c.get('user')!, rows[0]!)
+    : undefined;
+  const editsNotes = body.notes !== undefined || body.versionNotes !== undefined;
+  // If the last file was deleted and this label recreated during validation,
+  // a combined request must not act on the new creator's label.
+  const creatorGuard = versionCreator === undefined ? '' : `AND EXISTS (
+    SELECT 1 FROM version_metadata vm
+     WHERE vm.project_id = versions.project_id AND vm.version = versions.version AND vm.created_by = ?
+  )`;
+  const creatorArgs = versionCreator === undefined ? [] : [versionCreator];
   if (body.isCurrent && (body.status === 'archived' ||
     (body.status !== 'ready' && !rows.some((row) => row.status === 'ready')))) {
     throw badRequest('only ready versions can be current');
   }
   const now = Date.now();
   const changes: D1PreparedStatement[] = [];
+  const noteChangeIndexes: number[] = [];
+  if (body.versionNotes !== undefined) {
+    noteChangeIndexes.push(changes.length);
+    changes.push(c.env.DB.prepare(
+      `UPDATE version_metadata SET notes = ?, updated_at = ?
+        WHERE project_id = ? AND version = ? AND created_by = ? AND ${VERSION_NOTES_UNLOCKED_SQL}`,
+    ).bind(body.versionNotes, now, body.projectId, body.version, versionCreator));
+  }
   if (body.notes !== undefined) {
+    noteChangeIndexes.push(changes.length);
     changes.push(c.env.DB.prepare(
       `UPDATE versions SET notes = ?, updated_at = ?
         WHERE project_id = ? AND version = ? AND status != 'pending'
-          AND id IN (${rows.map(() => '?').join(',')}) AND ${NOTES_UNLOCKED_SQL}`,
-    ).bind(body.notes, now, body.projectId, body.version, ...rows.map((row) => row.id)));
+          AND id IN (${rows.map(() => '?').join(',')}) AND ${NOTES_UNLOCKED_SQL} ${creatorGuard}`,
+    ).bind(body.notes, now, body.projectId, body.version, ...rows.map((row) => row.id), ...creatorArgs));
   }
   if (body.status !== undefined) {
     changes.push(c.env.DB.prepare(
       `UPDATE versions SET status = ?, updated_at = ? WHERE project_id = ? AND version = ? AND status = ?
-        ${body.notes !== undefined ? `AND ${NOTES_UNLOCKED_SQL}` : ''}`,
-    ).bind(body.status, now, body.projectId, body.version, body.status === 'archived' ? 'ready' : 'archived'));
+        ${editsNotes ? `AND ${NOTES_UNLOCKED_SQL}` : ''} ${creatorGuard}`,
+    ).bind(body.status, now, body.projectId, body.version, body.status === 'archived' ? 'ready' : 'archived', ...creatorArgs));
   }
   if (body.isCurrent !== undefined) {
-    changes.push(setCurrentVersion(c.env.DB, body.projectId, body.version, body.isCurrent, body.notes !== undefined));
+    changes.push(setCurrentVersion(c.env.DB, body.projectId, body.version, body.isCurrent, editsNotes, versionCreator));
   }
   if (changes.length) {
     changes.push(clearUnusedCurrentVersions(c.env.DB, body.projectId));
     changes.push(syncLegacyCurrentVersion(c.env.DB, body.projectId, now));
     const result = await c.env.DB.batch(changes);
-    if (body.notes !== undefined && result[0]?.meta.changes === 0) {
+    if (noteChangeIndexes.some((index) => result[index]?.meta.changes === 0)) {
       throw conflict('version changed; cancel current usage before editing notes');
     }
     await audit(c, {
@@ -435,6 +463,7 @@ versionRoutes.delete('/:id', async (c) => {
   }
   await c.env.DB.batch([
     c.env.DB.prepare('DELETE FROM versions WHERE id = ?').bind(id),
+    clearUnusedVersionMetadata(c.env.DB, row.project_id, row.version),
     clearUnusedCurrentVersions(c.env.DB, row.project_id),
     syncLegacyCurrentVersion(c.env.DB, row.project_id, Date.now()),
   ]);

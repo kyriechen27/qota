@@ -14,7 +14,7 @@ export default function ProjectDetail() {
   const [project, setProject] = useState<Project | null>(null);
   const [versions, setVersions] = useState<Version[]>([]);
   const [expandedVersionGroups, setExpandedVersionGroups] = useState<Set<string>>(() => new Set());
-  const [notesDialog, setNotesDialog] = useState<{ version: string; items: Version[] } | null>(null);
+  const [notesDialog, setNotesDialog] = useState<{ version: string; items: Version[]; scope: 'version' | 'file' } | null>(null);
   const [versionBusy, setVersionBusy] = useState(false);
   const versionBusyRef = useRef(false);
   const [tokens, setTokens] = useState<ApiToken[]>([]);
@@ -282,30 +282,32 @@ export default function ProjectDetail() {
     [...statusCounts.entries()]
       .map(([status, count]) => `${t(`status.${status}`)}${count > 1 ? ` x${count}` : ''}`)
       .join(' / ');
-  const renderNotes = (items: Version[]) => {
-    const noteGroups = groupNotes(items);
-    const preview = noteGroups.find((entry) => entry.notes)?.notes;
-    const versionLabel = items[0]!.version;
+  const renderNotes = (items: Version[], scope: 'version' | 'file' = 'file') => {
+    const first = items[0]!;
+    const preview = scope === 'version' ? first.versionNotes : first.notes;
+    const versionLabel = first.version;
     const current = versions.some((item) => item.version === versionLabel && item.isCurrent);
-    if (!preview && !current && !items.some((item) => item.canEditNotes)) return <span className="muted">-</span>;
+    const canEdit = scope === 'version' ? first.canEditVersionNotes : first.canEditNotes;
+    const label = t(scope === 'version' ? 'pd.viewVersionNotes' : 'pd.viewFileNotes', {
+      version: versionLabel, filename: first.filename, channel: first.releaseChannel,
+    });
     return (
       <button
         type="button"
-        className={`version-notes-preview${noteGroups.length > 1 ? ' has-multiple' : ''}${preview ? '' : ' is-empty'}`}
-        title={t('pd.viewVersionNotes', { version: versionLabel })}
-        aria-label={t('pd.viewVersionNotes', { version: versionLabel })}
+        className={`version-notes-preview${preview ? '' : ' is-empty'}`}
+        title={label}
+        aria-label={label}
         onClick={(e) => {
           e.stopPropagation();
-          setNotesDialog({ version: versionLabel, items });
+          setNotesDialog({ version: versionLabel, items, scope });
         }}
       >
         <span className="version-notes-content">
           <span className="version-notes-excerpt">
-            {preview || t(current ? 'pd.noNotes' : 'pd.addNotes')}
+            {preview || t(scope === 'version'
+              ? !current && canEdit ? 'pd.addVersionNotes' : 'pd.noVersionNotes'
+              : !current && canEdit ? 'pd.addFileNotes' : 'pd.noFileNotes')}
           </span>
-          {noteGroups.length > 1 && (
-            <span className="version-notes-more">{t('pd.notesVariants', { count: noteGroups.length })}</span>
-          )}
         </span>
         <VersionIcon name="notes" />
       </button>
@@ -433,7 +435,6 @@ export default function ProjectDetail() {
           {groups.map((group) => {
             const [first] = group.items;
             if (!first) return null;
-            if (group.items.length === 1) return renderVersionRow(first);
 
             const groupKey = `${archived ? 'archived' : 'active'}:${group.label}`;
             const expanded = expandedVersionGroups.has(groupKey);
@@ -467,7 +468,7 @@ export default function ProjectDetail() {
                       </div>
                     </div>
                   </td>
-                  <td className="version-notes-cell">{renderNotes(group.items)}</td>
+                  <td className="version-notes-cell">{renderNotes(group.items, 'version')}</td>
                   <td>
                     <span className="version-channel-list">
                       {group.channels.slice(0, 2).map((ch) => <Fragment key={ch}>{renderChannelTag(ch)}</Fragment>)}
@@ -664,12 +665,20 @@ export default function ProjectDetail() {
       {notesDialog && (
         <VersionNotesDialog
           version={notesDialog.version}
+          showVersionNotes={notesDialog.scope === 'version'}
+          versionNotes={versions.find((v) => v.version === notesDialog.version)?.versionNotes ?? null}
+          canEditVersionNotes={versions.find((v) => v.version === notesDialog.version)?.canEditVersionNotes ?? false}
           items={versions.filter((v) => notesDialog.items.some((item) => item.id === v.id))}
           current={versions.some((v) => v.version === notesDialog.version && v.isCurrent)}
           onClose={() => setNotesDialog(null)}
           onSave={async (versionId, updatedNotes) => {
             const updated = await api.updateVersion(versionId, { notes: updatedNotes });
             patchVersion(versionId, updated);
+          }}
+          onSaveVersion={async (versionNotes) => {
+            const updated = await api.updateVersionGroup({ projectId, version: notesDialog.version, versionNotes });
+            const byId = new Map(updated.map((v) => [v.id, v]));
+            setVersions((items) => items.map((item) => byId.get(item.id) ?? item));
           }}
         />
       )}
@@ -681,6 +690,7 @@ export default function ProjectDetail() {
           defaultChannel={project.defaultChannel || 'stable'}
           channels={channelList}
           versions={versionList}
+          existingVersions={versions}
           onClose={() => setShowUpload(false)}
           onRefresh={load}
         />
@@ -848,6 +858,8 @@ type UploadQueueItem = {
   id: number;
   file: File;
   channel: string;
+  notes: string;
+  notesExpanded: boolean;
   attempted: boolean;
   status: UploadQueueStatus;
   loaded: number;
@@ -861,6 +873,7 @@ function UploadFilesDialog({
   defaultChannel,
   channels,
   versions,
+  existingVersions,
   onClose,
   onRefresh,
 }: {
@@ -868,6 +881,7 @@ function UploadFilesDialog({
   defaultChannel: string;
   channels: string[];
   versions: string[];
+  existingVersions: Version[];
   onClose: () => void;
   onRefresh: () => Promise<void>;
 }) {
@@ -880,7 +894,7 @@ function UploadFilesDialog({
   const jobRef = useRef<UploadJobHandle | null>(null);
   const [queue, setQueue] = useState<UploadQueueItem[]>([]);
   const [version, setVersion] = useState('');
-  const [notes, setNotes] = useState('');
+  const [versionNotes, setVersionNotes] = useState('');
   const [mandatory, setMandatory] = useState(false);
   const [busy, setBusy] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -936,7 +950,7 @@ function UploadFilesDialog({
         continue;
       }
       keys.add(key);
-      added.push({ id: nextId.current++, file, channel: defaultChannel, attempted: false, status: 'waiting', loaded: 0 });
+      added.push({ id: nextId.current++, file, channel: defaultChannel, notes: '', notesExpanded: false, attempted: false, status: 'waiting', loaded: 0 });
     }
     setQueue((items) => [...items, ...added]);
     setSelectionError(duplicates.size ? t('pd.duplicateSelection', { names: [...duplicates].join('、'), channel: defaultChannel }) : null);
@@ -955,6 +969,8 @@ function UploadFilesDialog({
   async function runQueue(items: UploadQueueItem[], overwriteIds: Set<number>) {
     setStarted(true);
     setConflict(null);
+    const previousVersionNotes = existingVersions.find((item) => item.version === version)?.versionNotes ?? '';
+    const uploadVersionNotes = versionNotes === previousVersionNotes ? undefined : versionNotes.trim() ? versionNotes : null;
     const ids = new Set(items.map((item) => item.id));
     setQueue((all) => all.map((item) => ids.has(item.id) ? { ...item, status: 'waiting', loaded: 0, error: undefined } : item));
     try {
@@ -967,7 +983,8 @@ function UploadFilesDialog({
             file: item.file,
             version,
             releaseChannel: item.channel,
-            notes: notes || undefined,
+            notes: item.notes || undefined,
+            versionNotes: uploadVersionNotes,
             isMandatory: mandatory,
             overwriteExisting: overwriteIds.has(item.id),
             concurrency: 4,
@@ -1088,6 +1105,8 @@ function UploadFilesDialog({
   const failedCount = queue.filter((item) => item.status === 'error').length;
   const cancelledCount = queue.filter((item) => item.status === 'cancelled').length;
   const totalSize = queue.reduce((sum, item) => sum + item.file.size, 0);
+  const existingVersion = existingVersions.find((item) => item.version === version);
+  const versionNotesLocked = !!existingVersion && !existingVersion.canEditVersionNotes;
 
   return (
     <dialog
@@ -1158,6 +1177,35 @@ function UploadFilesDialog({
                         onClick={() => { setQueue((items) => items.filter((entry) => entry.id !== item.id)); setConflict(null); }}
                       >×</button>
                     </div>
+                    <div className="upload-file-notes">
+                      <button
+                        type="button"
+                        className="upload-file-notes-toggle"
+                        aria-expanded={item.notesExpanded}
+                        aria-controls={`upload-notes-${item.id}`}
+                        aria-label={t('pd.fileNotesLabel', { index: index + 1, filename: item.file.name })}
+                        onClick={() => updateItem(item.id, { notesExpanded: !item.notesExpanded })}
+                      >
+                        <VersionIcon name="notes" />
+                        {t(item.notes.trim() ? 'pd.fileNotesFilled' : 'pd.fileNotes')}
+                        <span aria-hidden="true">{item.notesExpanded ? '−' : '+'}</span>
+                      </button>
+                      {item.notesExpanded && (
+                        <textarea
+                          id={`upload-notes-${item.id}`}
+                          aria-label={t('pd.fileNotesLabel', { index: index + 1, filename: item.file.name })}
+                          value={item.notes}
+                          onChange={(e) => {
+                            if (busyRef.current || item.attempted) return;
+                            updateItem(item.id, { notes: e.target.value });
+                            setConflict(null);
+                          }}
+                          placeholder={t('pd.fileNotesPlaceholder')}
+                          rows={2}
+                          disabled={busy || item.attempted}
+                        />
+                      )}
+                    </div>
                     {active && <div className="progress" role="progressbar" aria-label={item.file.name} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percentage}><div style={{ width: `${percentage}%` }} /></div>}
                     {item.error && <p className="upload-file-error" role="alert">{item.error}</p>}
                     {duplicateIds.has(item.id) && <p className="upload-file-error" role="alert">{t('pd.duplicateFileChannel', { channel: item.channel })}</p>}
@@ -1168,11 +1216,26 @@ function UploadFilesDialog({
           ) : <div className="upload-file-empty">{t('pd.fileSelectionHint')}</div>}
           <label>
             <span className="lbl">{t('pd.fldVersion')}</span>
-            <VersionField value={version} onChange={(value) => { setVersion(value); setConflict(null); }} options={versions} disabled={busy || started} />
+            <VersionField value={version} onChange={(value) => {
+              setVersion(value);
+              setVersionNotes(existingVersions.find((item) => item.version === value)?.versionNotes ?? '');
+              setConflict(null);
+            }} options={versions} disabled={busy || started} />
           </label>
           <label>
-            <span className="lbl">{t('pd.sharedNotes')}</span>
-            <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} disabled={busy || started} style={{ width: '100%' }} />
+            <span className="lbl">{t('pd.versionNotes')}</span>
+            <textarea
+              className="upload-version-notes"
+              aria-label={t('pd.versionNotes')}
+              value={versionNotes}
+              onChange={(e) => setVersionNotes(e.target.value)}
+              rows={3}
+              disabled={busy || started}
+              readOnly={versionNotesLocked}
+            />
+            <span className="upload-notes-hint">{t(versionNotesLocked
+              ? existingVersions.some((item) => item.version === version && item.isCurrent) ? 'pd.notesCurrentLocked' : 'pd.versionNotesPermissionHint'
+              : 'pd.uploadVersionNotesHint')}</span>
           </label>
           <label className="upload-mandatory"><input type="checkbox" checked={mandatory} onChange={(e) => setMandatory(e.target.checked)} disabled={busy || started} /> {t('pd.fldMandatory')}</label>
           {started && <p className="upload-batch-lock-hint">{t('pd.batchSettingsLocked')}</p>}
@@ -1236,24 +1299,33 @@ function VersionNotesDialog({
   version,
   items,
   current,
+  showVersionNotes,
+  versionNotes,
+  canEditVersionNotes,
   onClose,
   onSave,
+  onSaveVersion,
 }: {
   version: string;
   items: Version[];
   current: boolean;
+  showVersionNotes: boolean;
+  versionNotes: string | null;
+  canEditVersionNotes: boolean;
   onClose: () => void;
   onSave: (id: number, notes: string | null) => Promise<void>;
+  onSaveVersion: (notes: string | null) => Promise<void>;
 }) {
   const { t } = useI18n();
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [editingId, setEditingId] = useState<number | null>(null);
+  const [editingVersion, setEditingVersion] = useState(false);
   const [draft, setDraft] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const savingRef = useRef(false);
   const editing = items.find((item) => item.id === editingId);
-  const editable = !current && editing?.canEditNotes;
+  const editable = !current && (editingVersion ? canEditVersionNotes : editing?.canEditNotes);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -1263,13 +1335,16 @@ function VersionNotesDialog({
 
   async function save(e: FormEvent) {
     e.preventDefault();
-    if (!editing || !editable || savingRef.current) return;
+    if ((!editingVersion && !editing) || !editable || savingRef.current) return;
     savingRef.current = true;
     setSaving(true);
     setError(null);
     try {
-      await onSave(editing.id, draft.trim() ? draft : null);
+      const value = draft.trim() ? draft : null;
+      if (editingVersion) await onSaveVersion(value);
+      else await onSave(editing!.id, value);
       setEditingId(null);
+      setEditingVersion(false);
     } catch (e: any) {
       setError(e?.message ?? String(e));
     } finally {
@@ -1277,6 +1352,35 @@ function VersionNotesDialog({
       setSaving(false);
     }
   }
+
+  const editorLabel = editingVersion ? t('pd.versionNotes') : editing
+    ? t('pd.editFileNotes', { channel: editing.releaseChannel, filename: editing.filename })
+    : t('pd.fileNotes');
+  const renderEditor = () => (
+    <form onSubmit={save}>
+      <label>
+        <span className="lbl">{editorLabel}</span>
+        <textarea
+          className="version-notes-editor"
+          aria-label={editorLabel}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          disabled={saving || !editable}
+          autoFocus
+        />
+      </label>
+      {!editingVersion && <p className="notes-layer-description">{t('pd.notesEditHint')}</p>}
+      {error && <p className="error" role="alert">{error}</p>}
+      <div className="dialog-actions">
+        <button type="button" disabled={saving} onClick={() => { setEditingId(null); setEditingVersion(false); setError(null); }}>
+          {t('common.cancel')}
+        </button>
+        <button type="submit" className="primary" disabled={saving || !editable}>
+          {saving ? t('pd.savingNotes') : t('common.save')}
+        </button>
+      </div>
+    </form>
+  );
 
   return (
     <dialog
@@ -1296,69 +1400,68 @@ function VersionNotesDialog({
       }}
     >
       <div className="version-notes-header">
-        <h3 id="version-notes-title">{t('pd.colNotes')} <span className="code">{version}</span></h3>
+        <h3 id="version-notes-title">{t(showVersionNotes ? 'pd.notesDetails' : 'pd.fileNotes')} <span className="code">{version}</span></h3>
         <button type="button" onClick={onClose} disabled={saving} autoFocus>{t('common.close')}</button>
       </div>
-      {current ? (
-        <p className="version-notes-hint">{t('pd.notesCurrentLocked')}</p>
-      ) : items.some((item) => !item.canEditNotes) ? (
-        <p className="version-notes-hint">{t('pd.notesPermissionHint')}</p>
-      ) : null}
+      {current && <p className="version-notes-hint">{t('pd.notesCurrentLocked')}</p>}
       <div className="version-notes-body">
-        {editing ? (
-          <form onSubmit={save}>
-            <label>
-              <span className="lbl">{t('pd.editFileNotes', { channel: editing.releaseChannel, filename: editing.filename })}</span>
-              <textarea
-                className="version-notes-editor"
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
-                disabled={saving || !editable}
-                autoFocus
-              />
-            </label>
-            <p className="muted">{t('pd.notesEditHint')}</p>
-            {error && <p className="error" role="alert">{error}</p>}
-            <div className="dialog-actions">
-              <button type="button" disabled={saving} onClick={() => { setEditingId(null); setError(null); }}>
-                {t('common.cancel')}
-              </button>
-              <button type="submit" className="primary" disabled={saving || !editable}>
-                {saving ? t('pd.savingNotes') : t('common.save')}
-              </button>
+        {showVersionNotes && (
+          <section className="notes-layer version-level-notes">
+            <div className="notes-layer-heading">
+              <h4>{t('pd.versionNotes')}</h4>
+              {canEditVersionNotes && !current && !editingVersion && (
+                <button
+                  type="button"
+                  disabled={saving || editingId !== null}
+                  onClick={() => { setEditingVersion(true); setDraft(versionNotes ?? ''); setError(null); }}
+                >
+                  {t('pd.editVersionNotes')}
+                </button>
+              )}
             </div>
-          </form>
-        ) : groupNotes(items).map((entry) => (
-          <section className="version-notes-section" key={entry.items[0]!.id}>
-            <div className="version-note-files">
-              {entry.items.map((item) => (
-                <div className="version-note-file-row" key={item.id}>
-                  <div className="version-note-file-identity">
-                    <span className="tag">{item.releaseChannel}</span>
-                    <span className="version-note-filename" title={item.filename}>{item.filename}</span>
-                  </div>
-                  {item.canEditNotes && !current && (
-                    <button
-                      type="button"
-                      title={t('pd.editFileNotes', { channel: item.releaseChannel, filename: item.filename })}
-                      aria-label={t('pd.editFileNotes', { channel: item.releaseChannel, filename: item.filename })}
-                      onClick={() => {
-                        setEditingId(item.id);
-                        setDraft(item.notes ?? '');
-                        setError(null);
-                      }}
-                    >
-                      {t('pd.editNotes')}
-                    </button>
-                  )}
-                </div>
-              ))}
-            </div>
-            <div className={`version-notes-text${entry.notes ? '' : ' muted'}`}>
-              {entry.notes || t('pd.noNotes')}
-            </div>
+            <p className="notes-layer-description">{t('pd.versionNotesEditHint')}</p>
+            {!current && !canEditVersionNotes && <p className="version-notes-hint">{t('pd.versionNotesPermissionHint')}</p>}
+            {editingVersion ? renderEditor() : (
+              <div className={`version-notes-text${versionNotes ? '' : ' muted'}`}>{versionNotes || t('pd.noVersionNotes')}</div>
+            )}
           </section>
-        ))}
+        )}
+        <section className="notes-layer file-level-notes">
+          {showVersionNotes && <div className="notes-layer-heading"><h4>{t('pd.fileNotes')}</h4></div>}
+          {!current && items.some((item) => !item.canEditNotes) && <p className="version-notes-hint">{t('pd.notesPermissionHint')}</p>}
+          {editing ? renderEditor() : groupNotes(items).map((entry) => (
+            <section className="version-notes-section" key={entry.items[0]!.id}>
+              <div className="version-note-files">
+                {entry.items.map((item) => (
+                  <div className="version-note-file-row" key={item.id}>
+                    <div className="version-note-file-identity">
+                      <span className="tag">{item.releaseChannel}</span>
+                      <span className="version-note-filename" title={item.filename}>{item.filename}</span>
+                    </div>
+                    {item.canEditNotes && !current && (
+                      <button
+                        type="button"
+                        disabled={saving || editingVersion}
+                        title={t('pd.editFileNotes', { channel: item.releaseChannel, filename: item.filename })}
+                        aria-label={t('pd.editFileNotes', { channel: item.releaseChannel, filename: item.filename })}
+                        onClick={() => {
+                          setEditingId(item.id);
+                          setDraft(item.notes ?? '');
+                          setError(null);
+                        }}
+                      >
+                        {t('pd.editNotes')}
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+              <div className={`version-notes-text${entry.notes ? '' : ' muted'}`}>
+                {entry.notes || t('pd.noFileNotes')}
+              </div>
+            </section>
+          ))}
+        </section>
       </div>
     </dialog>
   );

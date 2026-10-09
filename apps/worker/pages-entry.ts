@@ -22,6 +22,8 @@ import migration0005 from './migrations/0005_current_version.sql';
 import migration0006 from './migrations/0006_global_roles.sql';
 import migration0007 from './migrations/0007_current_versions.sql';
 import migration0008 from './migrations/0008_multiple_files.sql';
+import migration0009 from './migrations/0009_version_metadata.sql';
+import migration0010 from './migrations/0010_upload_version_notes.sql';
 
 interface PagesEnv extends Bindings {
   ASSETS: Fetcher;
@@ -60,6 +62,8 @@ async function ensureSchema(env: PagesEnv): Promise<void> {
       await env.DB.prepare(stmt).run();
     }
     await ensureMultipleFiles(env);
+    await ensureVersionMetadata(env);
+    await ensureUploadVersionNotes(env);
     schemaReady = true;
     console.log('[schema] initialized D1 tables on first run');
     return;
@@ -73,6 +77,8 @@ async function ensureSchema(env: PagesEnv): Promise<void> {
   await ensureGlobalRoles(env, statements(migration0006));
   await ensureCurrentVersions(env);
   await ensureMultipleFiles(env);
+  await ensureVersionMetadata(env);
+  await ensureUploadVersionNotes(env);
   schemaReady = true;
 }
 
@@ -118,6 +124,25 @@ async function ensureMultipleFiles(env: PagesEnv): Promise<void> {
     // Rebuild and restore dependent references in one atomic transaction.
     await env.DB.batch(statements(migration0008).map((stmt) => env.DB.prepare(stmt)));
     console.log('[schema] enabled multiple files per version and channel');
+  }
+}
+
+async function ensureVersionMetadata(env: PagesEnv): Promise<void> {
+  const row = await env.DB.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'version_metadata'",
+  ).first();
+  if (!row) {
+    await env.DB.batch(statements(migration0009).map((stmt) => env.DB.prepare(stmt)));
+    console.log('[schema] added independent version notes');
+  }
+}
+
+async function ensureUploadVersionNotes(env: PagesEnv): Promise<void> {
+  const row = await env.DB.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'upload_sessions'")
+    .first<{ sql: string }>();
+  if (row && !row.sql.includes('has_version_notes')) {
+    await env.DB.batch(statements(migration0010).map((stmt) => env.DB.prepare(stmt)));
+    console.log('[schema] added upload version notes');
   }
 }
 

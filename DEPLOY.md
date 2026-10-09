@@ -186,8 +186,9 @@ Deploy. **On first request the API auto-creates the D1 schema and the admin user
 `main` commit using the same bindings and build settings.
 
 The bundled Pages entry automatically upgrades the database on the first API
-request, including multiple current versions (`0007`) and multiple files per
-version/channel (`0008`). Existing files, metadata and upload references are
+request, including multiple current versions (`0007`), multiple files per
+version/channel (`0008`), independent version notes (`0009`), and version notes
+saved during upload (`0010`). Existing files, metadata and upload references are
 preserved; these Pages upgrades require no manual SQL. Future migrations must
 also be wired into `pages-entry.ts` to use this automatic upgrade path. Standalone
 Worker deployments still apply migrations with `npm run d1:migrate:remote`

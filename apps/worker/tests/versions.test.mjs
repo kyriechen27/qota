@@ -17,12 +17,13 @@ const migrationsDir = new URL('../migrations/', import.meta.url);
 const migrations = readdirSync(migrationsDir).filter((name) => name.endsWith('.sql')).sort();
 const secret = 'isolated-version-regression-tests';
 
-async function fixture(t, { beforeCurrentMigration = false, beforeMultiFileMigration = false } = {}) {
+async function fixture(t, { beforeCurrentMigration = false, beforeMultiFileMigration = false, beforeVersionNotesMigration = false } = {}) {
   const db = createSqliteD1(':memory:');
   t.after(() => db._db.close());
   for (const migration of migrations) {
     if (beforeCurrentMigration && migration >= '0007_') continue;
     if (beforeMultiFileMigration && migration >= '0008_') continue;
+    if (beforeVersionNotesMigration && migration >= '0009_') continue;
     db._db.exec(readFileSync(new URL(migration, migrationsDir), 'utf8'));
   }
   db._db.exec(`
@@ -88,6 +89,12 @@ async function fixture(t, { beforeCurrentMigration = false, beforeMultiFileMigra
         filename, size, notes, uploaded_by, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, 1024, ?, ?, ?, ?)
     `).run(projectId, label, channel, status, key, filename, notes, uploadedBy, createdAt, createdAt);
+    if (db._db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'version_metadata'").get()) {
+      db._db.prepare(`
+        INSERT OR IGNORE INTO version_metadata (project_id, version, notes, created_by, created_at, updated_at)
+        VALUES (?, ?, NULL, ?, ?, ?)
+      `).run(projectId, label, uploadedBy, createdAt, createdAt);
+    }
     return Number(result.lastInsertRowid);
   }
   async function group(label, fields, projectId = 1, options = {}) {
@@ -509,24 +516,13 @@ test('upload SQL guard preserves metadata if current is selected after its final
       totalSize: 1024, overwriteExisting: true, notes: 'Changed notes',
     },
   });
-  const prepare = f.db.prepare.bind(f.db);
+  const batch = f.db.batch.bind(f.db);
   let interleaved = false;
-  f.db.prepare = (sql) => {
-    const statement = prepare(sql);
-    if (/UPDATE versions\s+SET status = 'ready'/.test(sql)) {
-      const bind = statement.bind.bind(statement);
-      statement.bind = (...args) => {
-        const bound = bind(...args);
-        const run = bound.run.bind(bound);
-        bound.run = async () => {
-          f.db._db.prepare('INSERT INTO project_current_versions (project_id, version) VALUES (1, ?)').run('v1');
-          interleaved = true;
-          return run();
-        };
-        return bound;
-      };
-    }
-    return statement;
+  f.db.batch = async (statements) => {
+    f.db.batch = batch;
+    f.db._db.prepare('INSERT INTO project_current_versions (project_id, version) VALUES (1, ?)').run('v1');
+    interleaved = true;
+    return batch(statements);
   };
   await f.request('/api/upload/complete', {
     method: 'POST', userId: 2, status: 409,
@@ -603,7 +599,10 @@ test('multi-file migration preserves old version metadata, live upload reference
       is_mandatory = 1, min_version = 'v0', max_version = 'v9', rollout_percentage = 75, device_group_id = 42
     WHERE id = ?
   `).run('a'.repeat(64), ready);
-  await f.group('v1', { isCurrent: true });
+  f.db._db.exec(`
+    INSERT INTO project_current_versions (project_id, version) VALUES (1, 'v1');
+    UPDATE projects SET current_version = 'v1' WHERE id = 1;
+  `);
   f.db._db.prepare(`
     INSERT INTO upload_sessions (id, project_id, version_id, r2_key, filename, total_size, part_size,
       upload_id, target_version, release_channel, notes, status, initiated_by, created_at)
@@ -626,7 +625,8 @@ test('multi-file migration preserves old version metadata, live upload reference
   assert.ok(pendingMigrations.length > 0, 'the multi-file migration must exist');
   assert.equal(runMigrations(f.db, fileURLToPath(migrationsDir)), pendingMigrations.length);
   assert.deepEqual(f.db._db.prepare('SELECT * FROM versions ORDER BY id').all(), versionsBefore);
-  assert.deepEqual(f.db._db.prepare('SELECT * FROM upload_sessions ORDER BY id').all(), sessionsBefore);
+  const originalSessionColumns = Object.keys(sessionsBefore[0]).join(', ');
+  assert.deepEqual(f.db._db.prepare(`SELECT ${originalSessionColumns} FROM upload_sessions ORDER BY id`).all(), sessionsBefore);
   assert.deepEqual(f.db._db.prepare('SELECT * FROM upload_parts').all(), partsBefore);
   assert.deepEqual(f.db._db.pragma('foreign_key_check'), []);
   assert.deepEqual(await f.current(), ['v1']);
@@ -750,3 +750,314 @@ test('device list and latest can select an exact filename within a shared versio
   assert.notEqual(latest.versionId, firmwareOld);
   await f.request('/api/download/device/latest?format=json&filename=missing.bin', { token, status: 404 });
 });
+
+function versionMetadata(f, version = 'v1', projectId = 1) {
+  return f.db._db.prepare('SELECT * FROM version_metadata WHERE project_id = ? AND version = ?').get(projectId, version);
+}
+
+test('version-note migration preserves file notes and current selections and derives the earliest uploader', async (t) => {
+  const f = await fixture(t, { beforeVersionNotesMigration: true });
+  f.version('same', 'ota', { filename: 'late.bin', uploadedBy: 7, notes: 'Shared historical notes', createdAt: 300 });
+  f.version('same', 'ota', { filename: 'early.bin', uploadedBy: 2, notes: 'Shared historical notes', createdAt: 100 });
+  f.version('different', 'ota', { notes: 'OTA instructions', uploadedBy: 2 });
+  f.version('different', 'flash', { notes: 'Flash instructions', uploadedBy: 7 });
+  f.version('null-empty', 'ota', { notes: null });
+  f.version('null-empty', 'flash', { notes: '' });
+  f.version('same', 'ota', { projectId: 2, notes: 'Other project notes', uploadedBy: 7 });
+  f.db._db.exec(`
+    INSERT INTO project_current_versions (project_id, version) VALUES (1, 'same');
+    UPDATE projects SET current_version = 'same' WHERE id = 1;
+    CREATE TABLE _node_migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);
+  `);
+  const filesBefore = f.db._db.prepare('SELECT * FROM versions ORDER BY id').all();
+  for (const migration of migrations.filter((name) => name < '0009_')) {
+    f.db._db.prepare('INSERT INTO _node_migrations (name, applied_at) VALUES (?, 1)').run(migration);
+  }
+  assert.ok(migrations.some((name) => name.startsWith('0009_')), 'version-note migration must exist');
+  runMigrations(f.db, fileURLToPath(migrationsDir));
+  assert.deepEqual(f.db._db.prepare('SELECT * FROM versions ORDER BY id').all(), filesBefore);
+  assert.equal(versionMetadata(f, 'same').notes, 'Shared historical notes');
+  assert.equal(versionMetadata(f, 'same').created_by, 2);
+  assert.equal(versionMetadata(f, 'same').created_at, 100);
+  assert.equal(versionMetadata(f, 'different').notes, null);
+  assert.equal(versionMetadata(f, 'null-empty').notes, null);
+  assert.equal(versionMetadata(f, 'same', 2).notes, 'Other project notes');
+  assert.equal(versionMetadata(f, 'same', 2).created_by, 7);
+  assert.deepEqual(await f.current(), ['same']);
+  const list = await f.request('/api/versions?projectId=1', { userId: 2 });
+  assert.ok(list.filter((v) => v.version === 'same').every((v) => v.versionNotes === 'Shared historical notes' && !v.canEditVersionNotes));
+  assert.ok(list.filter((v) => v.version === 'different').every((v) => v.versionNotes === null));
+  assert.deepEqual(f.db._db.pragma('foreign_key_check'), []);
+});
+
+test('version notes and per-file notes update and clear independently across detail and catalog responses', async (t) => {
+  const f = await fixture(t);
+  const first = f.version('v1', 'ota', { uploadedBy: 2, notes: 'First file instructions' });
+  const second = f.version('v1', 'flash', { uploadedBy: 7, notes: 'Second file instructions' });
+  const versionNotes = '版本总体说明\n\n' + '这是适用于整个版本的兼容性说明。'.repeat(300);
+  const updated = await f.group('v1', { versionNotes }, 1, { userId: 2 });
+  assert.ok(updated.every((v) => v.versionNotes === versionNotes && v.canEditVersionNotes));
+  assert.equal(f.row(first).notes, 'First file instructions');
+  assert.equal(f.row(second).notes, 'Second file instructions');
+  await f.request(`/api/versions/${first}`, { method: 'PATCH', userId: 2, body: { notes: 'Updated first file instructions' } });
+  assert.equal(versionMetadata(f).notes, versionNotes);
+  for (const path of ['/api/versions?projectId=1', '/api/versions/accessible']) {
+    const listed = await f.request(path, { userId: 2 });
+    assert.ok(listed.every((v) => v.versionNotes === versionNotes));
+    assert.equal(listed.find((v) => v.id === second).notes, 'Second file instructions');
+  }
+  assert.equal((await f.request(`/api/versions/${first}`, { userId: 2 })).versionNotes, versionNotes);
+  // The legacy bulk-file-notes API remains separate from the new parent field.
+  await f.group('v1', { notes: 'Bulk file instructions' });
+  assert.equal(versionMetadata(f).notes, versionNotes);
+  await f.group('v1', { versionNotes: null }, 1, { userId: 2 });
+  assert.equal(versionMetadata(f).notes, null);
+  assert.equal(f.row(first).notes, 'Bulk file instructions');
+  assert.equal(f.row(second).notes, 'Bulk file instructions');
+  await f.group('v1', { versionNotes: 'Keep this version note' }, 1, { userId: 2 });
+  await f.request(`/api/versions/${first}`, { method: 'PATCH', userId: 2, body: { notes: null } });
+  assert.equal(f.row(first).notes, null);
+  assert.equal(f.row(second).notes, 'Bulk file instructions');
+  assert.equal(versionMetadata(f).notes, 'Keep this version note');
+});
+
+test('version-note permissions follow the creator independently of file ownership and project boundaries', async (t) => {
+  const f = await fixture(t);
+  const original = f.version('v1', 'ota', { uploadedBy: 2 });
+  const added = f.version('v1', 'flash', { uploadedBy: 7 });
+  f.version('v1', 'ota', { projectId: 2, uploadedBy: 7 });
+  const ownerView = await f.request(`/api/versions/${added}`, { userId: 2 });
+  assert.equal(ownerView.canEditVersionNotes, true);
+  assert.equal(ownerView.canEditNotes, false);
+  const fileOwnerView = await f.request(`/api/versions/${added}`, { userId: 7 });
+  assert.equal(fileOwnerView.canEditVersionNotes, false);
+  assert.equal(fileOwnerView.canEditNotes, true);
+  await f.group('v1', { versionNotes: 'Denied' }, 1, { userId: 7, status: 403 });
+  await f.request(`/api/versions/${added}`, { method: 'PATCH', userId: 7, body: { notes: 'My own file note' } });
+  await f.group('v1', { versionNotes: 'Creator note' }, 1, { userId: 2 });
+  await f.group('v1', { versionNotes: 'Do not partially save', notes: 'Cannot edit another uploader file' }, 1, { userId: 2, status: 403 });
+  assert.equal(versionMetadata(f).notes, 'Creator note');
+  assert.equal(f.row(added).notes, 'My own file note');
+  await f.group('v1', { versionNotes: 'Other project denied' }, 2, { userId: 2, status: 403 });
+  assert.equal(versionMetadata(f, 'v1', 2).notes, null);
+  for (const userId of [1, 5, 6]) {
+    assert.equal((await f.request(`/api/versions/${original}`, { userId })).canEditVersionNotes, true);
+    await f.group('v1', { versionNotes: `Administrator ${userId}` }, 1, { userId });
+  }
+  for (const userId of [3, 4]) {
+    assert.equal((await f.request(`/api/versions/${original}`, { userId })).canEditVersionNotes, false);
+    await f.group('v1', { versionNotes: 'Denied read-only edit' }, 1, { userId, status: 403 });
+  }
+  assert.equal(versionMetadata(f).notes, 'Administrator 6');
+  assert.equal(f.row(added).notes, 'My own file note');
+});
+
+test('current usage locks both note levels and cannot be cancelled in the same editing request', async (t) => {
+  const f = await fixture(t);
+  const ready = f.version('v1', 'ota', { uploadedBy: 2, notes: 'Published file note' });
+  const archived = f.version('v1', 'flash', { uploadedBy: 7, status: 'archived', notes: 'Archived file note' });
+  await f.group('v1', { versionNotes: 'Published version note' }, 1, { userId: 2 });
+  await f.group('v1', { isCurrent: true });
+  const beforeMetadata = versionMetadata(f);
+  const beforeFiles = [f.row(ready), f.row(archived)];
+  for (const userId of [1, 2, 5, 6]) {
+    await f.group('v1', { versionNotes: 'Forbidden edit' }, 1, { userId, status: 409 });
+    const detail = await f.request(`/api/versions/${archived}`, { userId });
+    assert.equal(detail.canEditVersionNotes, false);
+    assert.equal(detail.canEditNotes, false);
+  }
+  await f.group('v1', {
+    versionNotes: 'Forbidden parent edit', notes: 'Forbidden file edit', isCurrent: false, status: 'archived',
+  }, 1, { status: 409 });
+  assert.deepEqual(versionMetadata(f), beforeMetadata);
+  assert.deepEqual([f.row(ready), f.row(archived)], beforeFiles);
+  assert.deepEqual(await f.current(), ['v1']);
+  await f.group('v1', { isCurrent: false });
+  await f.group('v1', { versionNotes: 'Editable after cancelling' }, 1, { userId: 2 });
+  assert.equal(versionMetadata(f).notes, 'Editable after cancelling');
+  assert.deepEqual([f.row(ready), f.row(archived)], beforeFiles);
+});
+
+test('a current-selection race blocks version and file note updates atomically', async (t) => {
+  const f = await fixture(t);
+  const id = f.version('v1', 'ota', { uploadedBy: 2, notes: 'Original file note' });
+  await f.group('v1', { versionNotes: 'Original version note' }, 1, { userId: 2 });
+  const beforeMetadata = versionMetadata(f);
+  const beforeFile = f.row(id);
+  const batch = f.db.batch.bind(f.db);
+  f.db.batch = async (statements) => {
+    f.db.batch = batch;
+    f.db._db.prepare('INSERT INTO project_current_versions (project_id, version) VALUES (1, ?)').run('v1');
+    return batch(statements);
+  };
+  await f.group('v1', { versionNotes: 'Concurrent parent edit', notes: 'Concurrent file edit', isCurrent: false, status: 'archived' }, 1, { userId: 2, status: 409 });
+  assert.deepEqual(versionMetadata(f), beforeMetadata);
+  assert.deepEqual(f.row(id), beforeFile);
+  assert.deepEqual(await f.current(), ['v1']);
+});
+
+test('first completed upload creates independent version metadata and later files preserve its creator and notes', async (t) => {
+  const f = await fixture(t);
+  trackStoredObjects(f);
+  const initialized = await initFile(f, 'first.bin', { notes: 'First file note', userId: 2 });
+  assert.equal(versionMetadata(f), undefined);
+  const first = await completeFile(f, initialized, { userId: 2 });
+  assert.equal(first.versionNotes, null);
+  assert.equal(first.notes, 'First file note');
+  assert.equal(first.canEditVersionNotes, true);
+  assert.equal(versionMetadata(f).created_by, 2);
+  await f.group('v1', { versionNotes: 'Version release summary' }, 1, { userId: 2 });
+  const before = versionMetadata(f);
+  const second = await completeFile(f, await initFile(f, 'second.bin', { notes: 'Second file note', userId: 7 }), { userId: 7 });
+  assert.equal(second.versionNotes, 'Version release summary');
+  assert.equal(second.notes, 'Second file note');
+  assert.equal(second.canEditVersionNotes, false);
+  assert.equal(second.canEditNotes, true);
+  assert.deepEqual(versionMetadata(f), before);
+  assert.equal(f.row(first.id).notes, 'First file note');
+});
+
+test('deleting files retains version metadata until the last artifact and recreating the label gets a new creator', async (t) => {
+  const f = await fixture(t);
+  trackStoredObjects(f);
+  const original = await completeFile(f, await initFile(f, 'first.bin', { userId: 2 }));
+  const remaining = await completeFile(f, await initFile(f, 'second.bin', { userId: 7 }), { userId: 7 });
+  await f.group('v1', { versionNotes: 'Retained version note' }, 1, { userId: 2 });
+  await f.request(`/api/versions/${remaining.id}`, { method: 'PATCH', body: { status: 'archived' } });
+  const before = versionMetadata(f);
+  await f.request(`/api/versions/${original.id}`, { method: 'DELETE', userId: 2 });
+  assert.deepEqual(versionMetadata(f), before);
+  await f.group('v1', { versionNotes: 'Creator can still edit after deleting their file' }, 1, { userId: 2 });
+  await f.request(`/api/versions/${remaining.id}`, { method: 'DELETE', userId: 7 });
+  assert.equal(versionMetadata(f), undefined);
+  const recreated = await completeFile(f, await initFile(f, 'new.bin', { userId: 7 }), { userId: 7 });
+  assert.equal(recreated.versionNotes, null);
+  assert.equal(recreated.canEditVersionNotes, true);
+  assert.equal(versionMetadata(f).created_by, 7);
+});
+
+test('multi-file uploads save shared version notes separately from each file and keep the first creator', async (t) => {
+  const f = await fixture(t);
+  trackStoredObjects(f);
+  const firstSession = await initFile(f, 'firmware.bin', { notes: 'Firmware instructions', versionNotes: 'Shared release summary' });
+  const secondSession = await initFile(f, 'resources.bin', { notes: 'Resource instructions', versionNotes: 'Shared release summary' });
+  const first = await completeFile(f, firstSession);
+  const second = await completeFile(f, secondSession);
+  assert.equal(first.versionNotes, 'Shared release summary');
+  assert.equal(second.versionNotes, 'Shared release summary');
+  assert.equal(first.notes, 'Firmware instructions');
+  assert.equal(second.notes, 'Resource instructions');
+  const parent = versionMetadata(f);
+  assert.equal(parent.created_by, 2);
+  const additional = await completeFile(f, await initFile(f, 'extra.bin', {
+    userId: 7, notes: 'Extra file instructions', versionNotes: 'Shared release summary',
+  }), { userId: 7 });
+  assert.equal(additional.versionNotes, 'Shared release summary');
+  assert.equal(additional.notes, 'Extra file instructions');
+  assert.equal(additional.canEditVersionNotes, false);
+  assert.deepEqual(versionMetadata(f), parent);
+});
+
+test('upload omission preserves version notes while explicit null clears only parent notes with permission', async (t) => {
+  const f = await fixture(t);
+  trackStoredObjects(f);
+  const first = await completeFile(f, await initFile(f, 'first.bin', { notes: 'File note', versionNotes: 'Release summary' }));
+  const added = await completeFile(f, await initFile(f, 'second.bin', { userId: 7, notes: 'Other file note' }), { userId: 7 });
+  assert.equal(added.versionNotes, 'Release summary');
+  await initFile(f, 'denied.bin', { userId: 7, versionNotes: 'Unauthorized parent change', status: 403 });
+  await initFile(f, 'denied-clear.bin', { userId: 7, versionNotes: null, status: 403 });
+  const clear = await completeFile(f, await initFile(f, 'clear.bin', { notes: 'Clear action file', versionNotes: null }));
+  assert.equal(clear.versionNotes, null);
+  assert.equal(versionMetadata(f).created_by, 2);
+  assert.equal(f.row(first.id).notes, 'File note');
+  assert.equal(f.row(added.id).notes, 'Other file note');
+  await f.group('v1', { versionNotes: 'Restored parent summary' }, 1, { userId: 2 });
+  const overwrite = await completeFile(f, await initFile(f, 'first.bin', { overwriteExisting: true }));
+  assert.equal(overwrite.versionNotes, 'Restored parent summary');
+  assert.equal(overwrite.notes, 'File note');
+});
+
+test('upload parent-note edits recheck permissions and current usage at initialization and completion', async (t) => {
+  const f = await fixture(t);
+  trackStoredObjects(f);
+  await completeFile(f, await initFile(f, 'original.bin', { versionNotes: 'Published summary' }));
+  await f.group('v1', { isCurrent: true });
+  await initFile(f, 'locked.bin', { versionNotes: 'Changed summary', status: 409 });
+  await initFile(f, 'locked-admin.bin', { userId: 1, versionNotes: null, status: 409 });
+  const unchanged = await completeFile(f, await initFile(f, 'append.bin', { userId: 7 }), { userId: 7 });
+  assert.equal(unchanged.versionNotes, 'Published summary');
+  await f.group('v1', { isCurrent: false });
+  const pending = await initFile(f, 'pending.bin', { versionNotes: 'New summary' });
+  await completeFile(f, pending, { userId: 7, status: 403 });
+  await f.group('v1', { isCurrent: true });
+  await completeFile(f, pending, { status: 409 });
+  assert.equal(versionMetadata(f).notes, 'Published summary');
+  assert.equal(await f.db.prepare("SELECT COUNT(*) AS count FROM versions WHERE filename = 'pending.bin'").first('count'), 0);
+});
+
+test('a conflicting concurrent upload cannot leave its parent-note changes behind', async (t) => {
+  const f = await fixture(t);
+  const stored = trackStoredObjects(f);
+  await completeFile(f, await initFile(f, 'original.bin', { versionNotes: 'Original summary' }));
+  const first = await initFile(f, 'same.bin', { versionNotes: 'First proposed summary' });
+  const second = await initFile(f, 'same.bin', { versionNotes: 'Second proposed summary' });
+  const complete = f.storage.completeMultipartUpload;
+  let release;
+  let arrivals = 0;
+  const bothInStorage = new Promise((resolve) => { release = resolve; });
+  f.storage.completeMultipartUpload = async (...args) => {
+    const result = await complete(...args);
+    if (++arrivals === 2) release();
+    await bothInStorage;
+    return result;
+  };
+  const results = await Promise.all([
+    completeFile(f, first, { status: [201, 409] }),
+    completeFile(f, second, { status: [201, 409] }),
+  ]);
+  const winners = results.filter((result) => typeof result.id === 'number');
+  assert.equal(winners.length, 1);
+  assert.equal(results.filter((result) => result.error).length, 1);
+  const winner = winners[0];
+  const expectedNotes = winner.r2Key === first.key ? 'First proposed summary' : 'Second proposed summary';
+  const losingKey = winner.r2Key === first.key ? second.key : first.key;
+  assert.equal(versionMetadata(f).notes, expectedNotes);
+  assert.equal(winner.versionNotes, expectedNotes);
+  assert.equal(await f.db.prepare('SELECT COUNT(*) AS count FROM versions').first('count'), 2);
+  assert.ok(stored.objects.has(winner.r2Key));
+  assert.ok(!stored.objects.has(losingKey));
+});
+
+for (const timing of ['during storage completion', 'before the final database batch']) {
+  test(`upload parent and new file stay unchanged when current is selected ${timing}`, async (t) => {
+    const f = await fixture(t);
+    const stored = trackStoredObjects(f);
+    const original = await completeFile(f, await initFile(f, 'original.bin', { notes: 'Original file note', versionNotes: 'Original parent note' }));
+    const beforeMetadata = versionMetadata(f);
+    const beforeFile = f.row(original.id);
+    const initialized = await initFile(f, 'added.bin', { notes: 'New file note', versionNotes: 'New parent note' });
+    const selectCurrent = () => f.db._db.prepare('INSERT INTO project_current_versions (project_id, version) VALUES (1, ?)').run('v1');
+    if (timing === 'during storage completion') {
+      const complete = f.storage.completeMultipartUpload;
+      f.storage.completeMultipartUpload = async (...args) => {
+        const result = await complete(...args);
+        selectCurrent();
+        return result;
+      };
+    } else {
+      const batch = f.db.batch.bind(f.db);
+      f.db.batch = async (statements) => {
+        f.db.batch = batch;
+        selectCurrent();
+        return batch(statements);
+      };
+    }
+    await completeFile(f, initialized, { status: 409 });
+    assert.deepEqual(versionMetadata(f), beforeMetadata);
+    assert.deepEqual(f.row(original.id), beforeFile);
+    assert.equal(await f.db.prepare('SELECT COUNT(*) AS count FROM versions').first('count'), 1);
+    assert.deepEqual(await f.current(), ['v1']);
+    assert.ok(stored.objects.has(original.r2Key));
+    assert.ok(!stored.objects.has(initialized.key));
+  });
+}

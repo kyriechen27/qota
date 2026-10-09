@@ -291,13 +291,20 @@ curl -L --output ota.bin -H "Authorization: Bearer qd_..." \
 版本列表支持整组归档和归档全部就绪版本,归档后显示在“版本”与“API 令牌”之间的
 “归档”区域,并可恢复。归档整个版本会取消它的当前使用标记;恢复不会自动重新标记。
 
-备注列最多显示两行,点击可查看全文。不同文件的备注按文件名和通道分别展示。已有备注仅允许
-原上传者或有权限的管理员修改;当前使用中的版本必须先单独取消当前使用,才能修改备注。
+版本汇总行显示独立的“版本备注”,展开后的每个文件显示自己的“文件备注”,两者分别保存,
+互不覆盖。单文件版本也有这两层备注。备注列最多显示两行,点击可查看全文或编辑。
+版本备注仅允许版本创建者（最早文件的上传者）或有权限的管理员修改;文件备注仅允许该文件
+原上传者或有权限的管理员修改。当前使用中的版本必须先单独取消当前使用,才能修改任一层备注。
+
+升级时原有文件备注保持不变。若一个版本的所有文件备注完全一致,会用它初始化版本备注;
+若文件备注不同,版本备注初始为空,可单独填写。
 
 ### 批量上传
 
-上传窗口支持一次选择多个文件,共用版本号和备注。每个文件可以单独选择或新建通道,
-默认使用项目的默认通道。同一版本、同一通道可以保留多个不同名称的文件,
+上传窗口支持一次选择多个文件,共用版本号。窗口下方的备注固定为“版本备注”,
+每个文件还可以在对应文件行单独选择或新建通道、填写“文件备注”,两者分别保存。
+通道默认使用项目的默认通道。选择已有版本会预填其版本备注;上传后也可在版本汇总行编辑。
+同一版本、同一通道可以保留多个不同名称的文件,
 同名文件也可以分配到不同通道;只有版本号、通道和文件名都相同时才需要确认覆盖。
 文件依次上传并分别显示进度和结果。部分文件失败不会中断其他文件,重试只处理未成功的文件。
 取消会停止当前上传和后续队列,已经成功上传的文件会保留。
@@ -311,7 +318,7 @@ curl -L --output ota.bin -H "Authorization: Bearer qd_..." \
 
 | Step | Request | Notes |
 | --- | --- | --- |
-| `POST /api/upload/init` | `{ projectId, filename, totalSize, version, releaseChannel?, expectedSha256?, partSizeHint?, notes?, isMandatory?, minVersion?, maxVersion?, rolloutPercentage?, overwriteExisting? }` | Worker 用 R2 S3 endpoint 调 CreateMultipartUpload,返回 `sessionId/uploadId/key/partSize/partCount/uploadedParts`。同版本、同通道、同文件名返回 409,设置 `overwriteExisting: true` 可明确覆盖该文件。 |
+| `POST /api/upload/init` | `{ projectId, filename, totalSize, version, releaseChannel?, expectedSha256?, partSizeHint?, notes?, versionNotes?, isMandatory?, minVersion?, maxVersion?, rolloutPercentage?, overwriteExisting? }` | Worker 用 R2 S3 endpoint 调 CreateMultipartUpload,返回 `sessionId/uploadId/key/partSize/partCount/uploadedParts`。`notes` 仅用于文件备注,`versionNotes` 仅用于版本备注（省略不修改,`null` 清空）。同版本、同通道、同文件名返回 409,设置 `overwriteExisting: true` 可明确覆盖该文件。 |
 | `POST /api/upload/sign-part` | `{ sessionId, partNumber }` | 返回 10min 短期 presigned PUT URL。 |
 | `PUT <presigned url>` | 二进制分片 | 客户端直传 R2。响应 header `ETag` 必须能读到 → 检查 CORS。 |
 | `POST /api/upload/complete` | `{ sessionId, parts:[{partNumber, etag, size}], sha256 }` | Worker CompleteMultipartUpload + HEAD 校验 + 写 `versions(status=ready)`。 |

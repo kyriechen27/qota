@@ -37,6 +37,19 @@ function mockXhr(t, finish) {
   return () => sends;
 }
 
+test('upload keeps file notes and shared version notes independent, including explicit clearing', async (t) => {
+  const calls = mockApi(t);
+  mockXhr(t, (xhr) => { xhr.status = 200; xhr.onload(); });
+  for (const versionNotes of ['Version release notes', null, undefined]) {
+    await startUpload({ ...opts(), notes: 'Only this file', versionNotes }).promise;
+    const payload = calls.init.mock.calls.at(-1).arguments[0];
+    assert.equal(payload.notes, 'Only this file');
+    assert.equal(payload.versionNotes, versionNotes);
+    const json = JSON.parse(JSON.stringify(payload));
+    assert.equal(Object.hasOwn(json, 'versionNotes'), versionNotes !== undefined);
+  }
+});
+
 test('a cancelled file stops before init while its file read is pending', async (t) => {
   const calls = mockApi(t);
   const read = deferred();

@@ -71,6 +71,10 @@ export interface Version {
   size: number;
   sha256: string | null;
   contentType: string | null;
+  /** Notes shared by this version label, independent of its file notes. */
+  versionNotes: string | null;
+  canEditVersionNotes?: boolean;
+  /** Notes belonging only to this file. */
   notes: string | null;
   /** Authenticated caller may edit notes; false while this label is current. */
   canEditNotes?: boolean;
@@ -202,7 +206,10 @@ export interface UploadInitRequest {
   /** Target version label, e.g. "1.2.3". */
   version: string;
   releaseChannel?: string;
-  notes?: string;
+  /** Notes belonging only to this file. */
+  notes?: string | null;
+  /** Shared version notes. Omit to preserve; null clears the existing value. */
+  versionNotes?: string | null;
   isMandatory?: boolean;
   minVersion?: string | null;
   maxVersion?: string | null;

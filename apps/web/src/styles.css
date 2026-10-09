@@ -322,6 +322,13 @@ tr:hover td { background: #1a1f2a; }
 .version-notes-channels { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
 .version-notes-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.8; margin-top: 12px; user-select: text; }
 .version-notes-editor { width: 100%; min-height: 240px; line-height: 1.8; resize: vertical; }
+.notes-layer + .notes-layer { margin-top: 22px; padding-top: 20px; border-top: 1px solid var(--border); }
+.notes-layer-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.notes-layer-heading h4 { margin: 0; font-size: 14px; font-weight: 600; }
+.notes-layer-heading button { font-size: 12px; }
+.notes-layer-description { color: #8a97ab; font-size: 12px; margin: 0 0 12px; }
+.version-level-notes { padding: 14px; background: #182131; border: 1px solid #2b3a50; border-radius: 8px; }
+.version-level-notes .version-notes-text { margin-top: 0; }
 .version-note-files { display: grid; gap: 8px; }
 .version-note-file-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; }
 .version-note-file-identity { display: flex; align-items: center; gap: 8px; min-width: 0; }
@@ -372,6 +379,14 @@ tr:hover td { background: #1a1f2a; }
 .upload-file-main .upload-remove-file { flex: 0 0 28px; width: 28px; height: 28px; padding: 0; border-color: transparent; background: transparent; color: #8190a5; font-size: 19px; }
 .upload-file-main .upload-remove-file:hover { background: #293346; color: var(--text); }
 .upload-file-row .progress { height: 4px; margin-top: 9px; }
+.upload-file-notes { margin-top: 6px; padding-left: 42px; }
+.upload-file-notes-toggle { display: inline-flex; align-items: center; gap: 6px; padding: 2px 0; min-height: 24px; border: 0; color: #8da8cc; font-size: 11px; background: transparent; }
+.upload-file-notes-toggle:hover { background: transparent; color: #b4d2fc; }
+.upload-file-notes-toggle svg { width: 13px; height: 13px; }
+.upload-file-notes textarea { display: block; width: 100%; margin-top: 5px; font-size: 12px; line-height: 1.6; resize: vertical; }
+.upload-version-notes { width: 100%; line-height: 1.6; }
+.upload-version-notes:read-only { color: #92a1b7; }
+.upload-notes-hint { display: block; color: #8390a5; font-size: 11px; margin-top: 5px; }
 .upload-file-error { margin: 7px 0 0 42px; color: #f19090; font-size: 12px; overflow-wrap: anywhere; }
 .upload-mandatory { display: flex; align-items: center; gap: 7px; font-size: 12px; color: #abb7c8; margin-bottom: 0; }
 .upload-batch-lock-hint { color: #7f8da1; font-size: 11px; margin: 8px 0 0; }
@@ -392,6 +407,7 @@ tr:hover td { background: #1a1f2a; }
   .upload-file-channel > label { margin: 0; }
   .upload-file-icon { display: none; }
   .upload-file-error { margin-left: 0; }
+  .upload-file-notes { padding-left: 0; }
 }
 .inline-warning {
   margin: 12px 0;

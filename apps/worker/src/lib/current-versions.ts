@@ -16,11 +16,17 @@ export const NOTES_UNLOCKED_SQL = `NOT EXISTS (
    WHERE cv.project_id = versions.project_id AND cv.version = versions.version
 )`;
 
-export function setCurrentVersion(db: D1Database, projectId: number, version: string, isCurrent: boolean, requireNotCurrent = false) {
-  const guard = requireNotCurrent ? `AND NOT EXISTS (
+export function setCurrentVersion(db: D1Database, projectId: number, version: string, isCurrent: boolean, requireNotCurrent = false, expectedVersionCreator?: number) {
+  let guard = requireNotCurrent ? `AND NOT EXISTS (
     SELECT 1 FROM project_current_versions cv WHERE cv.project_id = ? AND cv.version = ?
   )` : '';
   const guardArgs = requireNotCurrent ? [projectId, version] : [];
+  if (expectedVersionCreator !== undefined) {
+    guard += ` AND EXISTS (
+      SELECT 1 FROM version_metadata vm WHERE vm.project_id = ? AND vm.version = ? AND vm.created_by = ?
+    )`;
+    guardArgs.push(projectId, version, expectedVersionCreator);
+  }
   if (!isCurrent) {
     return db.prepare(`DELETE FROM project_current_versions WHERE project_id = ? AND version = ? ${guard}`)
       .bind(projectId, version, ...guardArgs);

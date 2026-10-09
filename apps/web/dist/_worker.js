@@ -27144,11 +27144,17 @@ var NOTES_UNLOCKED_SQL = `NOT EXISTS (
   SELECT 1 FROM project_current_versions cv
    WHERE cv.project_id = versions.project_id AND cv.version = versions.version
 )`;
-function setCurrentVersion(db, projectId, version, isCurrent, requireNotCurrent = false) {
-  const guard = requireNotCurrent ? `AND NOT EXISTS (
+function setCurrentVersion(db, projectId, version, isCurrent, requireNotCurrent = false, expectedVersionCreator) {
+  let guard = requireNotCurrent ? `AND NOT EXISTS (
     SELECT 1 FROM project_current_versions cv WHERE cv.project_id = ? AND cv.version = ?
   )` : "";
   const guardArgs = requireNotCurrent ? [projectId, version] : [];
+  if (expectedVersionCreator !== void 0) {
+    guard += ` AND EXISTS (
+      SELECT 1 FROM version_metadata vm WHERE vm.project_id = ? AND vm.version = ? AND vm.created_by = ?
+    )`;
+    guardArgs.push(projectId, version, expectedVersionCreator);
+  }
   if (!isCurrent) {
     return db.prepare(`DELETE FROM project_current_versions WHERE project_id = ? AND version = ? ${guard}`).bind(projectId, version, ...guardArgs);
   }
@@ -28063,37 +28069,77 @@ function escapeXml(s) {
 }
 
 // apps/worker/src/lib/version-notes.ts
-async function notesRole(db, user, projectId) {
-  if (user.role === "super_admin" || user.role === "admin") return { canManage: true, isAdmin: true };
-  if (user.role === "observer") return { canManage: false, isAdmin: false };
-  const role = await effectiveRoleOnProject(db, user.id, projectId);
-  return { canManage: !!role && roleHas(role, "manage_versions"), isAdmin: role === "customer_admin" };
+async function notesContexts(db, user, projectIds) {
+  const contexts = /* @__PURE__ */ new Map();
+  for (let offset = 0; offset < projectIds.length; offset += 80) {
+    const ids = projectIds.slice(offset, offset + 80);
+    const placeholders = ids.map(() => "?").join(",");
+    const [projects, current, metadata] = await Promise.all([
+      db.prepare(
+        `SELECT p.id, COALESCE(pm.role, cm.role) AS role FROM projects p
+         LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = ?
+         LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = ?
+         WHERE p.id IN (${placeholders})`
+      ).bind(user.id, user.id, ...ids).all(),
+      db.prepare(`SELECT project_id, version FROM project_current_versions WHERE project_id IN (${placeholders})`).bind(...ids).all(),
+      db.prepare(`SELECT project_id, version, notes, created_by FROM version_metadata WHERE project_id IN (${placeholders})`).bind(...ids).all()
+    ]);
+    for (const project of projects.results ?? []) {
+      const globalAdmin = user.role === "super_admin" || user.role === "admin";
+      const canManage = globalAdmin || user.role !== "observer" && !!project.role && roleHas(project.role, "manage_versions");
+      contexts.set(project.id, {
+        canManage,
+        isAdmin: globalAdmin || canManage && project.role === "customer_admin",
+        current: /* @__PURE__ */ new Set(),
+        metadata: /* @__PURE__ */ new Map()
+      });
+    }
+    for (const row of current.results ?? []) contexts.get(row.project_id)?.current.add(row.version);
+    for (const row of metadata.results ?? []) contexts.get(row.project_id)?.metadata.set(row.version, row);
+  }
+  return contexts;
 }
 async function withNotePermissions(db, user, rows) {
-  const contexts = /* @__PURE__ */ new Map();
-  await Promise.all([...new Set(rows.map((row) => row.project_id))].map(async (projectId) => {
-    const [role, current] = await Promise.all([
-      notesRole(db, user, projectId),
-      db.prepare("SELECT version FROM project_current_versions WHERE project_id = ?").bind(projectId).all()
-    ]);
-    contexts.set(projectId, { ...role, current: new Set((current.results ?? []).map((row) => row.version)) });
-  }));
+  const contexts = await notesContexts(db, user, [...new Set(rows.map((row) => row.project_id))]);
   return rows.map((row) => {
     const context = contexts.get(row.project_id);
+    const metadata = context?.metadata.get(row.version);
+    const locked = context?.current.has(row.version) ?? false;
+    const canManage = !!context?.canManage && !locked;
     return {
       ...row,
-      can_edit_notes: context.canManage && (context.isAdmin || row.uploaded_by === user.id) && !context.current.has(row.version)
+      notes_locked: locked,
+      can_edit_notes: canManage && (!!context?.isAdmin || row.uploaded_by === user.id),
+      version_notes: metadata?.notes ?? null,
+      version_notes_creator: metadata?.created_by ?? null,
+      can_edit_version_notes: canManage && !!metadata && (!!context?.isAdmin || metadata.created_by === user.id)
     };
   });
 }
 async function requireNotesEdit(db, user, rows) {
   const permitted = await withNotePermissions(db, user, rows);
   if (permitted.every((row) => row.can_edit_notes)) return;
-  for (const row of rows) {
-    const current = await db.prepare("SELECT 1 FROM project_current_versions WHERE project_id = ? AND version = ?").bind(row.project_id, row.version).first();
-    if (current) throw conflict("cancel current usage before editing notes");
-  }
+  if (permitted.some((row) => row.notes_locked)) throw conflict("cancel current usage before editing notes");
   throw forbidden("only the uploader or an administrator can edit notes");
+}
+async function requireVersionNotesEdit(db, user, row) {
+  const [permitted] = await withNotePermissions(db, user, [row]);
+  if (!permitted || permitted.version_notes_creator === null) throw notFound("version metadata not found");
+  if (permitted.notes_locked) throw conflict("cancel current usage before editing notes");
+  if (!permitted.can_edit_version_notes) throw forbidden("only the version creator or an administrator can edit version notes");
+  return permitted.version_notes_creator;
+}
+var VERSION_NOTES_UNLOCKED_SQL = `NOT EXISTS (
+  SELECT 1 FROM project_current_versions cv
+   WHERE cv.project_id = version_metadata.project_id AND cv.version = version_metadata.version
+)`;
+function clearUnusedVersionMetadata(db, projectId, version) {
+  return db.prepare(
+    `DELETE FROM version_metadata WHERE project_id = ? AND version = ? AND NOT EXISTS (
+       SELECT 1 FROM versions v
+        WHERE v.project_id = version_metadata.project_id AND v.version = version_metadata.version
+     )`
+  ).bind(projectId, version);
 }
 
 // apps/worker/src/routes/versions.ts
@@ -28113,6 +28159,8 @@ function versionDto(r) {
     contentType: r.content_type,
     notes: r.notes,
     canEditNotes: !!r.can_edit_notes,
+    versionNotes: r.version_notes ?? null,
+    canEditVersionNotes: !!r.can_edit_version_notes,
     isMandatory: !!r.is_mandatory,
     isCurrent: !!r.is_current,
     minVersion: r.min_version,
@@ -28208,6 +28256,9 @@ function validateVersionPatch(body) {
   if (body.notes !== void 0 && body.notes !== null && typeof body.notes !== "string") {
     throw badRequest("notes must be a string or null");
   }
+  if (body.versionNotes !== void 0 && body.versionNotes !== null && typeof body.versionNotes !== "string") {
+    throw badRequest("versionNotes must be a string or null");
+  }
   if (body.isCurrent !== void 0 && typeof body.isCurrent !== "boolean") {
     throw badRequest("isCurrent must be a boolean");
   }
@@ -28231,32 +28282,48 @@ versionRoutes.patch("/group", async (c) => {
   const rows = existing.results ?? [];
   if (rows.length === 0) throw notFound("version not found");
   if (body.notes !== void 0) await requireNotesEdit(c.env.DB, c.get("user"), rows);
+  const versionCreator = body.versionNotes !== void 0 ? await requireVersionNotesEdit(c.env.DB, c.get("user"), rows[0]) : void 0;
+  const editsNotes = body.notes !== void 0 || body.versionNotes !== void 0;
+  const creatorGuard = versionCreator === void 0 ? "" : `AND EXISTS (
+    SELECT 1 FROM version_metadata vm
+     WHERE vm.project_id = versions.project_id AND vm.version = versions.version AND vm.created_by = ?
+  )`;
+  const creatorArgs = versionCreator === void 0 ? [] : [versionCreator];
   if (body.isCurrent && (body.status === "archived" || body.status !== "ready" && !rows.some((row) => row.status === "ready"))) {
     throw badRequest("only ready versions can be current");
   }
   const now = Date.now();
   const changes = [];
+  const noteChangeIndexes = [];
+  if (body.versionNotes !== void 0) {
+    noteChangeIndexes.push(changes.length);
+    changes.push(c.env.DB.prepare(
+      `UPDATE version_metadata SET notes = ?, updated_at = ?
+        WHERE project_id = ? AND version = ? AND created_by = ? AND ${VERSION_NOTES_UNLOCKED_SQL}`
+    ).bind(body.versionNotes, now, body.projectId, body.version, versionCreator));
+  }
   if (body.notes !== void 0) {
+    noteChangeIndexes.push(changes.length);
     changes.push(c.env.DB.prepare(
       `UPDATE versions SET notes = ?, updated_at = ?
         WHERE project_id = ? AND version = ? AND status != 'pending'
-          AND id IN (${rows.map(() => "?").join(",")}) AND ${NOTES_UNLOCKED_SQL}`
-    ).bind(body.notes, now, body.projectId, body.version, ...rows.map((row) => row.id)));
+          AND id IN (${rows.map(() => "?").join(",")}) AND ${NOTES_UNLOCKED_SQL} ${creatorGuard}`
+    ).bind(body.notes, now, body.projectId, body.version, ...rows.map((row) => row.id), ...creatorArgs));
   }
   if (body.status !== void 0) {
     changes.push(c.env.DB.prepare(
       `UPDATE versions SET status = ?, updated_at = ? WHERE project_id = ? AND version = ? AND status = ?
-        ${body.notes !== void 0 ? `AND ${NOTES_UNLOCKED_SQL}` : ""}`
-    ).bind(body.status, now, body.projectId, body.version, body.status === "archived" ? "ready" : "archived"));
+        ${editsNotes ? `AND ${NOTES_UNLOCKED_SQL}` : ""} ${creatorGuard}`
+    ).bind(body.status, now, body.projectId, body.version, body.status === "archived" ? "ready" : "archived", ...creatorArgs));
   }
   if (body.isCurrent !== void 0) {
-    changes.push(setCurrentVersion(c.env.DB, body.projectId, body.version, body.isCurrent, body.notes !== void 0));
+    changes.push(setCurrentVersion(c.env.DB, body.projectId, body.version, body.isCurrent, editsNotes, versionCreator));
   }
   if (changes.length) {
     changes.push(clearUnusedCurrentVersions(c.env.DB, body.projectId));
     changes.push(syncLegacyCurrentVersion(c.env.DB, body.projectId, now));
     const result = await c.env.DB.batch(changes);
-    if (body.notes !== void 0 && result[0]?.meta.changes === 0) {
+    if (noteChangeIndexes.some((index) => result[index]?.meta.changes === 0)) {
       throw conflict("version changed; cancel current usage before editing notes");
     }
     await audit(c, {
@@ -28428,6 +28495,7 @@ versionRoutes.delete("/:id", async (c) => {
   }
   await c.env.DB.batch([
     c.env.DB.prepare("DELETE FROM versions WHERE id = ?").bind(id),
+    clearUnusedVersionMetadata(c.env.DB, row.project_id, row.version),
     clearUnusedCurrentVersions(c.env.DB, row.project_id),
     syncLegacyCurrentVersion(c.env.DB, row.project_id, Date.now())
   ]);
@@ -28909,6 +28977,7 @@ function sessionDto(r) {
     targetVersion: r.target_version,
     contentType: r.content_type,
     notes: r.notes,
+    ...r.has_version_notes ? { versionNotes: r.version_notes } : {},
     isMandatory: !!r.is_mandatory,
     minVersion: r.min_version,
     maxVersion: r.max_version,
@@ -28918,6 +28987,18 @@ function sessionDto(r) {
     createdAt: r.created_at,
     completedAt: r.completed_at
   };
+}
+async function uploadNotesPermission(db, user, projectId, version, hasVersionNotes, versionNotes, uploadedBy = user.id) {
+  const [permission] = await withNotePermissions(db, user, [
+    { project_id: projectId, version, uploaded_by: uploadedBy }
+  ]);
+  if (hasVersionNotes && permission.version_notes !== versionNotes) {
+    if (permission.notes_locked) throw conflict("cancel current usage before editing version notes");
+    if (permission.version_notes_creator !== null && !permission.can_edit_version_notes) {
+      throw forbidden("only the version creator or an administrator can edit version notes");
+    }
+  }
+  return permission;
 }
 uploadRoutes.post("/init", async (c) => {
   const me = c.get("user");
@@ -28944,6 +29025,9 @@ uploadRoutes.post("/init", async (c) => {
   if (body.notes !== void 0 && body.notes !== null && typeof body.notes !== "string") {
     throw badRequest("notes must be a string or null");
   }
+  if (body.versionNotes !== void 0 && body.versionNotes !== null && typeof body.versionNotes !== "string") {
+    throw badRequest("versionNotes must be a string or null");
+  }
   const project = await requireProjectAccess(c.env.DB, me, body.projectId, "upload");
   const customer = await c.env.DB.prepare("SELECT code FROM customers WHERE id = ?").bind(project.customer_id).first();
   if (!customer) throw notFound("customer not found");
@@ -28954,6 +29038,14 @@ uploadRoutes.post("/init", async (c) => {
   if (existing && !body.overwriteExisting) throw conflict("filename already exists for this version and channel");
   const notes = body.notes === void 0 ? existing?.notes ?? null : body.notes;
   if (existing && existing.notes !== notes) await requireNotesEdit(c.env.DB, me, [existing]);
+  await uploadNotesPermission(
+    c.env.DB,
+    me,
+    body.projectId,
+    body.version,
+    body.versionNotes !== void 0,
+    body.versionNotes ?? null
+  );
   const totalSize = body.totalSize;
   const partSize = clampPartSize(body.partSizeHint, totalSize);
   const partCount = Math.ceil(totalSize / partSize);
@@ -28965,9 +29057,9 @@ uploadRoutes.post("/init", async (c) => {
   const r = await c.env.DB.prepare(
     `INSERT INTO upload_sessions
        (project_id, r2_key, filename, total_size, part_size, upload_id, expected_sha256, release_channel,
-        target_version, content_type, notes, is_mandatory, min_version, max_version, rollout_percentage, version_id,
+        target_version, content_type, notes, version_notes, has_version_notes, is_mandatory, min_version, max_version, rollout_percentage, version_id,
         status, initiated_by, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?)`
   ).bind(
     body.projectId,
     key,
@@ -28980,6 +29072,8 @@ uploadRoutes.post("/init", async (c) => {
     body.version,
     body.contentType ?? null,
     notes,
+    body.versionNotes ?? null,
+    body.versionNotes === void 0 ? 0 : 1,
     body.isMandatory ? 1 : 0,
     body.minVersion ?? null,
     body.maxVersion ?? null,
@@ -29050,6 +29144,14 @@ uploadRoutes.post("/complete", async (c) => {
   if (overwriteTarget && overwriteTarget.notes !== session.notes) {
     await requireNotesEdit(c.env.DB, me, [overwriteTarget]);
   }
+  await uploadNotesPermission(
+    c.env.DB,
+    me,
+    session.project_id,
+    session.target_version,
+    !!session.has_version_notes,
+    session.version_notes
+  );
   const s3 = makeStorage(c.env);
   let completeRes;
   try {
@@ -29085,15 +29187,87 @@ uploadRoutes.post("/complete", async (c) => {
     }
     const sha256 = body.sha256 ?? session.expected_sha256 ?? null;
     let versionId = session.version_id ?? 0;
-    let oldKey = null;
-    if (session.version_id) {
-      const existing = await c.env.DB.prepare("SELECT r2_key, project_id, version, notes, uploaded_by FROM versions WHERE id = ? AND project_id = ?").bind(session.version_id, session.project_id).first();
-      if (!existing) throw conflict("overwrite target version no longer exists");
-      if (existing.notes !== session.notes) await requireNotesEdit(c.env.DB, me, [existing]);
-      const [notesPermission] = await withNotePermissions(c.env.DB, me, [existing]);
-      oldKey = existing.r2_key;
-      const overwriteResult = await c.env.DB.prepare(
-        `UPDATE versions
+    const existing = session.version_id ? await c.env.DB.prepare("SELECT r2_key, project_id, version, notes, uploaded_by FROM versions WHERE id = ? AND project_id = ?").bind(session.version_id, session.project_id).first() : null;
+    if (session.version_id && !existing) throw conflict("overwrite target version no longer exists");
+    if (existing && existing.notes !== session.notes) await requireNotesEdit(c.env.DB, me, [existing]);
+    const notesPermission = await uploadNotesPermission(
+      c.env.DB,
+      me,
+      session.project_id,
+      session.target_version,
+      !!session.has_version_notes,
+      session.version_notes,
+      existing?.uploaded_by
+    );
+    const oldKey = existing?.r2_key ?? null;
+    const unlocked = `NOT EXISTS (
+      SELECT 1 FROM project_current_versions WHERE project_id = ? AND version = ?
+    )`;
+    const guards = [`EXISTS (SELECT 1 FROM upload_sessions WHERE id = ? AND status = 'in_progress')`];
+    const guardArgs = [session.id];
+    if (existing) {
+      guards.push(`EXISTS (
+        SELECT 1 FROM versions v WHERE v.id = ? AND v.project_id = ? AND v.uploaded_by = ? AND v.r2_key = ?
+          AND (v.notes IS ? OR (? = 1 AND ${unlocked}))
+      )`);
+      guardArgs.push(
+        session.version_id,
+        session.project_id,
+        existing.uploaded_by,
+        existing.r2_key,
+        session.notes,
+        notesPermission.can_edit_notes ? 1 : 0,
+        session.project_id,
+        session.target_version
+      );
+    } else {
+      guards.push(`NOT EXISTS (
+        SELECT 1 FROM versions WHERE project_id = ? AND version = ? AND release_channel = ? AND filename = ?
+      )`);
+      guardArgs.push(session.project_id, session.target_version, session.release_channel, session.filename);
+    }
+    if (session.has_version_notes) {
+      guards.push(`(
+        NOT EXISTS (SELECT 1 FROM version_metadata WHERE project_id = ? AND version = ?)
+        OR EXISTS (
+          SELECT 1 FROM version_metadata vm WHERE vm.project_id = ? AND vm.version = ?
+            AND (vm.notes IS ? OR (? = 1 AND vm.created_by = ? AND ${unlocked}))
+        )
+      )`);
+      guardArgs.push(
+        session.project_id,
+        session.target_version,
+        session.project_id,
+        session.target_version,
+        session.version_notes,
+        notesPermission.can_edit_version_notes ? 1 : 0,
+        notesPermission.version_notes_creator ?? -1,
+        session.project_id,
+        session.target_version
+      );
+    }
+    const guardSql = guards.join(" AND ");
+    const metadataWrite = c.env.DB.prepare(
+      `INSERT INTO version_metadata (project_id, version, notes, created_by, created_at, updated_at)
+       SELECT ?, ?, ?, COALESCE((
+         SELECT uploaded_by FROM versions WHERE project_id = ? AND version = ? ORDER BY created_at, id LIMIT 1
+       ), ?), ?, ? WHERE ${guardSql}
+       ON CONFLICT (project_id, version) DO UPDATE SET notes = excluded.notes, updated_at = excluded.updated_at
+       WHERE ? = 1 AND version_metadata.notes IS NOT excluded.notes`
+    ).bind(
+      session.project_id,
+      session.target_version,
+      session.has_version_notes ? session.version_notes : null,
+      session.project_id,
+      session.target_version,
+      session.initiated_by,
+      now,
+      now,
+      ...guardArgs,
+      session.has_version_notes ? 1 : 0
+    );
+    const artifactWrite = existing ? c.env.DB.prepare(
+      `UPDATE versions
             SET status = 'ready',
                 r2_key = ?,
                 filename = ?,
@@ -29107,64 +29281,58 @@ uploadRoutes.post("/complete", async (c) => {
                 rollout_percentage = ?,
                 created_at = ?,
                 updated_at = ?
-          WHERE id = ? AND uploaded_by = ? AND r2_key = ?
-            AND (notes IS ? OR (? = 1 AND ${NOTES_UNLOCKED_SQL}))`
-      ).bind(
-        session.r2_key,
-        session.filename,
-        session.total_size,
-        sha256,
-        session.content_type,
-        session.notes,
-        session.is_mandatory,
-        session.min_version,
-        session.max_version,
-        session.rollout_percentage,
-        now,
-        now,
-        session.version_id,
-        existing.uploaded_by,
-        existing.r2_key,
-        session.notes,
-        notesPermission?.can_edit_notes ? 1 : 0
-      ).run();
-      if (overwriteResult.meta.changes === 0) {
-        throw conflict("version changed; cancel current usage before editing notes");
-      }
-    } else {
-      const verRes = await c.env.DB.prepare(
-        `INSERT INTO versions
+          WHERE id = ? AND ${guardSql}`
+    ).bind(
+      session.r2_key,
+      session.filename,
+      session.total_size,
+      sha256,
+      session.content_type,
+      session.notes,
+      session.is_mandatory,
+      session.min_version,
+      session.max_version,
+      session.rollout_percentage,
+      now,
+      now,
+      session.version_id,
+      ...guardArgs
+    ) : c.env.DB.prepare(
+      `INSERT INTO versions
            (project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type, notes,
             is_mandatory, min_version, max_version, rollout_percentage, device_group_id,
             uploaded_by, created_at, updated_at)
-         VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+         SELECT ?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ? WHERE ${guardSql}
          ON CONFLICT (project_id, version, release_channel, filename) DO NOTHING`
-      ).bind(
-        session.project_id,
-        session.target_version,
-        session.release_channel,
-        session.r2_key,
-        session.filename,
-        session.total_size,
-        sha256,
-        session.content_type,
-        session.notes,
-        session.is_mandatory,
-        session.min_version,
-        session.max_version,
-        session.rollout_percentage,
-        session.initiated_by,
-        now,
-        now
-      ).run();
-      if (verRes.meta.changes === 0) {
-        throw conflict("filename already exists for this version and channel");
-      }
-      versionId = Number(verRes.meta.last_row_id);
+    ).bind(
+      session.project_id,
+      session.target_version,
+      session.release_channel,
+      session.r2_key,
+      session.filename,
+      session.total_size,
+      sha256,
+      session.content_type,
+      session.notes,
+      session.is_mandatory,
+      session.min_version,
+      session.max_version,
+      session.rollout_percentage,
+      session.initiated_by,
+      now,
+      now,
+      ...guardArgs
+    );
+    const completeSession = c.env.DB.prepare(
+      `UPDATE upload_sessions SET status = 'completed', completed_at = ?, version_id = (
+         SELECT id FROM versions WHERE project_id = ? AND r2_key = ? LIMIT 1
+       ) WHERE id = ? AND status = 'in_progress' AND changes() = 1`
+    ).bind(now, session.project_id, session.r2_key, session.id);
+    const [, artifactResult] = await c.env.DB.batch([metadataWrite, artifactWrite, completeSession]);
+    if (!artifactResult || artifactResult.meta.changes === 0) {
+      throw conflict("version or filename changed; refresh before retrying the upload");
     }
-    await c.env.DB.prepare(
-      `UPDATE upload_sessions SET status = 'completed', completed_at = ?, version_id = ? WHERE id = ?`
-    ).bind(now, versionId, session.id).run();
+    if (!existing) versionId = Number(artifactResult.meta.last_row_id);
     await audit(c, {
       action: "version.upload.complete",
       customerId: project.customer_id,
@@ -29717,6 +29885,12 @@ var current_versions_default = "-- Current usage is a set of version labels, sha
 // apps/worker/migrations/0008_multiple_files.sql
 var multiple_files_default = "-- Permit distinct files in the same project/version/channel. This migration\n-- must run in one transaction (Node migrations / D1 migrations / Pages batch).\n-- Keep foreign keys enabled: preserve references before DROP TABLE invokes\n-- upload_sessions.version_id's ON DELETE SET NULL action, then restore them.\nCREATE TABLE _qota_0008_upload_version_refs (\n  session_id INTEGER PRIMARY KEY,\n  version_id INTEGER NOT NULL\n);\nINSERT INTO _qota_0008_upload_version_refs (session_id, version_id)\nSELECT id, version_id FROM upload_sessions WHERE version_id IS NOT NULL;\n\nCREATE TABLE _qota_0008_version_sequence (seq INTEGER NOT NULL);\nINSERT INTO _qota_0008_version_sequence (seq)\nSELECT COALESCE(MAX(seq), 0) FROM sqlite_sequence WHERE name = 'versions';\n\nCREATE TABLE versions_multi_file (\n  id INTEGER PRIMARY KEY AUTOINCREMENT,\n  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  version TEXT NOT NULL,\n  release_channel TEXT NOT NULL DEFAULT 'stable',\n  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'ready', 'archived')),\n  r2_key TEXT NOT NULL UNIQUE,\n  filename TEXT NOT NULL,\n  size INTEGER NOT NULL,\n  sha256 TEXT,\n  content_type TEXT,\n  notes TEXT,\n  is_mandatory INTEGER NOT NULL DEFAULT 0,\n  min_version TEXT,\n  max_version TEXT,\n  rollout_percentage INTEGER NOT NULL DEFAULT 100 CHECK (rollout_percentage BETWEEN 0 AND 100),\n  device_group_id INTEGER REFERENCES device_groups(id) ON DELETE SET NULL,\n  uploaded_by INTEGER NOT NULL REFERENCES users(id),\n  created_at INTEGER NOT NULL,\n  updated_at INTEGER NOT NULL,\n  download_count INTEGER NOT NULL DEFAULT 0,\n  public_slug TEXT\n);\nINSERT INTO versions_multi_file (\n  id, project_id, version, release_channel, status, r2_key, filename, size,\n  sha256, content_type, notes, is_mandatory, min_version, max_version,\n  rollout_percentage, device_group_id, uploaded_by, created_at, updated_at,\n  download_count, public_slug\n)\nSELECT id, project_id, version, release_channel, status, r2_key, filename, size,\n  sha256, content_type, notes, is_mandatory, min_version, max_version,\n  rollout_percentage, device_group_id, uploaded_by, created_at, updated_at,\n  download_count, public_slug\nFROM versions;\n\nDROP TABLE versions;\nALTER TABLE versions_multi_file RENAME TO versions;\n\nUPDATE upload_sessions SET version_id = (\n  SELECT ref.version_id FROM _qota_0008_upload_version_refs ref\n  WHERE ref.session_id = upload_sessions.id\n)\nWHERE id IN (SELECT session_id FROM _qota_0008_upload_version_refs);\n\n-- Preserve deleted ID high-water marks so old links never target a reused ID.\nINSERT INTO sqlite_sequence (name, seq)\nSELECT 'versions', seq FROM _qota_0008_version_sequence\nWHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'versions');\nUPDATE sqlite_sequence SET seq = MAX(seq, (SELECT seq FROM _qota_0008_version_sequence))\nWHERE name = 'versions';\n\nCREATE INDEX idx_versions_project ON versions(project_id, created_at DESC);\nCREATE INDEX idx_versions_channel ON versions(project_id, release_channel, created_at DESC);\nCREATE UNIQUE INDEX idx_versions_public_slug ON versions(public_slug);\nCREATE UNIQUE INDEX idx_versions_file ON versions(project_id, version, release_channel, filename);\n\nDROP TABLE _qota_0008_upload_version_refs;\nDROP TABLE _qota_0008_version_sequence;\n";
 
+// apps/worker/migrations/0009_version_metadata.sql
+var version_metadata_default = "-- Version-label notes are independent of each uploaded file's notes. Keep the\n-- earliest uploader as the label's creator, even when more files are added.\nCREATE TABLE IF NOT EXISTS version_metadata (\n  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  version TEXT NOT NULL,\n  notes TEXT,\n  created_by INTEGER NOT NULL REFERENCES users(id),\n  created_at INTEGER NOT NULL,\n  updated_at INTEGER NOT NULL,\n  PRIMARY KEY (project_id, version)\n);\n\nINSERT OR IGNORE INTO version_metadata (project_id, version, notes, created_by, created_at, updated_at)\nSELECT v.project_id, v.version,\n  CASE WHEN COUNT(v.notes) = COUNT(*) AND COUNT(DISTINCT v.notes) = 1\n    THEN MIN(v.notes) ELSE NULL END,\n  (SELECT first_file.uploaded_by FROM versions first_file\n    WHERE first_file.project_id = v.project_id AND first_file.version = v.version\n    ORDER BY first_file.created_at ASC, first_file.id ASC LIMIT 1),\n  MIN(v.created_at), MAX(v.updated_at)\nFROM versions v\nGROUP BY v.project_id, v.version;\n";
+
+// apps/worker/migrations/0010_upload_version_notes.sql
+var upload_version_notes_default = "-- Omitted parent notes preserve the existing value; explicit NULL clears it.\nALTER TABLE upload_sessions ADD COLUMN version_notes TEXT;\nALTER TABLE upload_sessions ADD COLUMN has_version_notes INTEGER NOT NULL DEFAULT 0;\n";
+
 // apps/worker/pages-entry.ts
 function statements(sql) {
   return sql.replace(/--[^\n]*/g, "").split(";").map((s) => s.trim()).filter((s) => s.length > 0 && !/^PRAGMA/i.test(s));
@@ -29739,6 +29913,8 @@ async function ensureSchema(env) {
       await env.DB.prepare(stmt).run();
     }
     await ensureMultipleFiles(env);
+    await ensureVersionMetadata(env);
+    await ensureUploadVersionNotes(env);
     schemaReady = true;
     console.log("[schema] initialized D1 tables on first run");
     return;
@@ -29749,6 +29925,8 @@ async function ensureSchema(env) {
   await ensureGlobalRoles(env, statements(global_roles_default));
   await ensureCurrentVersions(env);
   await ensureMultipleFiles(env);
+  await ensureVersionMetadata(env);
+  await ensureUploadVersionNotes(env);
   schemaReady = true;
 }
 async function ensureColumn(env, table, column, stmts) {
@@ -29783,6 +29961,22 @@ async function ensureMultipleFiles(env) {
   if (!row) {
     await env.DB.batch(statements(multiple_files_default).map((stmt) => env.DB.prepare(stmt)));
     console.log("[schema] enabled multiple files per version and channel");
+  }
+}
+async function ensureVersionMetadata(env) {
+  const row = await env.DB.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'version_metadata'"
+  ).first();
+  if (!row) {
+    await env.DB.batch(statements(version_metadata_default).map((stmt) => env.DB.prepare(stmt)));
+    console.log("[schema] added independent version notes");
+  }
+}
+async function ensureUploadVersionNotes(env) {
+  const row = await env.DB.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'upload_sessions'").first();
+  if (row && !row.sql.includes("has_version_notes")) {
+    await env.DB.batch(statements(upload_version_notes_default).map((stmt) => env.DB.prepare(stmt)));
+    console.log("[schema] added upload version notes");
   }
 }
 var pages_entry_default = {
