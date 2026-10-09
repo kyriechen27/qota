@@ -281,8 +281,6 @@ export default function ProjectDetail() {
     const first = items[0]!;
     const preview = scope === 'version' ? first.versionNotes : first.notes;
     const versionLabel = first.version;
-    const current = versions.some((item) => item.version === versionLabel && item.isCurrent);
-    const canEdit = scope === 'version' ? first.canEditVersionNotes : first.canEditNotes;
     const label = t(scope === 'version' ? 'pd.viewVersionNotes' : 'pd.viewFileNotes', {
       version: versionLabel, filename: first.filename, channel: first.releaseChannel,
     });
@@ -299,9 +297,7 @@ export default function ProjectDetail() {
       >
         <span className="version-notes-content">
           <span className="version-notes-excerpt">
-            {preview || t(scope === 'version'
-              ? !current && canEdit ? 'pd.addVersionNotes' : 'pd.noVersionNotes'
-              : !current && canEdit ? 'pd.addFileNotes' : 'pd.noFileNotes')}
+            {preview || ''}
           </span>
         </span>
         <VersionIcon name="notes" />
@@ -1411,7 +1407,7 @@ function VersionNotesDialog({
             <p className="notes-layer-description">{t('pd.versionNotesEditHint')}</p>
             {!current && !canEditVersionNotes && <p className="version-notes-hint">{t('pd.versionNotesPermissionHint')}</p>}
             {editingVersion ? renderEditor() : (
-              <div className={`version-notes-text${versionNotes ? '' : ' muted'}`}>{versionNotes || t('pd.noVersionNotes')}</div>
+              <div className="version-notes-text">{versionNotes || ''}</div>
             )}
           </section>
         )}
@@ -1445,8 +1441,8 @@ function VersionNotesDialog({
                   </div>
                 ))}
               </div>
-              <div className={`version-notes-text${entry.notes ? '' : ' muted'}`}>
-                {entry.notes || t('pd.noFileNotes')}
+              <div className="version-notes-text">
+                {entry.notes || ''}
               </div>
             </section>
           ))}
