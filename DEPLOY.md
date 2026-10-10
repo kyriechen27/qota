@@ -192,8 +192,8 @@ saved during upload (`0010`), special versions (`0011`), project announcements
 (`0012`), SMTP settings and email delivery records (`0013`), API token
 version restrictions (`0014`), nested customers (`0015`), and the registration
 setting (`0016`). Public registration is disabled by default; administrators can
-enable it from the Users page. Newly registered users have no customer or project
-access until an administrator grants it. Existing customers
+enable it from the Users page. Newly registered users are observers with no customer
+or project access until an administrator grants it. Existing customers
 remain at the top level, with their memberships and projects unchanged. Files, metadata and upload references are
 preserved; these Pages upgrades require no manual SQL. Future migrations must
 also be wired into `pages-entry.ts` to use this automatic upgrade path. Standalone
@@ -205,6 +205,13 @@ future projects. This applies to existing grants without a schema change or
 re-granting. Explicit project roles take precedence; otherwise the nearest
 customer membership in the ancestor chain determines the role. Moving a subtree
 or revoking a customer membership immediately updates inherited access.
+
+Observers, including existing observer accounts, now require customer or project
+membership to view and download content. They no longer have global visibility,
+and remain read-only even when a membership has a developer or administrator
+role. This policy change requires no additional database migration. Existing
+accounts with another role retain that role; the observer default applies to
+new public registrations.
 
 ### Local preview of the Pages build
 

@@ -1,6 +1,6 @@
 export const registrationZh = {
   'registration.title': '注册账户',
-  'registration.intro': '注册后，由管理员为你授权客户或项目。',
+  'registration.intro': '新注册账号默认为观察者。管理员授予客户或项目权限后，你可以在授权范围内查看和下载。',
   'registration.link': '注册新账户',
   'registration.email': '邮箱',
   'registration.name': '用户名（可选）',
@@ -15,14 +15,14 @@ export const registrationZh = {
   'registration.closedHint': '请联系管理员创建账户，已有账户可正常登录。',
   'registration.loadFailed': '暂时无法获取注册状态，请稍后重试。',
   'registration.retry': '重试',
-  'registration.success': '注册成功，请登录。客户和项目权限由管理员分配。',
+  'registration.success': '观察者账号注册成功，请登录。管理员授权后即可查看和下载对应客户或项目的内容。',
   'registration.duplicate': '该邮箱已被注册，请登录或更换邮箱。',
   'registration.failed': '注册失败，请检查填写内容后重试。',
 };
 
 export const registrationEn = {
   'registration.title': 'Create an account',
-  'registration.intro': 'An administrator will grant access to customers or projects after registration.',
+  'registration.intro': 'New accounts are observers. After an administrator grants customer or project access, you can view and download within that scope.',
   'registration.link': 'Create an account',
   'registration.email': 'Email',
   'registration.name': 'Username (optional)',
@@ -37,7 +37,7 @@ export const registrationEn = {
   'registration.closedHint': 'Contact an administrator to create an account. Existing accounts can still sign in.',
   'registration.loadFailed': 'Unable to load registration status. Please try again.',
   'registration.retry': 'Retry',
-  'registration.success': 'Account created. Please sign in. An administrator will grant your customer and project access.',
+  'registration.success': 'Observer account created. Please sign in. Once an administrator grants access, you can view and download content from those customers or projects.',
   'registration.duplicate': 'This email is already registered. Sign in or use another email.',
   'registration.failed': 'Registration failed. Check your details and try again.',
 };

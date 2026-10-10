@@ -497,7 +497,7 @@ test('announcement mail recipients inherit view access and sending rechecks the 
     const f = await fixture(t);
     await f.configureMail();
     const before = await f.request('/api/announcements/recipients?projectId=4', { userId: 2 });
-    assert.deepEqual(before.items.map((row) => row.id).sort(), [1, 2, 3, 6, 7]);
+    assert.deepEqual(before.items.map((row) => row.id).sort(), [1, 2, 3, 6]);
     const batch = f.db.batch.bind(f.db);
     f.db.batch = async (queries) => {
       f.db.batch = batch;

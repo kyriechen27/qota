@@ -389,7 +389,7 @@ const zh: Dict = {
   'mem.projectFilter': '— 按项目筛选 —',
   'mem.grant': '+ 授予成员',
   'mem.rolesHint':
-    '成员角色:客户管理员(管理整个客户/项目)、开发者(上传 + 下载)、查看者(仅下载)。全局管理员可管理全部，观察者仅可查看和下载。',
+    '成员角色：客户管理员（管理授权客户/项目）、开发者（上传和下载）、查看者（查看和下载）。全局管理员可管理全部；观察者仅能在已授权客户或项目范围内查看和下载，任何成员角色都不会为其增加写入权限。',
   'mem.colUser': '用户',
   'mem.colScope': '范围',
   'mem.colTarget': '目标',
@@ -790,7 +790,7 @@ const en: Dict = {
   'mem.projectFilter': '— project filter —',
   'mem.grant': '+ Grant membership',
   'mem.rolesHint':
-    'Member roles: customer_admin (manage all of customer/project), developer (upload + download), viewer (download only). Global admins manage everything; observers can only view and download.',
+    'Member roles: customer administrator (manage granted customers/projects), developer (upload and download), viewer (view and download). Global administrators manage everything. Observers can only view and download within granted customers or projects; membership roles never add write access for them.',
   'mem.colUser': 'User',
   'mem.colScope': 'Scope',
   'mem.colTarget': 'Target',

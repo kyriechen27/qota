@@ -2365,12 +2365,18 @@ authRoutes.post("/register", async (c) => {
   if (exists) throw conflict("email already exists");
   const hash2 = await hashPassword(body.password);
   const now = Date.now();
-  const result = await c.env.DB.prepare(
+  const insertUser = c.env.DB.prepare(
     `INSERT INTO users (email, password_hash, display_name, role, is_active, created_at, updated_at)
      SELECT ?, ?, ?, 'developer', 1, ?, ?
       WHERE EXISTS (SELECT 1 FROM registration_settings WHERE id = 1 AND enabled = 1)
      ON CONFLICT (email) DO NOTHING`
-  ).bind(email, hash2, displayName || null, now, now).run();
+  ).bind(email, hash2, displayName || null, now, now);
+  const insertRole = c.env.DB.prepare(
+    `INSERT INTO user_global_roles (user_id, role, updated_at, updated_by)
+     SELECT id, 'observer', ?, NULL FROM users
+      WHERE id = last_insert_rowid() AND email = ? AND changes() = 1`
+  ).bind(now, email);
+  const result = (await c.env.DB.batch([insertUser, insertRole]))[0];
   if (!result.meta.changes) {
     if (!await registrationEnabled(c.env.DB)) throw registrationDisabled();
     throw conflict("email already exists");
@@ -2703,7 +2709,7 @@ var GLOBAL_OBSERVER_ACTIONS = /* @__PURE__ */ new Set(["view", "download"]);
 function globalRoleHas(user, action) {
   if (user.role === "super_admin") return true;
   if (user.role === "admin") return GLOBAL_ADMIN_ACTIONS.has(action);
-  if (user.role === "observer") return GLOBAL_OBSERVER_ACTIONS.has(action);
+  if (user.role === "observer") return GLOBAL_OBSERVER_ACTIONS.has(action) ? null : false;
   return null;
 }
 function roleHas(role, action) {
@@ -2739,7 +2745,7 @@ function projectAccessSql(projectIdSql, userIdSql, action, ownerIdSql) {
       ON permission_cm.id = ${customerMembershipIdSql("permission_project.customer_id", "permission_user.id")}
     WHERE permission_user.id = ${userIdSql} AND permission_user.is_active = 1 AND (
       COALESCE(permission_global.role, permission_user.role) IN ('super_admin', 'admin')
-      ${GLOBAL_OBSERVER_ACTIONS.has(action) ? "OR COALESCE(permission_global.role, permission_user.role) = 'observer'" : ""}
+      ${GLOBAL_OBSERVER_ACTIONS.has(action) ? "OR (COALESCE(permission_global.role, permission_user.role) = 'observer' AND COALESCE(permission_pm.role, permission_cm.role) IS NOT NULL)" : ""}
       OR (COALESCE(permission_global.role, permission_user.role) = 'developer'
         AND COALESCE(permission_pm.role, permission_cm.role) IN (${roles})
         ${ownerIdSql ? `AND (permission_user.id = ${ownerIdSql} OR COALESCE(permission_pm.role, permission_cm.role) = 'customer_admin')` : ""})
@@ -2784,14 +2790,14 @@ async function requireCustomerAccess(db, user, customerId, action) {
   return row;
 }
 async function visibleCustomerIds(db, user) {
-  if (user.role === "super_admin" || user.role === "admin" || user.role === "observer") return null;
+  if (user.role === "super_admin" || user.role === "admin") return null;
   const rows = await db.prepare(`SELECT id FROM customers WHERE id IN ${inheritedCustomerIdsSql("?")}
     UNION SELECT p.customer_id AS id FROM project_memberships pm
       JOIN projects p ON p.id = pm.project_id WHERE pm.user_id = ?`).bind(user.id, user.id).all();
   return (rows.results ?? []).map((row) => row.id);
 }
 async function visibleProjectIds(db, user) {
-  if (user.role === "super_admin" || user.role === "admin" || user.role === "observer") return null;
+  if (user.role === "super_admin" || user.role === "admin") return null;
   const rows = await db.prepare(
     `SELECT DISTINCT p.id FROM projects p
         WHERE p.customer_id IN ${inheritedCustomerIdsSql("?")}
@@ -29604,8 +29610,8 @@ var RECIPIENTS_SQL = `SELECT u.id, u.email, u.display_name AS displayName
   LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = u.id
   LEFT JOIN memberships cm ON cm.id = ${customerMembershipIdSql("p.customer_id", "u.id")}
   WHERE u.is_active = 1 AND (
-    COALESCE(gr.role, u.role) IN ('super_admin', 'admin', 'observer') OR
-    (COALESCE(gr.role, u.role) = 'developer' AND COALESCE(pm.role, cm.role) IS NOT NULL)
+    COALESCE(gr.role, u.role) IN ('super_admin', 'admin') OR
+    (COALESCE(gr.role, u.role) IN ('developer', 'observer') AND COALESCE(pm.role, cm.role) IS NOT NULL)
   )`;
 function announcementRecipientIds(value) {
   if (value === void 0) return [];
@@ -29726,10 +29732,8 @@ var ANNOUNCEMENT_CAN_MANAGE_SQL = `EXISTS (
   WHERE au.id = ? AND au.is_active = 1 AND (
     COALESCE(agr.role, au.role) IN ('super_admin', 'admin')
     OR (COALESCE(agr.role, au.role) = 'developer' AND COALESCE(apm.role, acm.role) = 'customer_admin')
-    OR (au.id = announcements.author_id AND (
-      COALESCE(agr.role, au.role) = 'observer'
-      OR (COALESCE(agr.role, au.role) = 'developer' AND COALESCE(apm.role, acm.role) IS NOT NULL)
-    ))
+    OR (au.id = announcements.author_id AND COALESCE(agr.role, au.role) = 'developer'
+      AND COALESCE(apm.role, acm.role) IS NOT NULL)
   )
 )`;
 async function requireAnnouncementAuthor(db, projectId, authorId) {
@@ -30391,7 +30395,7 @@ storageRoutes.get("/blob", async (c) => {
 var auditRoutes = new Hono2();
 auditRoutes.use("*", requireUser);
 function isGlobalVisible(role) {
-  return role === "super_admin" || role === "admin" || role === "observer";
+  return role === "super_admin" || role === "admin";
 }
 function dto6(r) {
   let meta = null;
@@ -30502,7 +30506,7 @@ function globalAdmin(user) {
   return user.role === "admin" || user.role === "super_admin";
 }
 function dto7(row, user) {
-  const canManage = row.author_id === user.id || globalAdmin(user) || user.role !== "observer" && row.project_role === "customer_admin";
+  const canManage = user.role !== "observer" && (row.author_id === user.id || globalAdmin(user) || row.project_role === "customer_admin");
   return {
     id: row.id,
     projectId: row.project_id,
@@ -30541,7 +30545,7 @@ announcementRoutes.get("/", async (c) => {
   if (limit > 100) throw badRequest("limit must be at most 100");
   const where = ["a.deleted_at IS NULL"];
   const args = [user.id, user.id];
-  if (!globalAdmin(user) && user.role !== "observer") where.push("COALESCE(pm.role, cm.role) IS NOT NULL");
+  if (!globalAdmin(user)) where.push("COALESCE(pm.role, cm.role) IS NOT NULL");
   if (projectIdQ !== void 0) {
     const projectId = positiveInteger(projectIdQ, "projectId");
     await requireProjectAccess(c.env.DB, user, projectId, "view");

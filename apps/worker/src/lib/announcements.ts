@@ -18,8 +18,9 @@ export const ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL = `EXISTS (
 )`;
 
 // One parameter: the acting user. Authors may still manage their announcement
-// after becoming viewers, provided they retain access to its project. Other
-// scoped users must remain administrators at the final write.
+// after becoming scoped viewers, provided they retain access to its project.
+// Global observers cannot write, even when they originally authored a notice.
+// Other scoped users must remain administrators at the final write.
 export const ANNOUNCEMENT_CAN_MANAGE_SQL = `EXISTS (
   SELECT 1 FROM users au JOIN projects ap ON ap.id = announcements.project_id
   LEFT JOIN user_global_roles agr ON agr.user_id = au.id
@@ -28,10 +29,8 @@ export const ANNOUNCEMENT_CAN_MANAGE_SQL = `EXISTS (
   WHERE au.id = ? AND au.is_active = 1 AND (
     COALESCE(agr.role, au.role) IN ('super_admin', 'admin')
     OR (COALESCE(agr.role, au.role) = 'developer' AND COALESCE(apm.role, acm.role) = 'customer_admin')
-    OR (au.id = announcements.author_id AND (
-      COALESCE(agr.role, au.role) = 'observer'
-      OR (COALESCE(agr.role, au.role) = 'developer' AND COALESCE(apm.role, acm.role) IS NOT NULL)
-    ))
+    OR (au.id = announcements.author_id AND COALESCE(agr.role, au.role) = 'developer'
+      AND COALESCE(apm.role, acm.role) IS NOT NULL)
   )
 )`;
 

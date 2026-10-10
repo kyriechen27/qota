@@ -55,8 +55,8 @@ function globalAdmin(user: AuthedUser) {
 }
 
 function dto(row: AnnouncementRow, user: AuthedUser): Announcement {
-  const canManage = row.author_id === user.id || globalAdmin(user) ||
-    (user.role !== 'observer' && row.project_role === 'customer_admin');
+  const canManage = user.role !== 'observer' &&
+    (row.author_id === user.id || globalAdmin(user) || row.project_role === 'customer_admin');
   return {
     id: row.id, projectId: row.project_id, projectName: row.project_name, customerName: row.customer_name,
     version: row.version, content: row.content, authorId: row.author_id, authorName: row.author_name,
@@ -90,7 +90,7 @@ announcementRoutes.get('/', async (c) => {
   if (limit > 100) throw badRequest('limit must be at most 100');
   const where = ['a.deleted_at IS NULL'];
   const args: unknown[] = [user.id, user.id];
-  if (!globalAdmin(user) && user.role !== 'observer') where.push('COALESCE(pm.role, cm.role) IS NOT NULL');
+  if (!globalAdmin(user)) where.push('COALESCE(pm.role, cm.role) IS NOT NULL');
   if (projectIdQ !== undefined) {
     const projectId = positiveInteger(projectIdQ, 'projectId');
     await requireProjectAccess(c.env.DB, user, projectId, 'view');

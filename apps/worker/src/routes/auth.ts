@@ -58,14 +58,22 @@ authRoutes.post('/register', async (c) => {
   if (exists) throw conflict('email already exists');
   const hash = await hashPassword(body.password);
   const now = Date.now();
-  // Read the switch inside the write, after hashing. Concurrent signups use
-  // the unique email constraint; neither race may create a privileged account.
-  const result = await c.env.DB.prepare(
+  // Read the switch inside the write, after hashing. Create the observer
+  // override in the same transaction, so the base-role compatibility row is
+  // never exposed without its read-only role. Failed/duplicate inserts must
+  // not apply an override to whichever user last_insert_rowid previously held.
+  const insertUser = c.env.DB.prepare(
     `INSERT INTO users (email, password_hash, display_name, role, is_active, created_at, updated_at)
      SELECT ?, ?, ?, 'developer', 1, ?, ?
       WHERE EXISTS (SELECT 1 FROM registration_settings WHERE id = 1 AND enabled = 1)
      ON CONFLICT (email) DO NOTHING`,
-  ).bind(email, hash, displayName || null, now, now).run();
+  ).bind(email, hash, displayName || null, now, now);
+  const insertRole = c.env.DB.prepare(
+    `INSERT INTO user_global_roles (user_id, role, updated_at, updated_by)
+     SELECT id, 'observer', ?, NULL FROM users
+      WHERE id = last_insert_rowid() AND email = ? AND changes() = 1`,
+  ).bind(now, email);
+  const result = (await c.env.DB.batch([insertUser, insertRole]))[0]!;
   if (!result.meta.changes) {
     if (!await registrationEnabled(c.env.DB)) throw registrationDisabled();
     throw conflict('email already exists');

@@ -35,7 +35,7 @@ async function fixture(t) {
     INSERT INTO projects (id,customer_id,code,name,created_at,updated_at) VALUES
       (1,1,'main','Main project',1,1),(2,2,'private','Private project',1,1),(3,1,'restricted','Restricted project',1,1);
     INSERT INTO memberships (user_id,customer_id,role,created_at) VALUES
-      (2,1,'developer',1),(3,1,'viewer',1),(5,1,'customer_admin',1),(7,1,'developer',1),(8,2,'developer',1);
+      (2,1,'developer',1),(3,1,'viewer',1),(4,1,'viewer',1),(5,1,'customer_admin',1),(7,1,'developer',1),(8,2,'developer',1);
     INSERT INTO project_memberships (user_id,project_id,role,created_at) VALUES (5,3,'viewer',1);
   `);
   const objects = new Map();
@@ -193,8 +193,9 @@ test('announcement visibility and publishing follow effective project permission
   assert.deepEqual((await f.list({ userId: 2 })).publishableProjects.map((p) => p.id).sort(), [1, 3]);
   assert.deepEqual((await f.list({ userId: 5 })).publishableProjects.map((p) => p.id), [1]);
   const observer = await f.list({ userId: 4 });
-  assert.equal(observer.items.length, 3);
-  assert.ok(observer.items.some((item) => item.id === privateItem.id));
+  assert.deepEqual(observer.items.map((item) => item.id).sort(), [main.id, restricted.id].sort());
+  assert.ok(!observer.items.some((item) => item.id === privateItem.id));
+  await f.list({ userId: 4, status: 403 }, '?projectId=2');
   assert.deepEqual(observer.publishableProjects, []);
   assert.deepEqual((await f.list({ userId: 9 })).items, []);
   for (const userId of [3, 4, 9]) await f.create('Denied publication', { userId, status: 403 });

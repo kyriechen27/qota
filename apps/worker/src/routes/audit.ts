@@ -1,5 +1,5 @@
 // Audit log reader. Scoped by caller's visibility:
-//   - super_admin/admin/observer see everything (optionally filtered)
+//   - super_admin/admin see everything (optionally filtered)
 //   - unfiltered non-global readers see authorized projects, inherited customer
 //     events, and their own actions; a project-only grant cannot reveal its
 //     customer's other projects or customer-wide events
@@ -20,7 +20,7 @@ export const auditRoutes = new Hono<AppEnv>();
 auditRoutes.use('*', requireUser);
 
 function isGlobalVisible(role: string) {
-  return role === 'super_admin' || role === 'admin' || role === 'observer';
+  return role === 'super_admin' || role === 'admin';
 }
 
 interface Row {

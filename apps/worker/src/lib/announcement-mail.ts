@@ -11,15 +11,15 @@ const SEND_BATCH_SIZE = 3;
 const STALE_CLAIM_MS = 5 * 60_000;
 
 // Parameters: project id. Match requireProjectAccess(..., 'view'), including
-// project overrides and global observers, and exclude disabled accounts.
+// project overrides and scoped observers, and exclude disabled accounts.
 const RECIPIENTS_SQL = `SELECT u.id, u.email, u.display_name AS displayName
   FROM users u JOIN projects p ON p.id = ?
   LEFT JOIN user_global_roles gr ON gr.user_id = u.id
   LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = u.id
   LEFT JOIN memberships cm ON cm.id = ${customerMembershipIdSql('p.customer_id', 'u.id')}
   WHERE u.is_active = 1 AND (
-    COALESCE(gr.role, u.role) IN ('super_admin', 'admin', 'observer') OR
-    (COALESCE(gr.role, u.role) = 'developer' AND COALESCE(pm.role, cm.role) IS NOT NULL)
+    COALESCE(gr.role, u.role) IN ('super_admin', 'admin') OR
+    (COALESCE(gr.role, u.role) IN ('developer', 'observer') AND COALESCE(pm.role, cm.role) IS NOT NULL)
   )`;
 
 export function announcementRecipientIds(value: unknown): number[] {

@@ -43,7 +43,7 @@ async function fixture(t, { beforeCurrentMigration = false, beforeMultiFileMigra
     INSERT INTO projects (id, customer_id, code, name, created_at, updated_at) VALUES
       (1, 1, 'one', 'Project one', 1, 1), (2, 2, 'two', 'Project two', 1, 1);
     INSERT INTO memberships (user_id, customer_id, role, created_at) VALUES
-      (2, 1, 'developer', 1), (3, 1, 'viewer', 1),
+      (2, 1, 'developer', 1), (3, 1, 'viewer', 1), (4, 1, 'viewer', 1),
       (5, 1, 'customer_admin', 1), (7, 1, 'developer', 1);
   `);
   const tokens = new Map();

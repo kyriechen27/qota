@@ -3,7 +3,7 @@
 // Roles:
 //   - users.role = 'super_admin'  → implicit access to everything
 //   - users.role = 'admin'        → global management except super-admin users
-//   - users.role = 'observer'     → global read/download only
+//   - users.role = 'observer'     → read/download only within memberships
 //   - users.role = 'developer'    → no global access; relies on memberships
 //
 // Customer-scoped roles (in `memberships` and `project_memberships` tables):
@@ -65,7 +65,7 @@ const GLOBAL_OBSERVER_ACTIONS = new Set<Action>(['view', 'download']);
 function globalRoleHas(user: AuthedUser, action: Action): boolean | null {
   if (user.role === 'super_admin') return true;
   if (user.role === 'admin') return GLOBAL_ADMIN_ACTIONS.has(action);
-  if (user.role === 'observer') return GLOBAL_OBSERVER_ACTIONS.has(action);
+  if (user.role === 'observer') return GLOBAL_OBSERVER_ACTIONS.has(action) ? null : false;
   return null;
 }
 
@@ -121,7 +121,7 @@ export function projectAccessSql(
       ON permission_cm.id = ${customerMembershipIdSql('permission_project.customer_id', 'permission_user.id')}
     WHERE permission_user.id = ${userIdSql} AND permission_user.is_active = 1 AND (
       COALESCE(permission_global.role, permission_user.role) IN ('super_admin', 'admin')
-      ${GLOBAL_OBSERVER_ACTIONS.has(action) ? "OR COALESCE(permission_global.role, permission_user.role) = 'observer'" : ''}
+      ${GLOBAL_OBSERVER_ACTIONS.has(action) ? "OR (COALESCE(permission_global.role, permission_user.role) = 'observer' AND COALESCE(permission_pm.role, permission_cm.role) IS NOT NULL)" : ''}
       OR (COALESCE(permission_global.role, permission_user.role) = 'developer'
         AND COALESCE(permission_pm.role, permission_cm.role) IN (${roles})
         ${ownerIdSql ? `AND (permission_user.id = ${ownerIdSql} OR COALESCE(permission_pm.role, permission_cm.role) = 'customer_admin')` : ''})
@@ -216,7 +216,7 @@ export async function visibleCustomerIds(
   db: D1Database,
   user: AuthedUser,
 ): Promise<number[] | null> {
-  if (user.role === 'super_admin' || user.role === 'admin' || user.role === 'observer') return null;
+  if (user.role === 'super_admin' || user.role === 'admin') return null;
   const rows = await db.prepare(`SELECT id FROM customers WHERE id IN ${inheritedCustomerIdsSql('?')}
     UNION SELECT p.customer_id AS id FROM project_memberships pm
       JOIN projects p ON p.id = pm.project_id WHERE pm.user_id = ?`)
@@ -229,7 +229,7 @@ export async function visibleProjectIds(
   db: D1Database,
   user: AuthedUser,
 ): Promise<number[] | null> {
-  if (user.role === 'super_admin' || user.role === 'admin' || user.role === 'observer') return null;
+  if (user.role === 'super_admin' || user.role === 'admin') return null;
   const rows = await db
     .prepare(
       `SELECT DISTINCT p.id FROM projects p

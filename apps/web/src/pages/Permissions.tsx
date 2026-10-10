@@ -180,7 +180,8 @@ function GrantDialog({ users, customers, projects, rows, loading, loadError, ini
   const [selected, setSelected] = useState<Set<number>>(new Set(initialProjectId ? [initialProjectId] : []));
   const tree = useMemo(() => customerHierarchy(customers), [customers]);
   const selectedUser = users.find((user) => user.id === userId);
-  const hasGlobalAccess = selectedUser && ['super_admin', 'admin', 'observer'].includes(selectedUser.role);
+  const hasGlobalAccess = selectedUser && ['super_admin', 'admin'].includes(selectedUser.role);
+  const isObserver = selectedUser?.role === 'observer';
   const directProjects = projects.filter((project) => project.customerId === customerId);
   const existingProjects = new Map(rows.filter((row): row is ProjectMembership & { scope: 'project' } => row.scope === 'project' && row.userId === userId).map((row) => [row.projectId, row]));
   const customerGrants = new Map(rows.filter((row): row is Membership & { scope: 'customer' } => row.scope === 'customer' && row.userId === userId).map((row) => [row.customerId, row]));
@@ -222,6 +223,7 @@ function GrantDialog({ users, customers, projects, rows, loading, loadError, ini
       <fieldset disabled={disabled}>
         <label><span className="lbl">{t('mem.fldUser')}</span><select aria-label={t('mem.fldUser')} value={userId || ''} onChange={(event) => { setUserId(Number(event.target.value)); resetChoices(); }} required><option value="" disabled>{t('common.select')}</option>{users.map((user) => <option key={user.id} value={user.id}>{userLabel(user)}</option>)}</select></label>
         {hasGlobalAccess && <p className="membership-scope-note membership-existing-note">{t('mem.globalAccessHint')}</p>}
+        {isObserver && <p className="membership-scope-note membership-existing-note">{t('mem.observerAccessHint')}</p>}
         <label><span className="lbl">{t('mem.fldCustomer')}</span><select aria-label={t('mem.fldCustomer')} value={customerId || ''} onChange={(event) => { setCustomerId(Number(event.target.value)); resetChoices(); }} required><option value="" disabled>{t('common.select')}</option>{tree.entries.map(({ customer, path }) => <option key={customer.id} value={customer.id}>{path} ({customer.code})</option>)}</select></label>
         <label><span className="lbl">{t('mem.fldScope')}</span><select aria-label={t('mem.fldScope')} value={scope} onChange={(event) => { setScope(event.target.value as 'project' | 'customer'); resetChoices(); }}><option value="project">{t('mem.scopeProject')}</option><option value="customer">{t('mem.scopeCustomer')}</option></select></label>
         <p className="membership-scope-note">{t(scope === 'project' ? 'mem.projectScopeHint' : 'mem.customerScopeHint')}</p>

@@ -5,6 +5,7 @@ import { api } from '../lib/api';
 import { startUpload, type UploadJobHandle } from '../lib/upload';
 import { formatBytes } from '../lib/utils';
 import { useI18n } from '../lib/i18n';
+import { useAuth } from '../lib/auth';
 import { customerHierarchy } from '../lib/customer-tree';
 import { groupVersions } from '../lib/version-groups';
 import VersionNotesPreview from '../components/VersionNotesPreview';
@@ -13,6 +14,8 @@ import MailRecipients, { emptyMailSelection } from '../components/MailRecipients
 import type { ApiToken, Project, Version } from '@qota/shared';
 
 export default function ProjectDetail() {
+  const { user } = useAuth();
+  const isObserver = user?.role === 'observer';
   const { id } = useParams<{ id: string }>();
   const projectId = Number(id);
   const activeProjectId = useRef(projectId);
@@ -128,7 +131,7 @@ export default function ProjectDetail() {
       setCustomerPath(customerHierarchy(customers).paths.get(p.customerId) ?? '');
       const [v, tk] = await Promise.all([
         api.listVersions(projectId),
-        api.listApiTokens(projectId).catch(() => [] as ApiToken[]),
+        isObserver ? Promise.resolve([] as ApiToken[]) : api.listApiTokens(projectId).catch(() => [] as ApiToken[]),
       ]);
       if (!isCurrentRequest()) return;
       setVersions(v);
@@ -404,7 +407,7 @@ export default function ProjectDetail() {
   };
   const renderVersionActions = (v: Version, showCurrentAction = true) => (
     <div className="version-row-actions">
-      {showCurrentAction && v.status === 'ready' && (
+      {!isObserver && showCurrentAction && v.status === 'ready' && (
         <button
           className={`version-current-action${v.isCurrent ? ' is-active' : ''}`}
           onClick={() => setCurrentVersion(v.version, !v.isCurrent)}
@@ -414,17 +417,17 @@ export default function ProjectDetail() {
           {v.isCurrent ? t('pd.unsetCurrent') : t('pd.setCurrent')}
         </button>
       )}
-      {v.status === 'ready' && (
+      {!isObserver && v.status === 'ready' && (
         <button onClick={() => archiveVer(v)} disabled={versionBusy}>
           {t('pd.archive')}
         </button>
       )}
-      {v.status === 'archived' && (
+      {!isObserver && v.status === 'archived' && (
         <button onClick={() => restoreVer(v)} disabled={versionBusy}>
           {t('pd.restore')}
         </button>
       )}
-      <span className="version-action-divider" aria-hidden="true" />
+      {!isObserver && <span className="version-action-divider" aria-hidden="true" />}
       <button
         className="version-icon-button"
         onClick={() => download(v)}
@@ -434,7 +437,7 @@ export default function ProjectDetail() {
       >
         <VersionIcon name="download" />
       </button>
-      <button
+      {!isObserver && <><button
         onClick={() => openPublic(v)}
         disabled={v.status !== 'ready' && !v.publicSlug}
         className={`version-icon-button${v.publicSlug ? ' is-public' : ''}`}
@@ -451,7 +454,7 @@ export default function ProjectDetail() {
         aria-label={t('common.delete')}
       >
         <VersionIcon name="delete" />
-      </button>
+      </button></>}
     </div>
   );
   const renderUploadTime = (timestamp: number) => (
@@ -561,7 +564,7 @@ export default function ProjectDetail() {
                     </div>
                   </td>
                   <td>
-                    <button
+                    {isObserver ? <span className="version-special-label" title={first.specialVersion ?? ''}>{first.specialVersion ?? ''}</span> : <button
                       type="button"
                       className="version-special-button"
                       title={first.specialVersion || t('pd.editSpecialVersion', { version: group.label })}
@@ -573,7 +576,7 @@ export default function ProjectDetail() {
                     >
                       <span className="version-special-label">{first.specialVersion ?? ''}</span>
                       <VersionIcon name="edit" />
-                    </button>
+                    </button>}
                   </td>
                   <td className="version-notes-cell">{renderNotes(group.items, 'version')}</td>
                   <td>
@@ -596,7 +599,7 @@ export default function ProjectDetail() {
                   <td>{group.totalDownloads}</td>
                   <td className="version-actions-cell">
                     <div className="version-row-actions" onClick={(e) => e.stopPropagation()}>
-                      {group.hasReady && (
+                      {!isObserver && group.hasReady && (
                         <>
                           <button
                             type="button"
@@ -616,7 +619,7 @@ export default function ProjectDetail() {
                           </button>
                         </>
                       )}
-                      {archived && (
+                      {!isObserver && archived && (
                         <button
                           type="button"
                           onClick={() => setGroupStatus(group.label, 'ready')}
@@ -665,7 +668,7 @@ export default function ProjectDetail() {
         <div className="version-card-header">
           <div className="version-section-title"><h3>{t('pd.versions')}</h3><span className="version-count">{versionGroups.length}</span></div>
           <div className="version-actions">
-            {canPublishAnnouncements && <button className="primary" onClick={() => setShowUpload(true)}>
+            {!isObserver && canPublishAnnouncements && <button className="primary" onClick={() => setShowUpload(true)}>
               {t('pd.uploadNew')}
             </button>}
           </div>
@@ -692,7 +695,7 @@ export default function ProjectDetail() {
         ) : <p className="version-empty-archive">{t('pd.noArchives')}</p>}
       </div>
 
-      <div className="card">
+      {!isObserver && <div className="card">
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
           <h3 style={{ margin: 0 }}>{t('pd.apiTokens')}</h3>
           <button
@@ -780,9 +783,9 @@ export default function ProjectDetail() {
           </tbody>
         </table>
         </div>
-      </div>
+      </div>}
 
-      {specialVersionDialog !== null && (
+      {!isObserver && specialVersionDialog !== null && (
         <SpecialVersionDialog
           version={specialVersionDialog}
           value={versions.find((v) => v.version === specialVersionDialog)?.specialVersion ?? ''}
@@ -803,8 +806,8 @@ export default function ProjectDetail() {
           version={notesDialog.version}
           showVersionNotes={notesDialog.scope === 'version'}
           versionNotes={versions.find((v) => v.version === notesDialog.version)?.versionNotes ?? null}
-          canEditVersionNotes={versions.find((v) => v.version === notesDialog.version)?.canEditVersionNotes ?? false}
-          items={versions.filter((v) => notesDialog.items.some((item) => item.id === v.id))}
+          canEditVersionNotes={!isObserver && (versions.find((v) => v.version === notesDialog.version)?.canEditVersionNotes ?? false)}
+          items={versions.filter((v) => notesDialog.items.some((item) => item.id === v.id)).map((v) => isObserver ? { ...v, canEditNotes: false } : v)}
           current={versions.some((v) => v.version === notesDialog.version && v.isCurrent)}
           onClose={() => setNotesDialog(null)}
           onSave={async (versionId, updatedNotes) => {
@@ -819,7 +822,7 @@ export default function ProjectDetail() {
         />
       )}
 
-      {showUpload && (
+      {!isObserver && showUpload && (
         <UploadFilesDialog
           key={`upload-${projectId}`}
           projectId={projectId}
@@ -832,7 +835,7 @@ export default function ProjectDetail() {
         />
       )}
 
-      {showTokenDlg && (
+      {!isObserver && showTokenDlg && (
         <dialog ref={tokDialogRef} className="dialog token-dialog" aria-labelledby="token-dialog-title" onCancel={(e) => { e.preventDefault(); if (!tokBusyRef.current) setShowTokenDlg(false); }}>
           <form onSubmit={createToken}>
             <h3 id="token-dialog-title">{t('pd.dlgIssueToken')}</h3>
@@ -964,7 +967,7 @@ export default function ProjectDetail() {
         </dialog>
       )}
 
-      {publicVer && (
+      {!isObserver && publicVer && (
         <div className="dialog-backdrop" onClick={() => setPublicVer(null)}>
           <div className="dialog" onClick={(e) => e.stopPropagation()}>
             <h3>

@@ -128,11 +128,12 @@ test('public signup normalizes email, hashes credentials and cannot inject globa
   assert.equal(user.is_active, 1);
   assert.notEqual(user.password_hash, signupPassword);
   assert.ok(await verifyPassword(signupPassword, user.password_hash));
-  for (const table of ['user_global_roles', 'memberships', 'project_memberships']) {
+  assert.deepEqual(f.db._db.prepare('SELECT role FROM user_global_roles WHERE user_id=?').all(user.id), [{ role: 'observer' }]);
+  for (const table of ['memberships', 'project_memberships']) {
     assert.equal(f.db._db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE user_id=?`).get(user.id).n, 0);
   }
   const login = await f.login(' NEW@EXAMPLE.TEST ', signupPassword);
-  assert.equal(login.user.role, 'developer');
+  assert.equal(login.user.role, 'observer');
   assert.equal(login.user.email, 'new@example.test');
   const auth = { token: login.token };
   assert.deepEqual(await f.request('/api/auth/me', auth), login.user);
@@ -186,40 +187,50 @@ test('the final signup write rechecks a switch closed during registration and ha
   for (const change of ['close', 'duplicate']) {
     const f = await fixture(t);
     await f.toggle(true);
-    const prepare = f.db.prepare.bind(f.db);
+    const batch = f.db.batch.bind(f.db);
     let interleaved = false;
-    f.db.prepare = (sql) => {
-      const statement = prepare(sql);
-      if (/INSERT INTO users/.test(sql)) {
-        const bind = statement.bind.bind(statement);
-        statement.bind = (...args) => {
-          const bound = bind(...args);
-          const run = bound.run.bind(bound);
-          bound.run = async () => {
-            if (change === 'close') f.db._db.prepare('UPDATE registration_settings SET enabled=0 WHERE id=1').run();
-            else f.db._db.prepare(`INSERT INTO users(email,password_hash,display_name,role,created_at,updated_at)
-              VALUES('new@example.test',?,'Concurrent winner','developer',1,1)`).run(await seedHash);
-            interleaved = true;
-            return run();
-          };
-          return bound;
-        };
+    f.db.batch = async (queries) => {
+      if (queries.some((query) => /INSERT INTO users/.test(query.sql))) {
+        if (change === 'close') f.db._db.prepare('UPDATE registration_settings SET enabled=0 WHERE id=1').run();
+        else {
+          f.db._db.prepare(`INSERT INTO users(email,password_hash,display_name,role,created_at,updated_at)
+            VALUES('new@example.test',?,'Concurrent winner','developer',1,1)`).run(await seedHash);
+          f.db._db.prepare(`INSERT INTO user_global_roles(user_id,role,updated_at)
+            SELECT id,'admin',1 FROM users WHERE email='new@example.test'`).run();
+        }
+        interleaved = true;
       }
-      return statement;
+      return batch(queries);
     };
     const result = await f.signup({}, { status: change === 'close' ? 403 : 409 });
     assert.equal(interleaved, true);
     if (change === 'close') {
       assert.equal(result.error, 'registration_disabled');
       assert.equal(f.count(), 5);
+      assert.equal(f.db._db.prepare('SELECT COUNT(*) AS n FROM user_global_roles').get().n, 2);
     } else {
       assert.equal(f.count(), 6);
       const winner = f.db._db.prepare("SELECT display_name,password_hash FROM users WHERE email='new@example.test'").get();
       assert.equal(winner.display_name, 'Concurrent winner');
       assert.equal(winner.password_hash, await seedHash);
+      assert.equal(f.db._db.prepare(`SELECT gr.role FROM users u JOIN user_global_roles gr ON gr.user_id=u.id WHERE u.email='new@example.test'`).get().role, 'admin');
     }
     f.auditHasNoCredentials(signupPassword, seedPassword);
   }
+});
+
+test('signup rolls back its new account when the observer role cannot be saved in the same transaction', async (t) => {
+  const f = await fixture(t);
+  await f.toggle(true);
+  f.db._db.exec(`CREATE TRIGGER reject_new_registration_role BEFORE INSERT ON user_global_roles
+    WHEN NEW.user_id > 5 BEGIN SELECT RAISE(ABORT, 'isolated observer role write failure'); END`);
+  await f.signup({}, { status: 500 });
+  assert.equal(f.count(), 5);
+  assert.equal(f.db._db.prepare('SELECT COUNT(*) AS n FROM user_global_roles').get().n, 2);
+  assert.equal(f.db._db.prepare("SELECT COUNT(*) AS n FROM audit_logs WHERE action='auth.register'").get().n, 0);
+  f.db._db.exec('DROP TRIGGER reject_new_registration_role');
+  await f.signup();
+  assert.equal((await f.login('new@example.test', signupPassword)).user.role, 'observer');
 });
 
 test('administrator creation and password reset reject mismatched confirmations without partial edits and retain legacy omission support', async (t) => {
