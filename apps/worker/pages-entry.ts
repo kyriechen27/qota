@@ -29,6 +29,7 @@ import migration0012 from './migrations/0012_announcements.sql';
 import migration0013 from './migrations/0013_mail.sql';
 import migration0014 from './migrations/0014_api_token_restrictions.sql';
 import migration0015 from './migrations/0015_customer_hierarchy.sql';
+import migration0016 from './migrations/0016_registration.sql';
 
 interface PagesEnv extends Bindings {
   ASSETS: Fetcher;
@@ -74,6 +75,7 @@ async function ensureSchema(env: PagesEnv): Promise<void> {
     await ensureMail(env);
     await ensureTokenRestrictions(env);
     await ensureCustomerHierarchy(env);
+    await ensureRegistration(env);
     schemaReady = true;
     console.log('[schema] initialized D1 tables on first run');
     return;
@@ -94,6 +96,7 @@ async function ensureSchema(env: PagesEnv): Promise<void> {
   await ensureMail(env);
   await ensureTokenRestrictions(env);
   await ensureCustomerHierarchy(env);
+  await ensureRegistration(env);
   schemaReady = true;
 }
 
@@ -202,6 +205,14 @@ async function ensureCustomerHierarchy(env: PagesEnv): Promise<void> {
     const sql = migration0015.split(/^-- statement-breakpoint\s*$/m).map((statement) => statement.trim()).filter(Boolean);
     await env.DB.batch(sql.map((statement) => env.DB.prepare(statement)));
     console.log('[schema] added customer hierarchy');
+  }
+}
+
+async function ensureRegistration(env: PagesEnv): Promise<void> {
+  const row = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'registration_settings'").first();
+  if (!row) {
+    await env.DB.batch(statements(migration0016).map((statement) => env.DB.prepare(statement)));
+    console.log('[schema] added registration settings, disabled by default');
   }
 }
 

@@ -24,8 +24,26 @@
 .hierarchy-field-hint { margin: 7px 0 12px; font-size: 12px; line-height: 1.7; }
 .membership-filters { flex-wrap: wrap; }
 .membership-filters > select { max-width: 300px; min-width: 160px; }
-.membership-table { min-width: 980px !important; }
+.membership-table { min-width: 1100px !important; table-layout: fixed; }
 .membership-table td:first-child { max-width: 260px; overflow-wrap: anywhere; }
+.membership-table-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.membership-table th { white-space: nowrap; }
+.membership-user-group { cursor: pointer; }
+.membership-user-group td { background: #171f2b; height: 68px; }
+.membership-user-group:hover td { background: #1c2735; }
+.membership-user-heading { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.membership-user-identity { display: flex; flex-direction: column; min-width: 0; max-width: 440px; gap: 5px; }
+.membership-user-identity strong, .membership-user-identity > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.membership-user-identity strong { font-size: 13px; font-weight: 600; color: #e6edf6; }
+.membership-user-identity > span { color: var(--muted); font-size: 11px; }
+.membership-user-count { flex-shrink: 0; font-size: 11px; color: #91a0b5; padding: 3px 8px; border: 1px solid #303b4c; border-radius: 12px; white-space: nowrap; }
+.membership-user-toggle { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 30px; width: 30px; height: 30px; padding: 7px; border-color: transparent; background: transparent; color: var(--muted); }
+.membership-user-toggle svg { width: 14px; height: 14px; transition: transform 0.15s; }
+.membership-user-toggle.is-expanded svg { transform: rotate(90deg); }
+.membership-group-action { padding: 5px 9px; font-size: 12px; min-height: 32px; background: transparent; white-space: nowrap; }
+.membership-detail-row td { vertical-align: middle; }
+.membership-detail-row select { max-width: 100%; }
+.membership-detail-user { display: block; padding-left: 36px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; }
 .membership-target { max-width: 420px; min-width: 180px; overflow-wrap: anywhere; }
 .membership-grant-coverage { display: block; color: var(--muted); font-size: 11px; line-height: 1.6; margin-top: 4px; }
 .dialog.membership-grant-dialog { width: 620px; }

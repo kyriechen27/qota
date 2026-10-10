@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import type { AppEnv, GlobalRole } from '../env';
 import { requireAdmin, requireUser } from '../middleware/auth';
-import { hashPassword } from '../utils/password';
+import { hashPassword, validatePasswordConfirmation } from '../utils/password';
 import { badRequest, conflict, forbidden, notFound } from '../utils/errors';
 import { audit } from '../lib/audit';
 import { baseGlobalRoleFor, EFFECTIVE_GLOBAL_ROLE_SQL, setUserGlobalRole } from '../lib/global-roles';
@@ -60,6 +60,24 @@ function dto(row: UserRow) {
   };
 }
 
+userRoutes.put('/registration', async (c) => {
+  const body = await c.req.json<{ enabled?: unknown }>().catch(() => null);
+  if (typeof body?.enabled !== 'boolean') throw badRequest('enabled must be a boolean');
+  const me = c.get('user')!;
+  const result = await c.env.DB.prepare(
+    `INSERT INTO registration_settings (id, enabled, updated_by, updated_at)
+     SELECT 1, ?, ?, ? WHERE EXISTS (
+       SELECT 1 FROM users u LEFT JOIN user_global_roles ugr ON ugr.user_id = u.id
+       WHERE u.id = ? AND u.is_active = 1 AND ${EFFECTIVE_GLOBAL_ROLE_SQL} IN ('super_admin', 'admin')
+     )
+     ON CONFLICT (id) DO UPDATE SET enabled = excluded.enabled,
+       updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+  ).bind(body.enabled ? 1 : 0, me.id, Date.now(), me.id).run();
+  if (!result.meta.changes) throw forbidden('admin only');
+  await audit(c, { action: 'registration.settings.update', targetType: 'registration_settings', targetId: 1, meta: { enabled: body.enabled } });
+  return c.json({ enabled: body.enabled });
+});
+
 userRoutes.get('/', async (c) => {
   const rows = await c.env.DB.prepare(
     `SELECT u.id, u.email, u.display_name, ${EFFECTIVE_GLOBAL_ROLE_SQL} AS role,
@@ -75,14 +93,16 @@ userRoutes.post('/', async (c) => {
   type CreateBody = {
     email?: string;
     password?: string;
+    confirmPassword?: unknown;
     displayName?: string;
     role?: GlobalRole;
   };
   const body = (await c.req.json<CreateBody>().catch(() => ({} as CreateBody))) as CreateBody;
-  const email = body.email?.trim().toLowerCase();
-  if (!email || !body.password || body.password.length < 8) {
+  const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
+  if (!email || typeof body.password !== 'string' || body.password.length < 8) {
     throw badRequest('email and password (>=8 chars) required');
   }
+  validatePasswordConfirmation(body.password, body.confirmPassword);
   const role = parseRole(body.role);
   const me = c.get('user')!;
   if (!canAssignRole(me.role, role)) {
@@ -121,8 +141,11 @@ userRoutes.patch('/:id', async (c) => {
     role?: GlobalRole;
     isActive?: boolean;
     password?: string;
+    confirmPassword?: unknown;
   };
   const body = (await c.req.json<PatchBody>().catch(() => ({} as PatchBody))) as PatchBody;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw badRequest('user details required');
+  validatePasswordConfirmation(body.password, body.confirmPassword);
   const me = c.get('user')!;
   const existing = await c.env.DB.prepare(
     `SELECT u.id, ${EFFECTIVE_GLOBAL_ROLE_SQL} AS role, u.is_active
@@ -167,7 +190,7 @@ userRoutes.patch('/:id', async (c) => {
     args.push(body.isActive ? 1 : 0);
   }
   if (body.password) {
-    if (body.password.length < 8) throw badRequest('password too short');
+    if (typeof body.password !== 'string' || body.password.length < 8) throw badRequest('password too short');
     sets.push('password_hash = ?');
     args.push(await hashPassword(body.password));
   }

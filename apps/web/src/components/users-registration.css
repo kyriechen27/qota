@@ -1,0 +1,32 @@
+.registration-settings { margin-bottom: 20px; }
+.registration-settings-heading { display: flex; justify-content: space-between; align-items: center; gap: 24px; }
+.registration-settings-heading > div { min-width: 0; }
+.registration-settings-heading h3 { font-size: 14px; margin: 0 0 7px; }
+.registration-settings-heading p { font-size: 12px; line-height: 1.7; margin: 0; max-width: 760px; }
+.registration-toggle { display: inline-flex; align-items: center; gap: 9px; margin: 0; flex-shrink: 0; cursor: pointer; font-size: 13px; }
+.registration-switch { display: inline-flex; position: relative; width: 38px; height: 24px; flex-shrink: 0; }
+.registration-switch input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; margin: 0; cursor: pointer; z-index: 1; }
+.registration-switch > span { width: 38px; height: 24px; border-radius: 20px; background: #384353; transition: background 0.15s; }
+.registration-switch > span::after { content: ''; position: absolute; width: 16px; height: 16px; top: 4px; left: 4px; border-radius: 50%; background: #cbd5e1; transition: transform 0.15s; }
+.registration-switch input:checked + span { background: #347aa0; }
+.registration-switch input:checked + span::after { transform: translateX(14px); background: white; }
+.registration-switch input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 3px; }
+.registration-switch input:disabled { cursor: wait; }
+.registration-switch input:disabled + span { opacity: 0.6; }
+.registration-settings-status { margin: 12px 0 0; font-size: 12px; }
+.registration-settings-error { display: flex; align-items: center; gap: 12px; justify-content: space-between; margin-top: 12px; font-size: 12px; overflow-wrap: anywhere; }
+.registration-settings-error button { flex-shrink: 0; }
+.dialog.user-password-dialog { width: 480px; min-width: 0; max-width: calc(100vw - 32px); max-height: calc(100dvh - 32px); margin: auto; color: var(--text); }
+.user-password-dialog::backdrop { background: rgb(5 9 15 / 72%); }
+.user-password-dialog fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+.user-password-dialog label { display: block; margin: 14px 0; }
+.user-password-dialog .lbl { display: block; margin-bottom: 6px; }
+.user-password-dialog input, .user-password-dialog select { width: 100%; }
+.user-password-dialog .error, .password-confirmation-message { margin: 12px 0; font-size: 12px; overflow-wrap: anywhere; }
+.user-password-dialog .password-dialog-description { color: var(--muted); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; margin: -6px 0 14px; }
+.password-range-hint { color: var(--muted); font-size: 12px; line-height: 1.6; margin: 8px 0 14px; }
+@media (max-width: 640px) {
+  .registration-settings-heading { flex-direction: column; align-items: stretch; gap: 14px; }
+  .registration-toggle { align-self: flex-start; min-height: 32px; }
+  .dialog.user-password-dialog { padding: 20px 16px; }
+}

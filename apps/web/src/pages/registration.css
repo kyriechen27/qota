@@ -1,0 +1,7 @@
+.registration-page { padding: 28px 16px; }
+.registration-page .login-card { width: 420px; max-width: 100%; }
+.registration-page input { width: 100%; }
+.registration-submit { width: 100%; margin-top: 4px; }
+.registration-link { margin-top: 20px; text-align: center; font-size: 13px; }
+.registration-notice { margin-top: 22px; line-height: 1.7; }
+.registration-success { margin-bottom: 18px; line-height: 1.6; }

@@ -1,0 +1,33 @@
+export const usersRegistrationZh: Record<string, string> = {
+  'password.newPassword': '新密码',
+  'password.confirmPassword': '确认密码',
+  'password.rangeHint': '密码长度为 8–128 位，请再次输入相同密码确认。',
+  'password.invalidLength': '密码长度须为 8–128 位。',
+  'password.mismatch': '两次输入的密码不一致。',
+  'users.resetPasswordFor': '为 {email} 设置新密码',
+  'users.resetPasswordSubmit': '重置密码',
+  'registrationSettings.title': '用户注册',
+  'registrationSettings.enabled': '开放用户注册',
+  'registrationSettings.description': '关闭后不影响已有用户登录。新注册账号需要管理员分配客户或项目权限后，才能访问对应内容。',
+  'registrationSettings.saved': '注册设置已保存。',
+  'registrationSettings.saving': '正在保存注册设置…',
+  'registrationSettings.loadError': '无法加载注册设置。',
+  'registrationSettings.saveError': '保存注册设置失败，请重试。',
+};
+
+export const usersRegistrationEn: Record<string, string> = {
+  'password.newPassword': 'New password',
+  'password.confirmPassword': 'Confirm password',
+  'password.rangeHint': 'Use 8–128 characters, then enter the same password again to confirm.',
+  'password.invalidLength': 'Passwords must contain 8–128 characters.',
+  'password.mismatch': 'The two passwords do not match.',
+  'users.resetPasswordFor': 'Set a new password for {email}',
+  'users.resetPasswordSubmit': 'Reset password',
+  'registrationSettings.title': 'User registration',
+  'registrationSettings.enabled': 'Allow user registration',
+  'registrationSettings.description': 'Disabling registration does not affect existing sign-ins. An administrator must grant new accounts customer or project access before they can view that content.',
+  'registrationSettings.saved': 'Registration settings saved.',
+  'registrationSettings.saving': 'Saving registration settings…',
+  'registrationSettings.loadError': 'Unable to load registration settings.',
+  'registrationSettings.saveError': 'Unable to save registration settings. Please try again.',
+};

@@ -2130,6 +2130,11 @@ function constantTimeEqual(a, b) {
 var ITERATIONS = 1e5;
 var KEYLEN = 32;
 var SALT_LEN = 16;
+function validatePasswordConfirmation(password, confirmation, required = false) {
+  if ((required || confirmation !== void 0) && (typeof confirmation !== "string" || confirmation !== password)) {
+    throw badRequest("password confirmation does not match", "password_confirmation_mismatch");
+  }
+}
 async function pbkdf2(password, salt, iterations) {
   const key = await crypto.subtle.importKey(
     "raw",
@@ -2305,6 +2310,26 @@ async function audit(c, ev) {
   }
 }
 
+// apps/worker/src/lib/registration.ts
+async function registrationEnabled(db) {
+  const row = await db.prepare("SELECT enabled FROM registration_settings WHERE id = 1").first();
+  return row?.enabled === 1;
+}
+function registrationDisabled() {
+  return new HttpError(403, "registration_disabled", "registration is disabled");
+}
+function registrationEmail(value) {
+  if (typeof value !== "string" || /[\u0000-\u001f\u007f]/.test(value)) throw badRequest("invalid email");
+  const email = value.trim().toLowerCase();
+  const parts = email.split("@");
+  const local = parts[0] ?? "";
+  const domain = parts[1] ?? "";
+  if (email.length > 254 || parts.length !== 2 || !local || local.length > 64 || !/^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+$/.test(local) || local.startsWith(".") || local.endsWith(".") || local.includes("..") || !domain.includes(".") || !domain.split(".").every((part) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(part))) {
+    throw badRequest("invalid email");
+  }
+  return email;
+}
+
 // apps/worker/src/routes/auth.ts
 var authRoutes = new Hono2();
 function dto(r) {
@@ -2318,6 +2343,42 @@ function dto(r) {
     updatedAt: r.updated_at
   };
 }
+authRoutes.get("/registration", async (c) => {
+  c.header("Cache-Control", "no-store, max-age=0");
+  return c.json({ enabled: await registrationEnabled(c.env.DB) });
+});
+authRoutes.post("/register", async (c) => {
+  if (!await registrationEnabled(c.env.DB)) throw registrationDisabled();
+  const body = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw badRequest("registration details required");
+  const email = registrationEmail(body.email);
+  if (typeof body.password !== "string" || body.password.length < 8 || body.password.length > 128) {
+    throw badRequest("password must contain 8-128 characters");
+  }
+  validatePasswordConfirmation(body.password, body.confirmPassword, true);
+  if (body.displayName !== void 0 && body.displayName !== null && typeof body.displayName !== "string") {
+    throw badRequest("displayName must be a string");
+  }
+  const displayName = typeof body.displayName === "string" ? body.displayName.trim() : "";
+  if (displayName.length > 128 || /[\u0000-\u001f\u007f]/.test(displayName)) throw badRequest("invalid displayName");
+  const exists = await c.env.DB.prepare("SELECT id FROM users WHERE email = ?").bind(email).first();
+  if (exists) throw conflict("email already exists");
+  const hash2 = await hashPassword(body.password);
+  const now = Date.now();
+  const result = await c.env.DB.prepare(
+    `INSERT INTO users (email, password_hash, display_name, role, is_active, created_at, updated_at)
+     SELECT ?, ?, ?, 'developer', 1, ?, ?
+      WHERE EXISTS (SELECT 1 FROM registration_settings WHERE id = 1 AND enabled = 1)
+     ON CONFLICT (email) DO NOTHING`
+  ).bind(email, hash2, displayName || null, now, now).run();
+  if (!result.meta.changes) {
+    if (!await registrationEnabled(c.env.DB)) throw registrationDisabled();
+    throw conflict("email already exists");
+  }
+  const id = Number(result.meta.last_row_id);
+  await audit(c, { action: "auth.register", actorType: "user", actorId: id, targetType: "user", targetId: id });
+  return c.json({ ok: true }, 201);
+});
 authRoutes.post("/login", async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const identifier = body.email?.trim();
@@ -2412,9 +2473,10 @@ authRoutes.patch("/profile", requireUser, async (c) => {
 authRoutes.post("/change-password", requireUser, async (c) => {
   const u = c.get("user");
   const body = await c.req.json().catch(() => ({}));
-  if (!body.oldPassword || !body.newPassword || body.newPassword.length < 8) {
+  if (typeof body?.oldPassword !== "string" || !body.oldPassword || typeof body.newPassword !== "string" || body.newPassword.length < 8) {
     throw badRequest("oldPassword and newPassword (>=8 chars) required");
   }
+  validatePasswordConfirmation(body.newPassword, body.confirmPassword);
   const row = await c.env.DB.prepare("SELECT password_hash FROM users WHERE id = ?").bind(u.id).first();
   if (!row) throw unauthorized();
   const ok = await verifyPassword(body.oldPassword, row.password_hash);
@@ -2460,6 +2522,23 @@ function dto2(row) {
     updatedAt: row.updated_at
   };
 }
+userRoutes.put("/registration", async (c) => {
+  const body = await c.req.json().catch(() => null);
+  if (typeof body?.enabled !== "boolean") throw badRequest("enabled must be a boolean");
+  const me = c.get("user");
+  const result = await c.env.DB.prepare(
+    `INSERT INTO registration_settings (id, enabled, updated_by, updated_at)
+     SELECT 1, ?, ?, ? WHERE EXISTS (
+       SELECT 1 FROM users u LEFT JOIN user_global_roles ugr ON ugr.user_id = u.id
+       WHERE u.id = ? AND u.is_active = 1 AND ${EFFECTIVE_GLOBAL_ROLE_SQL} IN ('super_admin', 'admin')
+     )
+     ON CONFLICT (id) DO UPDATE SET enabled = excluded.enabled,
+       updated_by = excluded.updated_by, updated_at = excluded.updated_at`
+  ).bind(body.enabled ? 1 : 0, me.id, Date.now(), me.id).run();
+  if (!result.meta.changes) throw forbidden("admin only");
+  await audit(c, { action: "registration.settings.update", targetType: "registration_settings", targetId: 1, meta: { enabled: body.enabled } });
+  return c.json({ enabled: body.enabled });
+});
 userRoutes.get("/", async (c) => {
   const rows = await c.env.DB.prepare(
     `SELECT u.id, u.email, u.display_name, ${EFFECTIVE_GLOBAL_ROLE_SQL} AS role,
@@ -2472,10 +2551,11 @@ userRoutes.get("/", async (c) => {
 });
 userRoutes.post("/", async (c) => {
   const body = await c.req.json().catch(() => ({}));
-  const email = body.email?.trim().toLowerCase();
-  if (!email || !body.password || body.password.length < 8) {
+  const email = typeof body?.email === "string" ? body.email.trim().toLowerCase() : "";
+  if (!email || typeof body.password !== "string" || body.password.length < 8) {
     throw badRequest("email and password (>=8 chars) required");
   }
+  validatePasswordConfirmation(body.password, body.confirmPassword);
   const role = parseRole(body.role);
   const me = c.get("user");
   if (!canAssignRole(me.role, role)) {
@@ -2505,6 +2585,8 @@ userRoutes.patch("/:id", async (c) => {
   const id = Number(c.req.param("id"));
   if (!Number.isFinite(id)) throw badRequest("invalid id");
   const body = await c.req.json().catch(() => ({}));
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw badRequest("user details required");
+  validatePasswordConfirmation(body.password, body.confirmPassword);
   const me = c.get("user");
   const existing = await c.env.DB.prepare(
     `SELECT u.id, ${EFFECTIVE_GLOBAL_ROLE_SQL} AS role, u.is_active
@@ -2540,7 +2622,7 @@ userRoutes.patch("/:id", async (c) => {
     args.push(body.isActive ? 1 : 0);
   }
   if (body.password) {
-    if (body.password.length < 8) throw badRequest("password too short");
+    if (typeof body.password !== "string" || body.password.length < 8) throw badRequest("password too short");
     sets.push("password_hash = ?");
     args.push(await hashPassword(body.password));
   }
@@ -30991,6 +31073,9 @@ var api_token_restrictions_default = "-- NULL keeps existing tokens unrestricted
 // apps/worker/migrations/0015_customer_hierarchy.sql
 var customer_hierarchy_default = "-- Hierarchy is organizational only. Memberships remain independently scoped.\nALTER TABLE customers ADD COLUMN parent_id INTEGER REFERENCES customers(id) ON DELETE RESTRICT;\n-- statement-breakpoint\nCREATE INDEX idx_customers_parent ON customers(parent_id);\n-- statement-breakpoint\n-- AFTER INSERT also checks the actual AUTOINCREMENT id when none was supplied.\nCREATE TRIGGER customers_parent_insert\nAFTER INSERT ON customers\nWHEN NEW.parent_id IS NOT NULL\nBEGIN\n  SELECT RAISE(ABORT, 'customer_hierarchy_cycle')\n  WHERE EXISTS (\n    WITH RECURSIVE ancestors(id) AS (\n      SELECT NEW.parent_id\n      UNION\n      SELECT c.parent_id FROM customers c JOIN ancestors a ON c.id = a.id\n       WHERE c.parent_id IS NOT NULL\n    )\n    SELECT 1 FROM ancestors WHERE id = NEW.id\n  );\nEND;\n-- statement-breakpoint\nCREATE TRIGGER customers_parent_update\nBEFORE UPDATE OF parent_id, id ON customers\nWHEN NEW.parent_id IS NOT NULL\nBEGIN\n  SELECT RAISE(ABORT, 'customer_hierarchy_cycle')\n  WHERE EXISTS (\n    WITH RECURSIVE ancestors(id) AS (\n      SELECT NEW.parent_id\n      UNION\n      SELECT c.parent_id FROM customers c JOIN ancestors a ON c.id = a.id\n       WHERE c.parent_id IS NOT NULL\n    )\n    SELECT 1 FROM ancestors WHERE id = NEW.id\n  );\nEND;\n";
 
+// apps/worker/migrations/0016_registration.sql
+var registration_default = "CREATE TABLE IF NOT EXISTS registration_settings (\n  id INTEGER PRIMARY KEY CHECK (id = 1),\n  enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),\n  updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,\n  updated_at INTEGER NOT NULL DEFAULT 0\n);\n\nINSERT OR IGNORE INTO registration_settings (id, enabled, updated_at) VALUES (1, 0, 0);\n";
+
 // apps/worker/pages-entry.ts
 function statements(sql) {
   return sql.replace(/--[^\n]*/g, "").split(";").map((s) => s.trim()).filter((s) => s.length > 0 && !/^PRAGMA/i.test(s));
@@ -31020,6 +31105,7 @@ async function ensureSchema(env) {
     await ensureMail(env);
     await ensureTokenRestrictions(env);
     await ensureCustomerHierarchy(env);
+    await ensureRegistration(env);
     schemaReady = true;
     console.log("[schema] initialized D1 tables on first run");
     return;
@@ -31037,6 +31123,7 @@ async function ensureSchema(env) {
   await ensureMail(env);
   await ensureTokenRestrictions(env);
   await ensureCustomerHierarchy(env);
+  await ensureRegistration(env);
   schemaReady = true;
 }
 async function ensureColumn(env, table, column, stmts) {
@@ -31123,6 +31210,13 @@ async function ensureCustomerHierarchy(env) {
     const sql = customer_hierarchy_default.split(/^-- statement-breakpoint\s*$/m).map((statement) => statement.trim()).filter(Boolean);
     await env.DB.batch(sql.map((statement) => env.DB.prepare(statement)));
     console.log("[schema] added customer hierarchy");
+  }
+}
+async function ensureRegistration(env) {
+  const row = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'registration_settings'").first();
+  if (!row) {
+    await env.DB.batch(statements(registration_default).map((statement) => env.DB.prepare(statement)));
+    console.log("[schema] added registration settings, disabled by default");
   }
 }
 var pages_entry_default = {

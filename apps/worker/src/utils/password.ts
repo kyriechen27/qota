@@ -1,8 +1,15 @@
 import { base64UrlDecode, base64UrlEncode, constantTimeEqual, toBytes } from './encoding';
+import { badRequest } from './errors';
 
 const ITERATIONS = 100_000;
 const KEYLEN = 32;
 const SALT_LEN = 16;
+
+export function validatePasswordConfirmation(password: unknown, confirmation: unknown, required = false): void {
+  if ((required || confirmation !== undefined) && (typeof confirmation !== 'string' || confirmation !== password)) {
+    throw badRequest('password confirmation does not match', 'password_confirmation_mismatch');
+  }
+}
 
 async function pbkdf2(password: string, salt: Uint8Array, iterations: number): Promise<Uint8Array> {
   const key = await crypto.subtle.importKey(

@@ -1,6 +1,8 @@
 import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from 'react';
 import { mailSettingsZh, mailSettingsEn } from './mail-settings-i18n';
 import { customerMembershipsZh, customerMembershipsEn } from './customer-memberships-i18n';
+import { registrationZh, registrationEn } from './registration-i18n';
+import { usersRegistrationZh, usersRegistrationEn } from './users-registration-i18n';
 
 export type Lang = 'zh' | 'en';
 
@@ -9,6 +11,8 @@ const LANG_KEY = 'qota.lang';
 type Dict = Record<string, string>;
 
 const zh: Dict = {
+  ...registrationZh,
+  ...usersRegistrationZh,
   ...customerMembershipsZh,
   ...mailSettingsZh,
   // common
@@ -421,6 +425,8 @@ const zh: Dict = {
 };
 
 const en: Dict = {
+  ...registrationEn,
+  ...usersRegistrationEn,
   ...customerMembershipsEn,
   ...mailSettingsEn,
   'common.cancel': 'Cancel',

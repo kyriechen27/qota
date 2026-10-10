@@ -85,22 +85,29 @@ export const api = {
       body: JSON.stringify({ email: identifier, password }),
     }),
   me: () => request<User>('/api/auth/me'),
-  changePassword: (oldPassword: string, newPassword: string) =>
+  getRegistrationState: () => request<{ enabled: boolean }>('/api/auth/registration', { cache: 'no-store' }),
+  updateRegistrationState: (enabled: boolean) =>
+    request<{ enabled: boolean }>('/api/users/registration', { method: 'PUT', body: JSON.stringify({ enabled }) }),
+  register: (body: { email: string; password: string; confirmPassword: string; displayName?: string }) =>
+    request<{ ok: true }>('/api/auth/register', { method: 'POST', body: JSON.stringify(body) }),
+  changePassword: (oldPassword: string, newPassword: string, confirmPassword?: string) =>
     request<{ ok: true }>('/api/auth/change-password', {
       method: 'POST',
-      body: JSON.stringify({ oldPassword, newPassword }),
+      body: JSON.stringify({ oldPassword, newPassword, confirmPassword }),
     }),
   updateProfile: (body: { email?: string; displayName?: string | null }) =>
     request<User>('/api/auth/profile', { method: 'PATCH', body: JSON.stringify(body) }),
 
   // Users (super_admin)
   listUsers: () => request<User[]>('/api/users'),
-  createUser: (body: { email: string; password: string; displayName?: string; role?: GlobalRole }) =>
+  createUser: (body: { email: string; password: string; confirmPassword?: string; displayName?: string; role?: GlobalRole }) =>
     request<User>('/api/users', { method: 'POST', body: JSON.stringify(body) }),
   updateUser: (
     id: number,
-    body: { displayName?: string | null; role?: GlobalRole; isActive?: boolean; password?: string },
+    body: { displayName?: string | null; role?: GlobalRole; isActive?: boolean; password?: string; confirmPassword?: string },
   ) => request<User>(`/api/users/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  resetUserPassword: (id: number, password: string, confirmPassword: string) =>
+    request<User>(`/api/users/${id}`, { method: 'PATCH', body: JSON.stringify({ password, confirmPassword }) }),
   deleteUser: (id: number) => request<{ ok: true }>(`/api/users/${id}`, { method: 'DELETE' }),
 
   // Customers

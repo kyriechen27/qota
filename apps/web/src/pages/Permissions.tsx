@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api, ApiError } from '../lib/api';
 import { useI18n } from '../lib/i18n';
@@ -39,10 +39,14 @@ export default function Memberships() {
   const [reload, setReload] = useState(0);
   const [filterCustomer, setFilterCustomer] = useState<number | ''>('');
   const [filterProject, setFilterProject] = useState<number | ''>('');
+  const [expandedUsers, setExpandedUsers] = useState<Set<number>>(() => new Set(filterUser ? [filterUser] : []));
   const [open, setOpen] = useState(false);
   const [busyRow, setBusyRow] = useState<string | null>(null);
   const mutationRef = useRef(false);
   const generation = useRef(0);
+  useEffect(() => {
+    if (filterUser) setExpandedUsers((current) => new Set(current).add(filterUser));
+  }, [filterUser]);
   useEffect(() => {
     const request = ++generation.current;
     setLoading(true); setErr(null);
@@ -72,6 +76,20 @@ export default function Memberships() {
     const customerId = projectMap.get(row.projectId)?.customerId;
     return customerId !== undefined && filterCustomerSubtree?.has(customerId);
   });
+  const userGroups = new Map<number, Row[]>();
+  for (const row of filteredRows) {
+    const group = userGroups.get(row.userId);
+    if (group) group.push(row); else userGroups.set(row.userId, [row]);
+  }
+  const groupedRows = [...userGroups].map(([userId, grants]) => ({ userId, grants, user: userMap.get(userId) })).sort((a, b) => {
+    const nameA = a.user?.displayName?.trim() || a.user?.email || `#${a.userId}`;
+    const nameB = b.user?.displayName?.trim() || b.user?.email || `#${b.userId}`;
+    return nameA.localeCompare(nameB, undefined, { numeric: true, sensitivity: 'base' })
+      || (a.user?.email ?? '').localeCompare(b.user?.email ?? '', undefined, { sensitivity: 'base' }) || a.userId - b.userId;
+  });
+  function toggleUser(userId: number) {
+    setExpandedUsers((current) => { const next = new Set(current); if (next.has(userId)) next.delete(userId); else next.add(userId); return next; });
+  }
   const customerPath = (id: number) => tree.paths.get(id) ?? `#${id}`;
   const projectLabel = (project: Project) => `${project.name} (${project.code}) / ${customerPath(project.customerId)}`;
   function scopeLabel(row: Row) {
@@ -112,19 +130,36 @@ export default function Memberships() {
     {err && <div className="error hierarchy-error" role="alert">{err}<button onClick={() => setReload((value) => value + 1)} disabled={loading || busyRow !== null}>{t('common.retry')}</button></div>}
     <p className="muted hierarchy-intro">{t('mem.rolesHint')}</p>
     <p className="muted hierarchy-intro">{t('mem.inheritanceHint')}</p>
-    <div className="hierarchy-table-scroll"><table className="membership-table">
+    <div className="hierarchy-table-scroll membership-table-scroll" tabIndex={0} role="region" aria-label={t('mem.title')}><table className="membership-table">
+      <colgroup><col style={{ width: 220 }} /><col style={{ width: 160 }} /><col style={{ width: 320 }} /><col style={{ width: 140 }} /><col style={{ width: 170 }} /><col style={{ width: 90 }} /></colgroup>
       <thead><tr><th>{t('mem.colUser')}</th><th>{t('mem.colScope')}</th><th>{t('mem.colTarget')}</th><th>{t('mem.colRole')}</th><th>{t('mem.colCreated')}</th><th>{t('customers.actions')}</th></tr></thead>
-      <tbody>{filteredRows.map((row) => {
-        const user = userMap.get(row.userId);
-        return <tr key={`${row.scope}-${row.id}`} data-membership-id={`${row.scope}-${row.id}`}>
-          <td>{user ? userLabel(user) : `#${row.userId}`}</td><td><span className="tag" title={row.scope === 'customer' ? t('mem.customerScopeHint') : undefined}>{t(row.scope === 'customer' ? 'mem.customerGrantLabel' : 'mscope.project')}</span></td><td className="membership-target">{scopeLabel(row)}{row.scope === 'customer' && <small className="membership-grant-coverage">{t('mem.customerCoverage')}</small>}</td>
-          <td><select aria-label={t('mem.roleFor', { user: user ? userLabel(user) : `#${row.userId}`, target: scopeLabel(row) })} value={row.role} disabled={loading || busyRow !== null} onChange={(event) => void mutate(row, event.target.value as CustomerRole)}>{ROLES.map((role) => <option key={role} value={role}>{t(`role.${role}`)}</option>)}</select></td>
-          <td className="muted customer-tree-date">{new Date(row.createdAt).toLocaleString()}</td>
-          <td><button className="danger" disabled={loading || busyRow !== null} onClick={() => void mutate(row)}>{busyRow === `${row.scope}-${row.id}` ? t('common.loading') : t('common.revoke')}</button></td>
-        </tr>;
+      <tbody>{groupedRows.map(({ userId, grants, user }) => {
+        const expanded = expandedUsers.has(userId);
+        const label = user ? userLabel(user) : `#${userId}`;
+        const toggleLabel = t(expanded ? 'mem.collapseUser' : 'mem.expandUser', { user: label });
+        const name = user?.displayName?.trim() || user?.email || `#${userId}`;
+        return <Fragment key={userId}>
+          <tr className="membership-user-group" data-membership-user-id={userId} onClick={() => toggleUser(userId)}>
+            <td colSpan={3}><div className="membership-user-heading">
+              <button type="button" className={`membership-user-toggle${expanded ? ' is-expanded' : ''}`} aria-label={toggleLabel} title={toggleLabel} aria-expanded={expanded} onClick={(event) => { event.stopPropagation(); toggleUser(userId); }}>
+                <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m6 3 5 5-5 5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
+              </button>
+              <div className="membership-user-identity"><strong title={name}>{name}</strong>{user?.displayName?.trim() && <span title={user.email}>{user.email}</span>}</div>
+              <span className="membership-user-count">{t('mem.grantCount', { count: grants.length })}</span>
+            </div></td>
+            <td colSpan={2} />
+            <td><button type="button" className="membership-group-action" aria-expanded={expanded} aria-label={toggleLabel} onClick={(event) => { event.stopPropagation(); toggleUser(userId); }}>{t(expanded ? 'mem.collapse' : 'mem.expand')}</button></td>
+          </tr>
+          {expanded && grants.map((row) => <tr key={`${row.scope}-${row.id}`} className="membership-detail-row" data-membership-id={`${row.scope}-${row.id}`} data-user-id={userId}>
+            <td><span className="membership-detail-user" title={label}>{label}</span></td><td><span className="tag" title={row.scope === 'customer' ? t('mem.customerScopeHint') : undefined}>{t(row.scope === 'customer' ? 'mem.customerGrantLabel' : 'mscope.project')}</span></td><td className="membership-target">{scopeLabel(row)}{row.scope === 'customer' && <small className="membership-grant-coverage">{t('mem.customerCoverage')}</small>}</td>
+            <td><select aria-label={t('mem.roleFor', { user: label, target: scopeLabel(row) })} value={row.role} disabled={loading || busyRow !== null} onChange={(event) => void mutate(row, event.target.value as CustomerRole)}>{ROLES.map((role) => <option key={role} value={role}>{t(`role.${role}`)}</option>)}</select></td>
+            <td className="muted customer-tree-date">{new Date(row.createdAt).toLocaleString()}</td>
+            <td><button className="danger" disabled={loading || busyRow !== null} onClick={() => void mutate(row)}>{busyRow === `${row.scope}-${row.id}` ? t('common.loading') : t('common.revoke')}</button></td>
+          </tr>)}
+        </Fragment>;
       })}{!filteredRows.length && <tr><td colSpan={6} className="muted hierarchy-empty">{t(loading ? 'common.loading' : 'mem.empty')}</td></tr>}</tbody>
     </table></div>
-    {open && <GrantDialog users={users} customers={customers} projects={projects} rows={rows} loading={loading} loadError={err} initialUserId={filterUser || 0} initialCustomerId={filterCustomer || (filterProject ? projectMap.get(filterProject)?.customerId ?? 0 : 0)} initialProjectId={filterProject || 0} onClose={() => setOpen(false)} onRefresh={() => setReload((value) => value + 1)} onSaved={(added) => { setRows((current) => [...current, ...added]); setOpen(false); }} />}
+    {open && <GrantDialog users={users} customers={customers} projects={projects} rows={rows} loading={loading} loadError={err} initialUserId={filterUser || 0} initialCustomerId={filterCustomer || (filterProject ? projectMap.get(filterProject)?.customerId ?? 0 : 0)} initialProjectId={filterProject || 0} onClose={() => setOpen(false)} onRefresh={() => setReload((value) => value + 1)} onSaved={(added) => { setRows((current) => [...current, ...added]); setExpandedUsers((current) => new Set([...current, ...added.map((row) => row.userId)])); setOpen(false); }} />}
   </>;
 }
 

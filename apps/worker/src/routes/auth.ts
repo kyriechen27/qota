@@ -1,11 +1,12 @@
 import { Hono } from 'hono';
 import type { AppEnv, GlobalRole } from '../env';
-import { hashPassword, verifyPassword } from '../utils/password';
+import { hashPassword, validatePasswordConfirmation, verifyPassword } from '../utils/password';
 import { signJwt } from '../utils/jwt';
 import { badRequest, conflict, unauthorized } from '../utils/errors';
 import { requireUser } from '../middleware/auth';
 import { audit } from '../lib/audit';
 import { EFFECTIVE_GLOBAL_ROLE_SQL } from '../lib/global-roles';
+import { registrationDisabled, registrationEmail, registrationEnabled } from '../lib/registration';
 
 export const authRoutes = new Hono<AppEnv>();
 
@@ -31,6 +32,48 @@ function dto(r: UserRow) {
     updatedAt: r.updated_at,
   };
 }
+
+authRoutes.get('/registration', async (c) => {
+  c.header('Cache-Control', 'no-store, max-age=0');
+  return c.json({ enabled: await registrationEnabled(c.env.DB) });
+});
+
+authRoutes.post('/register', async (c) => {
+  if (!await registrationEnabled(c.env.DB)) throw registrationDisabled();
+  const body = await c.req.json<{
+    email?: unknown; password?: unknown; confirmPassword?: unknown; displayName?: unknown;
+  }>().catch(() => null);
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw badRequest('registration details required');
+  const email = registrationEmail(body.email);
+  if (typeof body.password !== 'string' || body.password.length < 8 || body.password.length > 128) {
+    throw badRequest('password must contain 8-128 characters');
+  }
+  validatePasswordConfirmation(body.password, body.confirmPassword, true);
+  if (body.displayName !== undefined && body.displayName !== null && typeof body.displayName !== 'string') {
+    throw badRequest('displayName must be a string');
+  }
+  const displayName = typeof body.displayName === 'string' ? body.displayName.trim() : '';
+  if (displayName.length > 128 || /[\u0000-\u001f\u007f]/.test(displayName)) throw badRequest('invalid displayName');
+  const exists = await c.env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
+  if (exists) throw conflict('email already exists');
+  const hash = await hashPassword(body.password);
+  const now = Date.now();
+  // Read the switch inside the write, after hashing. Concurrent signups use
+  // the unique email constraint; neither race may create a privileged account.
+  const result = await c.env.DB.prepare(
+    `INSERT INTO users (email, password_hash, display_name, role, is_active, created_at, updated_at)
+     SELECT ?, ?, ?, 'developer', 1, ?, ?
+      WHERE EXISTS (SELECT 1 FROM registration_settings WHERE id = 1 AND enabled = 1)
+     ON CONFLICT (email) DO NOTHING`,
+  ).bind(email, hash, displayName || null, now, now).run();
+  if (!result.meta.changes) {
+    if (!await registrationEnabled(c.env.DB)) throw registrationDisabled();
+    throw conflict('email already exists');
+  }
+  const id = Number(result.meta.last_row_id);
+  await audit(c, { action: 'auth.register', actorType: 'user', actorId: id, targetType: 'user', targetId: id });
+  return c.json({ ok: true }, 201);
+});
 
 authRoutes.post('/login', async (c) => {
   type LoginBody = { email?: string; password?: string };
@@ -155,11 +198,12 @@ authRoutes.patch('/profile', requireUser, async (c) => {
 
 authRoutes.post('/change-password', requireUser, async (c) => {
   const u = c.get('user')!;
-  type ChangeBody = { oldPassword?: string; newPassword?: string };
+  type ChangeBody = { oldPassword?: string; newPassword?: string; confirmPassword?: unknown };
   const body = (await c.req.json<ChangeBody>().catch(() => ({} as ChangeBody))) as ChangeBody;
-  if (!body.oldPassword || !body.newPassword || body.newPassword.length < 8) {
+  if (typeof body?.oldPassword !== 'string' || !body.oldPassword || typeof body.newPassword !== 'string' || body.newPassword.length < 8) {
     throw badRequest('oldPassword and newPassword (>=8 chars) required');
   }
+  validatePasswordConfirmation(body.newPassword, body.confirmPassword);
   const row = await c.env.DB.prepare('SELECT password_hash FROM users WHERE id = ?')
     .bind(u.id)
     .first<{ password_hash: string }>();

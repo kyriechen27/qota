@@ -1,6 +1,7 @@
 import { Navigate, Route, Routes } from 'react-router-dom';
 import { useAuth } from './lib/auth';
 import Login from './pages/Login';
+import Register from './pages/Register';
 import Layout from './components/Layout';
 import Dashboard from './pages/Dashboard';
 import Announcements from './pages/Announcements';
@@ -31,6 +32,7 @@ export default function App() {
       <>
         <Routes>
           <Route path="/login" element={<Login />} />
+          <Route path="/register" element={<Register />} />
           <Route path="*" element={<Navigate to="/login" replace />} />
         </Routes>
         <LangSwitch />
