@@ -28546,6 +28546,72 @@ async function decryptSecret(enc2, secret) {
   }
 }
 
+// apps/worker/src/lib/token-restrictions.ts
+function optionalLabel(value, field, pattern) {
+  if (value === void 0 || value === null || value === "") return null;
+  if (typeof value !== "string" || !pattern.test(value)) throw badRequest(`invalid ${field}`);
+  return value;
+}
+function normalizeTokenRestrictions(input) {
+  const versionId = input.versionId ?? null;
+  if (versionId !== null && (typeof versionId !== "number" || !Number.isSafeInteger(versionId) || versionId <= 0)) {
+    throw badRequest("versionId must be a positive integer");
+  }
+  return {
+    channel: optionalLabel(input.channel, "channel", /^[a-z0-9][a-z0-9_-]{0,31}$/),
+    specialVersion: normalizeSpecialVersion(input.specialVersion) ?? null,
+    version: optionalLabel(input.version, "version", /^[A-Za-z0-9._+-]{1,64}$/),
+    versionId
+  };
+}
+function hasVersionRestrictions(restrictions) {
+  return restrictions.specialVersion !== null || restrictions.version !== null || restrictions.versionId !== null;
+}
+function downloadRestrictions(token, query, latest = false) {
+  let versionId;
+  if (query.versionId !== void 0) {
+    if (!/^\d+$/.test(query.versionId)) throw badRequest("invalid versionId");
+    versionId = Number(query.versionId);
+  }
+  const requested = normalizeTokenRestrictions({ ...query, versionId });
+  const result = { ...token };
+  for (const key of ["channel", "specialVersion", "version", "versionId"]) {
+    const restriction = token[key];
+    const request = requested[key];
+    if (restriction !== null && request !== null && restriction !== request) {
+      throw forbidden(`${key} not allowed for this token`);
+    }
+  }
+  result.channel = token.channel || requested.channel;
+  result.specialVersion = token.specialVersion ?? requested.specialVersion;
+  result.version = token.version ?? requested.version;
+  result.versionId = token.versionId ?? requested.versionId;
+  if (latest && !result.channel && !hasVersionRestrictions(token)) result.channel = "stable";
+  return result;
+}
+function tokenVersionFilter(projectId, restrictions) {
+  const where = ["v.project_id = ?"];
+  const args = [projectId];
+  if (restrictions.channel) {
+    where.push("v.release_channel = ?");
+    args.push(restrictions.channel);
+  }
+  if (restrictions.specialVersion !== null) {
+    where.push(`EXISTS (SELECT 1 FROM version_metadata tm
+      WHERE tm.project_id = v.project_id AND tm.version = v.version AND tm.special_version = ?)`);
+    args.push(restrictions.specialVersion);
+  }
+  if (restrictions.version !== null) {
+    where.push("v.version = ?");
+    args.push(restrictions.version);
+  }
+  if (restrictions.versionId !== null) {
+    where.push("v.id = ?");
+    args.push(restrictions.versionId);
+  }
+  return { sql: where.join(" AND "), args };
+}
+
 // apps/worker/src/routes/api-tokens.ts
 var apiTokenRoutes = new Hono2();
 apiTokenRoutes.use("*", requireUser);
@@ -28558,6 +28624,9 @@ function dto5(r) {
     kind: r.kind,
     scope: r.scope,
     channel: r.channel,
+    specialVersion: r.special_version,
+    version: r.version,
+    versionId: r.version_id,
     createdBy: r.created_by,
     expiresAt: r.expires_at,
     lastUsedAt: r.last_used_at,
@@ -28582,7 +28651,7 @@ apiTokenRoutes.get("/", async (c) => {
   const user = c.get("user");
   await requireProjectAccess(c.env.DB, user, projectId, "manage_tokens");
   const rows = await c.env.DB.prepare(
-    `SELECT id, project_id, name, token_prefix, kind, scope, channel, created_by, expires_at,
+    `SELECT id, project_id, name, token_prefix, kind, scope, channel, special_version, version, version_id, created_by, expires_at,
             last_used_at, last_used_ip, revoked_at, created_at, token_enc
        FROM api_tokens WHERE project_id = ? ORDER BY id DESC`
   ).bind(projectId).all();
@@ -28591,8 +28660,21 @@ apiTokenRoutes.get("/", async (c) => {
 apiTokenRoutes.post("/", async (c) => {
   const me = c.get("user");
   const body = await c.req.json().catch(() => ({}));
-  if (!body.projectId || !body.name) throw badRequest("projectId and name required");
+  if (!body || typeof body.projectId !== "number" || !Number.isSafeInteger(body.projectId) || body.projectId <= 0 || typeof body.name !== "string" || !body.name.trim()) {
+    throw badRequest("projectId and name required");
+  }
+  if (body.expiresAt !== void 0 && body.expiresAt !== null && !Number.isSafeInteger(body.expiresAt)) {
+    throw badRequest("expiresAt must be an integer timestamp or null");
+  }
   const proj = await requireProjectAccess(c.env.DB, me, body.projectId, "manage_tokens");
+  const restrictions = normalizeTokenRestrictions(body);
+  const filter = tokenVersionFilter(body.projectId, restrictions);
+  const needsMatch = hasVersionRestrictions(restrictions);
+  const matchSql = `EXISTS (SELECT 1 FROM versions v WHERE ${filter.sql} AND v.status IN ('ready', 'archived'))`;
+  if (needsMatch) {
+    const match2 = await c.env.DB.prepare(`SELECT ${matchSql} AS allowed`).bind(...filter.args).first();
+    if (!match2?.allowed) throw badRequest("token restrictions do not match a ready or archived file in this project");
+  }
   const kind = body.kind === "ci" ? "ci" : "device";
   const scope = body.scope === "upload" || body.scope === "full" ? body.scope : "download";
   if (kind === "device" && scope !== "download") {
@@ -28604,8 +28686,9 @@ apiTokenRoutes.post("/", async (c) => {
   const prefix = token.slice(0, 12);
   const now = Date.now();
   const r = await c.env.DB.prepare(
-    `INSERT INTO api_tokens (project_id, name, token_hash, token_enc, token_prefix, kind, scope, channel, created_by, expires_at, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO api_tokens (project_id, name, token_hash, token_enc, token_prefix, kind, scope, channel,
+                            special_version, version, version_id, created_by, expires_at, created_at)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? ${needsMatch ? `WHERE ${matchSql}` : ""}`
   ).bind(
     body.projectId,
     body.name,
@@ -28614,14 +28697,19 @@ apiTokenRoutes.post("/", async (c) => {
     prefix,
     kind,
     scope,
-    body.channel ?? null,
+    restrictions.channel,
+    restrictions.specialVersion,
+    restrictions.version,
+    restrictions.versionId,
     me.id,
     body.expiresAt ?? null,
-    now
+    now,
+    ...needsMatch ? filter.args : []
   ).run();
+  if (!r.meta.changes) throw conflict("token target changed; refresh the available versions before retrying");
   const id = Number(r.meta.last_row_id);
   const row = await c.env.DB.prepare(
-    `SELECT id, project_id, name, token_prefix, kind, scope, channel, created_by, expires_at,
+    `SELECT id, project_id, name, token_prefix, kind, scope, channel, special_version, version, version_id, created_by, expires_at,
             last_used_at, last_used_ip, revoked_at, created_at, token_enc
        FROM api_tokens WHERE id = ?`
   ).bind(id).first();
@@ -28631,7 +28719,7 @@ apiTokenRoutes.post("/", async (c) => {
     projectId: body.projectId,
     targetType: "api_token",
     targetId: id,
-    meta: { kind, scope, channel: body.channel ?? null, name: body.name }
+    meta: { kind, scope, ...restrictions, name: body.name }
   });
   return c.json({ ...dto5(row), token }, 201);
 });
@@ -28693,7 +28781,7 @@ apiTokenRoutes.delete("/:id", async (c) => {
 async function resolveApiToken(c, rawToken) {
   const hash2 = await sha256Hex(rawToken);
   const row = await c.env.DB.prepare(
-    `SELECT id, project_id, kind, scope, channel, expires_at, revoked_at
+    `SELECT id, project_id, kind, scope, channel, special_version, version, version_id, expires_at, revoked_at
        FROM api_tokens WHERE token_hash = ?`
   ).bind(hash2).first();
   if (!row) throw unauthorized("invalid api token");
@@ -28708,7 +28796,10 @@ async function resolveApiToken(c, rawToken) {
     projectId: row.project_id,
     kind: row.kind,
     scope: row.scope,
-    channel: row.channel
+    channel: row.channel || null,
+    specialVersion: row.special_version,
+    version: row.version,
+    versionId: row.version_id
   };
 }
 
@@ -28762,6 +28853,16 @@ async function authDevice(c) {
   c.set("apiToken", apiToken);
   return apiToken;
 }
+function deviceVersionFilter(c, token, latest = false) {
+  const restrictions = downloadRestrictions(token, c.req.query(), latest);
+  const filter = tokenVersionFilter(token.projectId, restrictions);
+  const filename = c.req.query("filename");
+  if (filename !== void 0) {
+    filter.sql += " AND v.filename = ?";
+    filter.args.push(filename);
+  }
+  return { ...filter, restrictions };
+}
 async function redirectOrJson(c, row, ttl) {
   const s3 = makeStorage(c.env);
   const url = await s3.signGetUrl(row.r2_key, ttl, {
@@ -28796,8 +28897,7 @@ async function redirectOrJson(c, row, ttl) {
 }
 downloadRoutes.get("/device/latest", async (c) => {
   const dev = await authDevice(c);
-  const channel = c.req.query("channel") ?? dev.channel ?? "stable";
-  if (dev.channel && dev.channel !== channel) throw forbidden("channel not allowed for this token");
+  const filter = deviceVersionFilter(c, dev, true);
   const customerCode = c.req.query("customer");
   const projectCode = c.req.query("project");
   if (customerCode || projectCode) {
@@ -28808,44 +28908,27 @@ downloadRoutes.get("/device/latest", async (c) => {
     if (customerCode && p.c_code !== customerCode) throw forbidden("customer mismatch");
     if (projectCode && p.p_code !== projectCode) throw forbidden("project mismatch");
   }
-  const filename = c.req.query("filename");
-  const args = [dev.projectId, channel];
-  if (filename !== void 0) args.push(filename);
   const row = await c.env.DB.prepare(
     `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type
        FROM versions v
-      WHERE v.project_id = ? AND v.release_channel = ? AND v.status = 'ready'
-        ${filename !== void 0 ? "AND v.filename = ?" : ""}
+      WHERE ${filter.sql} AND v.status = 'ready'
       ORDER BY ${IS_CURRENT_SQL} DESC, v.created_at DESC, v.id DESC LIMIT 1`
-  ).bind(...args).first();
-  if (!row) throw notFound("no ready versions in this channel");
+  ).bind(...filter.args).first();
+  if (!row) throw notFound("no ready versions match this token and the requested filters");
   const ttl = Number(c.env.DOWNLOAD_URL_TTL_SECONDS) || 300;
   return redirectOrJson(c, row, ttl);
 });
 downloadRoutes.get("/device/list", async (c) => {
   const dev = await authDevice(c);
-  const qChannel = c.req.query("channel");
-  if (dev.channel && qChannel && dev.channel !== qChannel) throw forbidden("channel not allowed for this token");
-  const effChannel = dev.channel ?? qChannel ?? null;
-  const where = ["v.project_id = ?", `v.status = 'ready'`];
-  const args = [dev.projectId];
-  if (effChannel) {
-    where.push("v.release_channel = ?");
-    args.push(effChannel);
-  }
-  const filename = c.req.query("filename");
-  if (filename !== void 0) {
-    where.push("v.filename = ?");
-    args.push(filename);
-  }
+  const filter = deviceVersionFilter(c, dev);
   const rows = await c.env.DB.prepare(
     `SELECT v.id, v.version, v.release_channel, v.filename, v.size, v.sha256, v.content_type, v.is_mandatory,
             ${IS_CURRENT_SQL} AS is_current, v.created_at
       FROM versions v
       JOIN projects p ON p.id = v.project_id
-      WHERE ${where.join(" AND ")}
+      WHERE ${filter.sql} AND v.status = 'ready'
       ORDER BY is_current DESC, v.created_at DESC, v.id DESC`
-  ).bind(...args).all();
+  ).bind(...filter.args).all();
   const proj = await c.env.DB.prepare(
     `SELECT p.code AS p_code, p.name AS p_name, c.code AS c_code, c.name AS c_name
        FROM projects p JOIN customers c ON c.id = p.customer_id WHERE p.id = ?`
@@ -28871,23 +28954,30 @@ downloadRoutes.get("/device/list", async (c) => {
       customerCode: proj?.c_code ?? null,
       customerName: proj?.c_name ?? null
     },
-    channel: effChannel,
+    channel: filter.restrictions.channel,
+    specialVersion: filter.restrictions.specialVersion,
+    version: filter.restrictions.version,
+    versionId: filter.restrictions.versionId,
     count: versions.length,
     versions
   });
 });
 downloadRoutes.get("/device/version/:id", async (c) => {
-  const id = Number(c.req.param("id"));
-  if (!Number.isFinite(id)) throw badRequest("invalid id");
+  const rawId = c.req.param("id");
+  const id = Number(rawId);
+  if (!/^\d+$/.test(rawId) || !Number.isSafeInteger(id) || id <= 0) throw badRequest("invalid id");
   const dev = await authDevice(c);
+  const filter = deviceVersionFilter(c, dev);
   const row = await c.env.DB.prepare(
-    `SELECT id, project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type
-       FROM versions WHERE id = ?`
-  ).bind(id).first();
-  if (!row) throw notFound();
+    `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type
+       FROM versions v WHERE v.id = ? AND ${filter.sql}`
+  ).bind(id, ...filter.args).first();
+  if (!row) {
+    const exists = await c.env.DB.prepare("SELECT id FROM versions WHERE id = ?").bind(id).first();
+    if (!exists) throw notFound();
+    throw forbidden("file not allowed for this token or the requested filters");
+  }
   if (row.status !== "ready") throw badRequest(`version is ${row.status}, not ready`);
-  if (row.project_id !== dev.projectId) throw forbidden();
-  if (dev.channel && dev.channel !== row.release_channel) throw forbidden("channel not allowed");
   const ttl = Number(c.env.DOWNLOAD_URL_TTL_SECONDS) || 300;
   return redirectOrJson(c, row, ttl);
 });
@@ -30723,6 +30813,9 @@ var announcements_default = "CREATE TABLE announcements (\n  id INTEGER PRIMARY 
 // apps/worker/migrations/0013_mail.sql
 var mail_default = "CREATE TABLE mail_settings (\n  id INTEGER PRIMARY KEY CHECK (id = 1),\n  enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),\n  host TEXT NOT NULL DEFAULT '',\n  port INTEGER NOT NULL DEFAULT 465,\n  security TEXT NOT NULL DEFAULT 'tls' CHECK (security IN ('tls', 'starttls')),\n  username TEXT NOT NULL DEFAULT '',\n  password_enc TEXT,\n  from_email TEXT NOT NULL DEFAULT '',\n  from_name TEXT NOT NULL DEFAULT '',\n  updated_by INTEGER REFERENCES users(id),\n  updated_at INTEGER NOT NULL\n);\n\nALTER TABLE upload_sessions ADD COLUMN announcement_recipient_ids TEXT;\nCREATE TABLE announcement_mail_deliveries (\n  id INTEGER PRIMARY KEY AUTOINCREMENT,\n  announcement_id INTEGER NOT NULL REFERENCES announcements(id) ON DELETE CASCADE,\n  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\n  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sending', 'sent', 'failed', 'skipped')),\n  error TEXT,\n  claim_token TEXT,\n  created_at INTEGER NOT NULL DEFAULT 0,\n  updated_at INTEGER NOT NULL DEFAULT 0,\n  UNIQUE (announcement_id, user_id)\n);\nCREATE INDEX idx_announcement_mail_deliveries_status ON announcement_mail_deliveries(announcement_id, status);\n";
 
+// apps/worker/migrations/0014_api_token_restrictions.sql
+var api_token_restrictions_default = "-- NULL keeps existing tokens unrestricted on these additional dimensions.\nALTER TABLE api_tokens ADD COLUMN special_version TEXT;\nALTER TABLE api_tokens ADD COLUMN version TEXT;\n-- Deliberately retain a deleted file's id: SET NULL would broaden its token.\n-- Artifact ids are AUTOINCREMENT, so a later upload cannot inherit this grant.\nALTER TABLE api_tokens ADD COLUMN version_id INTEGER;\n";
+
 // apps/worker/pages-entry.ts
 function statements(sql) {
   return sql.replace(/--[^\n]*/g, "").split(";").map((s) => s.trim()).filter((s) => s.length > 0 && !/^PRAGMA/i.test(s));
@@ -30750,6 +30843,7 @@ async function ensureSchema(env) {
     await ensureSpecialVersion(env);
     await ensureAnnouncements(env);
     await ensureMail(env);
+    await ensureTokenRestrictions(env);
     schemaReady = true;
     console.log("[schema] initialized D1 tables on first run");
     return;
@@ -30765,6 +30859,7 @@ async function ensureSchema(env) {
   await ensureSpecialVersion(env);
   await ensureAnnouncements(env);
   await ensureMail(env);
+  await ensureTokenRestrictions(env);
   schemaReady = true;
 }
 async function ensureColumn(env, table, column, stmts) {
@@ -30836,6 +30931,13 @@ async function ensureMail(env) {
   if (!row) {
     await env.DB.batch(statements(mail_default).map((stmt) => env.DB.prepare(stmt)));
     console.log("[schema] added SMTP settings and announcement notifications");
+  }
+}
+async function ensureTokenRestrictions(env) {
+  const row = await env.DB.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'api_tokens'").first();
+  if (row && !row.sql.includes("special_version")) {
+    await env.DB.batch(statements(api_token_restrictions_default).map((stmt) => env.DB.prepare(stmt)));
+    console.log("[schema] added API token version restrictions");
   }
 }
 var pages_entry_default = {

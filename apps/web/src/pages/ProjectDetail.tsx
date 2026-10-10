@@ -13,6 +13,9 @@ import type { ApiToken, Project, Version } from '@qota/shared';
 export default function ProjectDetail() {
   const { id } = useParams<{ id: string }>();
   const projectId = Number(id);
+  const activeProjectId = useRef(projectId);
+  activeProjectId.current = projectId;
+  const loadGeneration = useRef(0);
   const { t } = useI18n();
   const [project, setProject] = useState<Project | null>(null);
   const [versions, setVersions] = useState<Version[]>([]);
@@ -35,6 +38,15 @@ export default function ProjectDetail() {
   const [tokKind, setTokKind] = useState<'device' | 'ci'>('device');
   const [tokScope, setTokScope] = useState<'download' | 'upload' | 'full'>('download');
   const [tokChannel, setTokChannel] = useState('');
+  const [tokSpecialVersion, setTokSpecialVersion] = useState('');
+  const [tokVersion, setTokVersion] = useState('');
+  const [tokVersionId, setTokVersionId] = useState<number | null>(null);
+  const [tokBusy, setTokBusy] = useState(false);
+  const tokBusyRef = useRef(false);
+  const tokRequestGeneration = useRef(0);
+  const tokDialogRef = useRef<HTMLDialogElement>(null);
+  const [tokError, setTokError] = useState<string | null>(null);
+  const [tokFileCleared, setTokFileCleared] = useState(false);
   const [newToken, setNewToken] = useState<string | null>(null);
   const [tokenCopied, setTokenCopied] = useState(false);
   const [copiedTokenId, setCopiedTokenId] = useState<number | null>(null);
@@ -61,6 +73,38 @@ export default function ProjectDetail() {
 
   const specialVersionList = useMemo(() => [...new Set(versions.map((v) => v.specialVersion).filter((value): value is string => !!value))].sort(), [versions]);
 
+  const tokenFiles = useMemo(() => versions.filter((v) => v.status === 'ready' || v.status === 'archived'), [versions]);
+  const tokenVersionOptions = useMemo(() => [...new Set(tokenFiles.map((v) => v.version))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })), [tokenFiles]);
+  const tokenSpecialOptions = useMemo(() => [...new Set(tokenFiles.map((v) => v.specialVersion).filter((value): value is string => !!value))].sort(), [tokenFiles]);
+  const tokenFileOptions = useMemo(() => tokenFiles.filter((v) => (!tokChannel || v.releaseChannel === tokChannel)
+    && (!tokSpecialVersion || v.specialVersion === tokSpecialVersion) && (!tokVersion || v.version === tokVersion)), [tokenFiles, tokChannel, tokSpecialVersion, tokVersion]);
+  const tokenMatchingFiles = tokVersionId === null ? tokenFileOptions : tokenFileOptions.filter((v) => v.id === tokVersionId);
+  const tokenHasVersionRestriction = !!tokSpecialVersion || !!tokVersion || tokVersionId !== null;
+  const tokenRangeValid = !tokenHasVersionRestriction || tokenMatchingFiles.length > 0;
+  const selectedTokenFile = tokenFiles.find((v) => v.id === tokVersionId);
+
+  useEffect(() => {
+    if (!showTokenDlg) return;
+    const dialog = tokDialogRef.current;
+    dialog?.showModal();
+    return () => dialog?.close();
+  }, [showTokenDlg]);
+
+  function changeTokenRestriction(field: 'channel' | 'specialVersion' | 'version', value: string) {
+    const channel = field === 'channel' ? value : tokChannel;
+    const specialVersion = field === 'specialVersion' ? value : tokSpecialVersion;
+    const version = field === 'version' ? value : tokVersion;
+    if (field === 'channel') setTokChannel(value);
+    if (field === 'specialVersion') setTokSpecialVersion(value);
+    if (field === 'version') setTokVersion(value);
+    if (tokVersionId !== null && !tokenFiles.some((v) => v.id === tokVersionId && (!channel || v.releaseChannel === channel)
+      && (!specialVersion || v.specialVersion === specialVersion) && (!version || v.version === version))) {
+      setTokVersionId(null);
+      setTokFileCleared(true);
+    }
+    setTokError(null);
+  }
+
   const versionGroups = useMemo(
     () => groupVersions(versions.filter((v) => v.status !== 'archived')),
     [versions],
@@ -71,22 +115,48 @@ export default function ProjectDetail() {
   );
 
   async function load() {
+    if (activeProjectId.current !== projectId) return;
+    const requestGeneration = ++loadGeneration.current;
+    const isCurrentRequest = () => activeProjectId.current === projectId && loadGeneration.current === requestGeneration;
     try {
       const p = await api.getProject(projectId);
+      if (!isCurrentRequest()) return;
       setProject(p);
       const [v, tk] = await Promise.all([
         api.listVersions(projectId),
         api.listApiTokens(projectId).catch(() => [] as ApiToken[]),
       ]);
+      if (!isCurrentRequest()) return;
       setVersions(v);
       setTokens(tk);
       setAnnouncementRefresh((value) => value + 1);
     } catch (e: any) {
-      setErr(e?.message);
+      if (isCurrentRequest()) setErr(e?.message);
     }
   }
 
   useEffect(() => {
+    tokRequestGeneration.current++;
+    tokBusyRef.current = false;
+    setTokBusy(false);
+    setShowTokenDlg(false);
+    setNewToken(null);
+    setTokName('');
+    setTokKind('device');
+    setTokScope('download');
+    setTokChannel('');
+    setTokSpecialVersion('');
+    setTokVersion('');
+    setTokVersionId(null);
+    setTokError(null);
+    setTokFileCleared(false);
+    setTokenCopied(false);
+    setCopiedTokenId(null);
+    setProject(null);
+    setVersions([]);
+    setTokens([]);
+    setErr(null);
+    setCanPublishAnnouncements(false);
     if (Number.isFinite(projectId)) void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId]);
@@ -207,21 +277,39 @@ export default function ProjectDetail() {
 
   async function createToken(e: FormEvent) {
     e.preventDefault();
-    setErr(null);
+    if (tokBusyRef.current || newToken || !tokName.trim()) return;
+    if (!tokenRangeValid) { setTokError(t('pd.tokenNoMatches')); return; }
+    tokBusyRef.current = true;
+    const requestGeneration = ++tokRequestGeneration.current;
+    const isCurrentRequest = () => activeProjectId.current === projectId && tokRequestGeneration.current === requestGeneration;
+    setTokBusy(true);
+    setTokError(null);
     try {
       const tk = await api.createApiToken({
         projectId,
-        name: tokName,
+        name: tokName.trim(),
         kind: tokKind,
         scope: tokKind === 'device' ? 'download' : tokScope,
-        channel: tokChannel || undefined,
+        channel: tokChannel || null,
+        specialVersion: tokSpecialVersion || null,
+        version: tokVersion || null,
+        versionId: tokVersionId,
       });
+      if (!isCurrentRequest()) return;
       setNewToken(tk.token);
       setTokName('');
       setTokChannel('');
+      setTokSpecialVersion('');
+      setTokVersion('');
+      setTokVersionId(null);
       await load();
     } catch (e: any) {
-      setErr(e?.message);
+      if (isCurrentRequest()) setTokError(e?.message ?? String(e));
+    } finally {
+      if (isCurrentRequest()) {
+        tokBusyRef.current = false;
+        setTokBusy(false);
+      }
     }
   }
 
@@ -247,18 +335,23 @@ export default function ProjectDetail() {
 
   async function copyTokenSecret(tk: ApiToken) {
     setErr(null);
+    const requestGeneration = tokRequestGeneration.current;
+    const isCurrentRequest = () => activeProjectId.current === projectId && tokRequestGeneration.current === requestGeneration;
     let token: string;
     try {
       ({ token } = await api.revealApiToken(tk.id));
     } catch (e: any) {
-      setErr(e?.message);
+      if (isCurrentRequest()) setErr(e?.message);
       return;
     }
+    if (!isCurrentRequest()) return;
     try {
       await navigator.clipboard.writeText(token);
+      if (!isCurrentRequest()) return;
       setCopiedTokenId(tk.id);
       setTimeout(() => setCopiedTokenId((id) => (id === tk.id ? null : id)), 1500);
     } catch {
+      if (!isCurrentRequest()) return;
       // Clipboard blocked (no gesture / insecure context) — show the token in the
       // dialog (select-all) so it can still be copied by hand.
       setNewToken(token);
@@ -602,6 +695,16 @@ export default function ProjectDetail() {
             onClick={() => {
               setShowTokenDlg(true);
               setNewToken(null);
+              setTokName('');
+              setTokKind('device');
+              setTokScope('download');
+              setTokChannel('');
+              setTokSpecialVersion('');
+              setTokVersion('');
+              setTokVersionId(null);
+              setTokError(null);
+              setTokFileCleared(false);
+              setTokenCopied(false);
             }}
           >
             {t('pd.issueToken')}
@@ -610,22 +713,23 @@ export default function ProjectDetail() {
         <div className="muted" style={{ marginBottom: 8 }}>
           {t('pd.tokensHint')}
         </div>
-        <table>
+        <div className="token-table-scroll">
+        <table className="token-table">
           <thead>
             <tr>
               <th>{t('pd.colName')}</th>
               <th>{t('pd.colKind')}</th>
               <th>{t('pd.colScope')}</th>
-              <th>{t('pd.colChannel')}</th>
+              <th>{t('pd.tokenAuthorization')}</th>
               <th>{t('pd.colPrefix')}</th>
               <th>{t('pd.colLastUsed')}</th>
               <th>{t('pd.colStatus')}</th>
-              <th></th>
+              <th>{t('pd.colActions')}</th>
             </tr>
           </thead>
           <tbody>
             {tokens.map((tk) => (
-              <tr key={tk.id}>
+              <tr key={tk.id} data-token-id={tk.id}>
                 <td>{tk.name}</td>
                 <td>
                   <span className="tag">{t(`kind.${tk.kind}`)}</span>
@@ -633,13 +737,13 @@ export default function ProjectDetail() {
                 <td>
                   <span className="tag">{t(`scope.${tk.scope}`)}</span>
                 </td>
-                <td>{tk.channel ?? <span className="muted">{t('pd.tokenChannelAny')}</span>}</td>
+                <td><TokenAuthorization token={tk} versions={versions} /></td>
                 <td>
                   <span className="code">{tk.tokenPrefix}…</span>
                 </td>
                 <td className="muted">{tk.lastUsedAt ? new Date(tk.lastUsedAt).toLocaleString() : '—'}</td>
                 <td>{tk.revokedAt ? <span className="error">{t('pd.revoked')}</span> : <span className="success">{t('pd.tokenActive')}</span>}</td>
-                <td>
+                <td className="token-table-actions">
                   {!tk.revokedAt &&
                     (tk.hasSecret ? (
                       <button onClick={() => copyTokenSecret(tk)} style={{ marginRight: 6 }}>
@@ -670,6 +774,7 @@ export default function ProjectDetail() {
             )}
           </tbody>
         </table>
+        </div>
       </div>
 
       {specialVersionDialog !== null && (
@@ -723,9 +828,9 @@ export default function ProjectDetail() {
       )}
 
       {showTokenDlg && (
-        <div className="dialog-backdrop" onClick={() => setShowTokenDlg(false)}>
-          <form className="dialog" onSubmit={createToken} onClick={(e) => e.stopPropagation()}>
-            <h3>{t('pd.dlgIssueToken')}</h3>
+        <dialog ref={tokDialogRef} className="dialog token-dialog" aria-labelledby="token-dialog-title" onCancel={(e) => { e.preventDefault(); if (!tokBusyRef.current) setShowTokenDlg(false); }}>
+          <form onSubmit={createToken}>
+            <h3 id="token-dialog-title">{t('pd.dlgIssueToken')}</h3>
             {newToken ? (
               <>
                 <p>
@@ -752,6 +857,7 @@ export default function ProjectDetail() {
                   </button>
                   <button
                     type="button"
+                    disabled={tokBusy}
                     onClick={() => {
                       setShowTokenDlg(false);
                       setNewToken(null);
@@ -764,14 +870,17 @@ export default function ProjectDetail() {
               </>
             ) : (
               <>
+                <fieldset className="token-form-fields" disabled={tokBusy}>
                 <label>
                   <span className="lbl">{t('pd.fldTokenName')}</span>
-                  <input value={tokName} onChange={(e) => setTokName(e.target.value)} required style={{ width: '100%' }} />
+                  <input aria-label={t('pd.fldTokenName')} value={tokName} onChange={(e) => setTokName(e.target.value)} required autoFocus />
                 </label>
+                <div className="token-form-grid">
                 <label>
                   <span className="lbl">{t('pd.fldKind')}</span>
                   <select
                     value={tokKind}
+                    aria-label={t('pd.fldKind')}
                     onChange={(e) => {
                       const k = e.target.value as 'device' | 'ci';
                       setTokKind(k);
@@ -788,6 +897,7 @@ export default function ProjectDetail() {
                     <span className="lbl">{t('pd.fldTokenScope')}</span>
                     <select
                       value={tokScope}
+                      aria-label={t('pd.fldTokenScope')}
                       onChange={(e) => setTokScope(e.target.value as 'download' | 'upload' | 'full')}
                       style={{ width: '100%' }}
                     >
@@ -797,22 +907,56 @@ export default function ProjectDetail() {
                     </select>
                   </label>
                 )}
-                <label>
-                  <span className="lbl">{t('pd.fldRestrictChannel')}</span>
-                  <ChannelField value={tokChannel} onChange={setTokChannel} options={channelList} allowAny />
-                </label>
+                </div>
+                <section className="token-range-section">
+                  <h4>{t('pd.tokenAuthorization')}</h4>
+                  <p className="token-range-hint">{t('pd.tokenRangeHint')}</p>
+                  <div className="token-form-grid">
+                    <label>
+                      <span className="lbl">{t('pd.colChannel')}</span>
+                      <ChannelField value={tokChannel} onChange={(value) => changeTokenRestriction('channel', value)} options={channelList} allowAny disabled={tokBusy} ariaLabel={t('pd.fldRestrictChannel')} />
+                    </label>
+                    <label>
+                      <span className="lbl">{t('pd.specialVersion')}</span>
+                      <select aria-label={t('pd.tokenRestrictSpecial')} value={tokSpecialVersion} onChange={(e) => changeTokenRestriction('specialVersion', e.target.value)}>
+                        <option value="">{t('pd.tokenUnrestricted')}</option>
+                        {tokenSpecialOptions.map((value) => <option value={value} key={value}>{value}</option>)}
+                      </select>
+                    </label>
+                    <label>
+                      <span className="lbl">{t('pd.colVersion')}</span>
+                      <select aria-label={t('pd.tokenRestrictVersion')} value={tokVersion} onChange={(e) => changeTokenRestriction('version', e.target.value)}>
+                        <option value="">{t('pd.tokenUnrestricted')}</option>
+                        {tokenVersionOptions.map((value) => <option value={value} key={value}>{value}</option>)}
+                      </select>
+                    </label>
+                    <label>
+                      <span className="lbl">{t('pd.tokenFirmware')}</span>
+                      <select aria-label={t('pd.tokenRestrictFile')} value={tokVersionId ?? ''} title={selectedTokenFile ? `${selectedTokenFile.version} / ${selectedTokenFile.releaseChannel} / ${selectedTokenFile.filename}` : undefined} onChange={(e) => { setTokVersionId(e.target.value ? Number(e.target.value) : null); setTokFileCleared(false); setTokError(null); }}>
+                        <option value="">{t('pd.tokenUnrestricted')}</option>
+                        {tokVersionId !== null && !tokenFileOptions.some((v) => v.id === tokVersionId) && <option value={tokVersionId} disabled>{t('pd.tokenUnavailableFile', { id: tokVersionId })}</option>}
+                        {tokenFileOptions.map((file) => <option value={file.id} key={file.id}>{file.version} / {file.releaseChannel} / {file.filename}{file.status === 'archived' ? ` · ${t('status.archived')}` : ''}</option>)}
+                      </select>
+                    </label>
+                  </div>
+                  {tokFileCleared && <p className="token-range-warning" role="status">{t('pd.tokenFileCleared')}</p>}
+                  {selectedTokenFile && <p className="token-selected-file">{t('pd.tokenSelectedFile')} <strong>{selectedTokenFile.filename}</strong><span>{selectedTokenFile.version} / {selectedTokenFile.releaseChannel} · #{selectedTokenFile.id}</span></p>}
+                  <p className={`token-match-summary${!tokenRangeValid ? ' is-empty' : ''}`} role="status">{t(!tokenRangeValid ? 'pd.tokenNoMatches' : tokChannel && !tokenHasVersionRestriction && !tokenMatchingFiles.length ? 'pd.tokenFutureChannel' : 'pd.tokenMatchCount', { count: tokenMatchingFiles.length })}</p>
+                </section>
+                </fieldset>
+                {tokError && <p className="error token-dialog-error" role="alert">{tokError}</p>}
                 <div className="dialog-actions">
-                  <button type="button" onClick={() => setShowTokenDlg(false)}>
+                  <button type="button" disabled={tokBusy} onClick={() => setShowTokenDlg(false)}>
                     {t('common.cancel')}
                   </button>
-                  <button type="submit" className="primary">
-                    {t('pd.issue')}
+                  <button type="submit" className="primary" disabled={tokBusy || !tokName.trim() || !tokenRangeValid}>
+                    {t(tokBusy ? 'pd.tokenIssuing' : 'pd.issue')}
                   </button>
                 </div>
               </>
             )}
           </form>
-        </div>
+        </dialog>
       )}
 
       {publicVer && (
@@ -877,6 +1021,21 @@ export default function ProjectDetail() {
       )}
     </>
   );
+}
+
+function TokenAuthorization({ token, versions }: { token: ApiToken; versions: Version[] }) {
+  const { t } = useI18n();
+  const file = token.versionId == null ? undefined : versions.find((version) => version.id === token.versionId);
+  if (!token.channel && !token.specialVersion && !token.version && token.versionId == null) {
+    return <span className="muted">{t('pd.tokenUnrestricted')}</span>;
+  }
+  const fileLabel = file ? `${file.version} / ${file.releaseChannel} / ${file.filename}` : t('pd.tokenUnavailableFile', { id: token.versionId ?? '' });
+  return <div className="token-authorization">
+    {token.channel && <span className="token-scope-tag" title={`${t('pd.colChannel')}: ${token.channel}`}><small>{t('pd.colChannel')}</small><span>{token.channel}</span></span>}
+    {token.specialVersion && <span className="token-scope-tag" title={`${t('pd.specialVersion')}: ${token.specialVersion}`}><small>{t('pd.specialVersion')}</small><span>{token.specialVersion}</span></span>}
+    {token.version && <span className="token-scope-tag" title={`${t('pd.colVersion')}: ${token.version}`}><small>{t('pd.colVersion')}</small><span>{token.version}</span></span>}
+    {token.versionId != null && <span className={`token-scope-tag token-file-scope${!file ? ' is-unavailable' : ''}`} title={fileLabel}><small>{t('pd.tokenFirmware')}</small><span>{fileLabel}</span></span>}
+  </div>;
 }
 
 type UploadQueueStatus = 'waiting' | 'sha256' | 'upload' | 'success' | 'error' | 'cancelled';

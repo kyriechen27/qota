@@ -14,13 +14,14 @@
 
 import { Hono, type Context } from 'hono';
 import { IS_CURRENT_SQL } from '../lib/current-versions';
-import type { AppEnv } from '../env';
+import type { AppEnv, AuthedApiToken } from '../env';
 import { requireUser } from '../middleware/auth';
 import { badRequest, forbidden, notFound, unauthorized } from '../utils/errors';
 import { requireProjectAccess } from '../lib/memberships';
 import { makeStorage } from '../lib/s3';
 import { audit } from '../lib/audit';
 import { resolveApiToken } from './api-tokens';
+import { downloadRestrictions, tokenVersionFilter } from '../lib/token-restrictions';
 
 export const downloadRoutes = new Hono<AppEnv>();
 
@@ -101,6 +102,17 @@ async function authDevice(c: Context<AppEnv>) {
   return apiToken;
 }
 
+function deviceVersionFilter(c: Context<AppEnv>, token: AuthedApiToken, latest = false) {
+  const restrictions = downloadRestrictions(token, c.req.query(), latest);
+  const filter = tokenVersionFilter(token.projectId, restrictions);
+  const filename = c.req.query('filename');
+  if (filename !== undefined) {
+    filter.sql += ' AND v.filename = ?';
+    filter.args.push(filename);
+  }
+  return { ...filter, restrictions };
+}
+
 async function redirectOrJson(c: Context<AppEnv>, row: VersionRow, ttl: number) {
   const s3 = makeStorage(c.env);
   const url = await s3.signGetUrl(row.r2_key, ttl, {
@@ -142,8 +154,7 @@ async function redirectOrJson(c: Context<AppEnv>, row: VersionRow, ttl: number) 
 
 downloadRoutes.get('/device/latest', async (c) => {
   const dev = await authDevice(c);
-  const channel = c.req.query('channel') ?? dev.channel ?? 'stable';
-  if (dev.channel && dev.channel !== channel) throw forbidden('channel not allowed for this token');
+  const filter = deviceVersionFilter(c, dev, true);
 
   // Optionally verify customer/project codes match
   const customerCode = c.req.query('customer');
@@ -159,53 +170,35 @@ downloadRoutes.get('/device/latest', async (c) => {
     if (projectCode && p.p_code !== projectCode) throw forbidden('project mismatch');
   }
 
-  const filename = c.req.query('filename');
-  const args: unknown[] = [dev.projectId, channel];
-  if (filename !== undefined) args.push(filename);
   const row = await c.env.DB.prepare(
     `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type
        FROM versions v
-      WHERE v.project_id = ? AND v.release_channel = ? AND v.status = 'ready'
-        ${filename !== undefined ? 'AND v.filename = ?' : ''}
+      WHERE ${filter.sql} AND v.status = 'ready'
       ORDER BY ${IS_CURRENT_SQL} DESC, v.created_at DESC, v.id DESC LIMIT 1`,
   )
-    .bind(...args)
+    .bind(...filter.args)
     .first<VersionRow>();
-  if (!row) throw notFound('no ready versions in this channel');
+  if (!row) throw notFound('no ready versions match this token and the requested filters');
 
   const ttl = Number(c.env.DOWNLOAD_URL_TTL_SECONDS) || 300;
   return redirectOrJson(c, row, ttl);
 });
 
-// List every ready version this token can pull (its project, honoring the
-// token's channel pin). Lets a device/CI enumerate all available files, then
+// List every ready version this token can pull (the intersection of every
+// restriction). Lets a device/CI enumerate all available files, then
 // fetch any via /device/version/:id. Bearer <api_token>.
 downloadRoutes.get('/device/list', async (c) => {
   const dev = await authDevice(c);
-  const qChannel = c.req.query('channel');
-  if (dev.channel && qChannel && dev.channel !== qChannel) throw forbidden('channel not allowed for this token');
-  const effChannel = dev.channel ?? qChannel ?? null;
-
-  const where = ['v.project_id = ?', `v.status = 'ready'`];
-  const args: unknown[] = [dev.projectId];
-  if (effChannel) {
-    where.push('v.release_channel = ?');
-    args.push(effChannel);
-  }
-  const filename = c.req.query('filename');
-  if (filename !== undefined) {
-    where.push('v.filename = ?');
-    args.push(filename);
-  }
+  const filter = deviceVersionFilter(c, dev);
   const rows = await c.env.DB.prepare(
     `SELECT v.id, v.version, v.release_channel, v.filename, v.size, v.sha256, v.content_type, v.is_mandatory,
             ${IS_CURRENT_SQL} AS is_current, v.created_at
       FROM versions v
       JOIN projects p ON p.id = v.project_id
-      WHERE ${where.join(' AND ')}
+      WHERE ${filter.sql} AND v.status = 'ready'
       ORDER BY is_current DESC, v.created_at DESC, v.id DESC`,
   )
-    .bind(...args)
+    .bind(...filter.args)
     .all<{
       id: number;
       version: string;
@@ -246,26 +239,34 @@ downloadRoutes.get('/device/list', async (c) => {
       customerCode: proj?.c_code ?? null,
       customerName: proj?.c_name ?? null,
     },
-    channel: effChannel,
+    channel: filter.restrictions.channel,
+    specialVersion: filter.restrictions.specialVersion,
+    version: filter.restrictions.version,
+    versionId: filter.restrictions.versionId,
     count: versions.length,
     versions,
   });
 });
 
 downloadRoutes.get('/device/version/:id', async (c) => {
-  const id = Number(c.req.param('id'));
-  if (!Number.isFinite(id)) throw badRequest('invalid id');
+  const rawId = c.req.param('id');
+  const id = Number(rawId);
+  if (!/^\d+$/.test(rawId) || !Number.isSafeInteger(id) || id <= 0) throw badRequest('invalid id');
   const dev = await authDevice(c);
+  const filter = deviceVersionFilter(c, dev);
   const row = await c.env.DB.prepare(
-    `SELECT id, project_id, version, release_channel, status, r2_key, filename, size, sha256, content_type
-       FROM versions WHERE id = ?`,
+    `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size, v.sha256, v.content_type
+       FROM versions v WHERE v.id = ? AND ${filter.sql}`,
   )
-    .bind(id)
+    .bind(id, ...filter.args)
     .first<VersionRow>();
-  if (!row) throw notFound();
+  if (!row) {
+    // Keep existing 403/404 semantics without ever signing an excluded file.
+    const exists = await c.env.DB.prepare('SELECT id FROM versions WHERE id = ?').bind(id).first();
+    if (!exists) throw notFound();
+    throw forbidden('file not allowed for this token or the requested filters');
+  }
   if (row.status !== 'ready') throw badRequest(`version is ${row.status}, not ready`);
-  if (row.project_id !== dev.projectId) throw forbidden();
-  if (dev.channel && dev.channel !== row.release_channel) throw forbidden('channel not allowed');
   const ttl = Number(c.env.DOWNLOAD_URL_TTL_SECONDS) || 300;
   return redirectOrJson(c, row, ttl);
 });

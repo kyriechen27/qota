@@ -464,6 +464,41 @@ tr:hover td { background: #1a1f2a; }
 .progress { height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
 .progress > div { height: 100%; background: var(--accent); transition: width 0.2s; }
 
+.token-table-scroll { overflow-x: auto; max-width: 100%; }
+.token-table { min-width: 930px; }
+.token-table th { white-space: nowrap; }
+.token-table td:nth-child(1) { max-width: 200px; overflow-wrap: anywhere; }
+.token-table td:nth-child(4) { width: 320px; min-width: 230px; max-width: 360px; }
+.token-table td:nth-child(6) { white-space: nowrap; font-size: 12px; }
+.token-table-actions { white-space: nowrap; }
+.token-authorization { display: flex; flex-wrap: wrap; gap: 5px; min-width: 0; }
+.token-scope-tag { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; min-width: 0; padding: 3px 7px; border: 1px solid #334057; border-radius: 5px; background: #1b2737; font-size: 11px; color: #b9cbe4; }
+.token-scope-tag small { font-size: 10px; color: #8597af; flex-shrink: 0; }
+.token-scope-tag > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.token-file-scope { flex-basis: 100%; }
+.token-file-scope.is-unavailable { color: #d5ac7f; border-color: #59442e; background: #29231d; }
+.dialog.token-dialog { width: 640px; min-width: 0; max-width: calc(100vw - 32px); max-height: calc(100dvh - 32px); margin: auto; color: var(--text); }
+.token-dialog::backdrop { background: rgb(5 9 15 / 72%); }
+.token-form-fields { min-width: 0; margin: 0; padding: 0; border: 0; }
+.token-form-fields > label, .token-form-grid > label { display: block; min-width: 0; margin-bottom: 14px; }
+.token-form-fields input, .token-form-fields select { width: 100%; min-width: 0; text-overflow: ellipsis; }
+.token-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 14px; }
+.token-range-section { padding: 16px; border: 1px solid #303d50; border-radius: 8px; background: #181f2b; margin-top: 4px; }
+.token-range-section h4 { margin: 0 0 5px; font-size: 13px; }
+.token-range-hint { margin: 0 0 16px; font-size: 12px; color: var(--muted); line-height: 1.7; }
+.token-match-summary { margin: 0; color: #91b2d2; font-size: 12px; }
+.token-match-summary.is-empty, .token-range-warning { color: #e6b47c; }
+.token-range-warning { margin: 0 0 12px; font-size: 12px; }
+.token-selected-file { margin: 0 0 13px; font-size: 11px; color: #9babc2; overflow-wrap: anywhere; }
+.token-selected-file strong { color: #c6d6ed; font-weight: 500; }
+.token-selected-file > span { display: block; margin-top: 3px; }
+.token-dialog-error { margin: 14px 0 0; overflow-wrap: anywhere; }
+@media (max-width: 540px) {
+  .dialog.token-dialog { padding: 20px 16px; }
+  .token-form-grid { grid-template-columns: minmax(0, 1fr); }
+  .token-range-section { padding: 13px; }
+}
+
 @media (max-width: 800px) {
   /* Stack into a top bar + content. Without explicit rows the two auto rows
      get stretched equally (grid align-content defaults to stretch) and the

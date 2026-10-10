@@ -4,12 +4,13 @@
 import { Hono, type Context } from 'hono';
 import type { AppEnv, AuthedApiToken } from '../env';
 import { requireUser } from '../middleware/auth';
-import { badRequest, HttpError, notFound, unauthorized } from '../utils/errors';
+import { badRequest, conflict, HttpError, notFound, unauthorized } from '../utils/errors';
 import { requireProjectAccess } from '../lib/memberships';
 import { sha256Hex } from '../utils/sha';
 import { bytesToHex } from '../utils/encoding';
 import { encryptSecret, decryptSecret } from '../utils/crypto';
 import { audit } from '../lib/audit';
+import { hasVersionRestrictions, normalizeTokenRestrictions, tokenVersionFilter } from '../lib/token-restrictions';
 
 export const apiTokenRoutes = new Hono<AppEnv>();
 
@@ -23,6 +24,9 @@ interface TokenRow {
   kind: 'device' | 'ci';
   scope: 'download' | 'upload' | 'full';
   channel: string | null;
+  special_version: string | null;
+  version: string | null;
+  version_id: number | null;
   created_by: number;
   expires_at: number | null;
   last_used_at: number | null;
@@ -41,6 +45,9 @@ function dto(r: TokenRow) {
     kind: r.kind,
     scope: r.scope,
     channel: r.channel,
+    specialVersion: r.special_version,
+    version: r.version,
+    versionId: r.version_id,
     createdBy: r.created_by,
     expiresAt: r.expires_at,
     lastUsedAt: r.last_used_at,
@@ -67,7 +74,7 @@ apiTokenRoutes.get('/', async (c) => {
   const user = c.get('user')!;
   await requireProjectAccess(c.env.DB, user, projectId, 'manage_tokens');
   const rows = await c.env.DB.prepare(
-    `SELECT id, project_id, name, token_prefix, kind, scope, channel, created_by, expires_at,
+    `SELECT id, project_id, name, token_prefix, kind, scope, channel, special_version, version, version_id, created_by, expires_at,
             last_used_at, last_used_ip, revoked_at, created_at, token_enc
        FROM api_tokens WHERE project_id = ? ORDER BY id DESC`,
   )
@@ -83,12 +90,28 @@ apiTokenRoutes.post('/', async (c) => {
     name?: string;
     kind?: 'device' | 'ci';
     scope?: 'download' | 'upload' | 'full';
-    channel?: string;
+    channel?: string | null;
+    specialVersion?: string | null;
+    version?: string | null;
+    versionId?: number | null;
     expiresAt?: number | null;
   };
   const body = (await c.req.json<CreateBody>().catch(() => ({} as CreateBody))) as CreateBody;
-  if (!body.projectId || !body.name) throw badRequest('projectId and name required');
+  if (!body || typeof body.projectId !== 'number' || !Number.isSafeInteger(body.projectId) || body.projectId <= 0 || typeof body.name !== 'string' || !body.name.trim()) {
+    throw badRequest('projectId and name required');
+  }
+  if (body.expiresAt !== undefined && body.expiresAt !== null && !Number.isSafeInteger(body.expiresAt)) {
+    throw badRequest('expiresAt must be an integer timestamp or null');
+  }
   const proj = await requireProjectAccess(c.env.DB, me, body.projectId, 'manage_tokens');
+  const restrictions = normalizeTokenRestrictions(body);
+  const filter = tokenVersionFilter(body.projectId, restrictions);
+  const needsMatch = hasVersionRestrictions(restrictions);
+  const matchSql = `EXISTS (SELECT 1 FROM versions v WHERE ${filter.sql} AND v.status IN ('ready', 'archived'))`;
+  if (needsMatch) {
+    const match = await c.env.DB.prepare(`SELECT ${matchSql} AS allowed`).bind(...filter.args).first<{ allowed: number }>();
+    if (!match?.allowed) throw badRequest('token restrictions do not match a ready or archived file in this project');
+  }
   const kind = body.kind === 'ci' ? 'ci' : 'device';
   const scope = body.scope === 'upload' || body.scope === 'full' ? body.scope : 'download';
   if (kind === 'device' && scope !== 'download') {
@@ -100,8 +123,9 @@ apiTokenRoutes.post('/', async (c) => {
   const prefix = token.slice(0, 12);
   const now = Date.now();
   const r = await c.env.DB.prepare(
-    `INSERT INTO api_tokens (project_id, name, token_hash, token_enc, token_prefix, kind, scope, channel, created_by, expires_at, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO api_tokens (project_id, name, token_hash, token_enc, token_prefix, kind, scope, channel,
+                            special_version, version, version_id, created_by, expires_at, created_at)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? ${needsMatch ? `WHERE ${matchSql}` : ''}`,
   )
     .bind(
       body.projectId,
@@ -111,15 +135,20 @@ apiTokenRoutes.post('/', async (c) => {
       prefix,
       kind,
       scope,
-      body.channel ?? null,
+      restrictions.channel,
+      restrictions.specialVersion,
+      restrictions.version,
+      restrictions.versionId,
       me.id,
       body.expiresAt ?? null,
       now,
+      ...(needsMatch ? filter.args : []),
     )
     .run();
+  if (!r.meta.changes) throw conflict('token target changed; refresh the available versions before retrying');
   const id = Number(r.meta.last_row_id);
   const row = await c.env.DB.prepare(
-    `SELECT id, project_id, name, token_prefix, kind, scope, channel, created_by, expires_at,
+    `SELECT id, project_id, name, token_prefix, kind, scope, channel, special_version, version, version_id, created_by, expires_at,
             last_used_at, last_used_ip, revoked_at, created_at, token_enc
        FROM api_tokens WHERE id = ?`,
   )
@@ -131,7 +160,7 @@ apiTokenRoutes.post('/', async (c) => {
     projectId: body.projectId,
     targetType: 'api_token',
     targetId: id,
-    meta: { kind, scope, channel: body.channel ?? null, name: body.name },
+    meta: { kind, scope, ...restrictions, name: body.name },
   });
   return c.json({ ...dto(row!), token }, 201);
 });
@@ -208,7 +237,7 @@ apiTokenRoutes.delete('/:id', async (c) => {
 export async function resolveApiToken(c: Context<AppEnv>, rawToken: string): Promise<AuthedApiToken> {
   const hash = await sha256Hex(rawToken);
   const row = await c.env.DB.prepare(
-    `SELECT id, project_id, kind, scope, channel, expires_at, revoked_at
+    `SELECT id, project_id, kind, scope, channel, special_version, version, version_id, expires_at, revoked_at
        FROM api_tokens WHERE token_hash = ?`,
   )
     .bind(hash)
@@ -218,6 +247,9 @@ export async function resolveApiToken(c: Context<AppEnv>, rawToken: string): Pro
       kind: 'device' | 'ci';
       scope: 'download' | 'upload' | 'full';
       channel: string | null;
+      special_version: string | null;
+      version: string | null;
+      version_id: number | null;
       expires_at: number | null;
       revoked_at: number | null;
     }>();
@@ -236,6 +268,9 @@ export async function resolveApiToken(c: Context<AppEnv>, rawToken: string): Pro
     projectId: row.project_id,
     kind: row.kind,
     scope: row.scope,
-    channel: row.channel,
+    channel: row.channel || null,
+    specialVersion: row.special_version,
+    version: row.version,
+    versionId: row.version_id,
   };
 }

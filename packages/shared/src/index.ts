@@ -191,14 +191,22 @@ export interface ProjectMembership {
 export type ApiTokenKind = 'device' | 'ci';
 export type ApiTokenScope = 'download' | 'upload' | 'full';
 
-export interface ApiToken {
+/** Non-null conditions are combined with AND within the token's project. */
+export interface ApiTokenRestrictions {
+  channel: string | null;
+  specialVersion: string | null;
+  version: string | null;
+  /** One firmware file id; deleting it never broadens the token's access. */
+  versionId: number | null;
+}
+
+export interface ApiToken extends ApiTokenRestrictions {
   id: number;
   projectId: number;
   name: string;
   tokenPrefix: string;
   kind: ApiTokenKind;
   scope: ApiTokenScope;
-  channel: string | null;
   createdBy: number;
   expiresAt: number | null;
   lastUsedAt: number | null;

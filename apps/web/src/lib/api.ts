@@ -246,7 +246,10 @@ export const api = {
     name: string;
     kind?: 'device' | 'ci';
     scope?: 'download' | 'upload' | 'full';
-    channel?: string;
+    channel?: string | null;
+    specialVersion?: string | null;
+    version?: string | null;
+    versionId?: number | null;
     expiresAt?: number | null;
   }) =>
     request<ApiToken & { token: string }>('/api/api-tokens', {

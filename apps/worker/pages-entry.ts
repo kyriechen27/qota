@@ -27,6 +27,7 @@ import migration0010 from './migrations/0010_upload_version_notes.sql';
 import migration0011 from './migrations/0011_special_version.sql';
 import migration0012 from './migrations/0012_announcements.sql';
 import migration0013 from './migrations/0013_mail.sql';
+import migration0014 from './migrations/0014_api_token_restrictions.sql';
 
 interface PagesEnv extends Bindings {
   ASSETS: Fetcher;
@@ -70,6 +71,7 @@ async function ensureSchema(env: PagesEnv): Promise<void> {
     await ensureSpecialVersion(env);
     await ensureAnnouncements(env);
     await ensureMail(env);
+    await ensureTokenRestrictions(env);
     schemaReady = true;
     console.log('[schema] initialized D1 tables on first run');
     return;
@@ -88,6 +90,7 @@ async function ensureSchema(env: PagesEnv): Promise<void> {
   await ensureSpecialVersion(env);
   await ensureAnnouncements(env);
   await ensureMail(env);
+  await ensureTokenRestrictions(env);
   schemaReady = true;
 }
 
@@ -177,6 +180,14 @@ async function ensureMail(env: PagesEnv): Promise<void> {
   if (!row) {
     await env.DB.batch(statements(migration0013).map((stmt) => env.DB.prepare(stmt)));
     console.log('[schema] added SMTP settings and announcement notifications');
+  }
+}
+
+async function ensureTokenRestrictions(env: PagesEnv): Promise<void> {
+  const row = await env.DB.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'api_tokens'").first<{ sql: string }>();
+  if (row && !row.sql.includes('special_version')) {
+    await env.DB.batch(statements(migration0014).map((stmt) => env.DB.prepare(stmt)));
+    console.log('[schema] added API token version restrictions');
   }
 }
 

@@ -1,4 +1,5 @@
 import type { D1Database, R2Bucket } from '@cloudflare/workers-types';
+import type { ApiTokenRestrictions } from '@qota/shared';
 import type { StorageBackend } from './lib/s3';
 import type { SMTPConfig, SMTPConnector, MailMessage } from './lib/smtp';
 
@@ -62,12 +63,11 @@ export interface AuthedUser {
   role: GlobalRole;
 }
 
-export interface AuthedApiToken {
+export interface AuthedApiToken extends ApiTokenRestrictions {
   id: number;
   projectId: number;
   kind: 'device' | 'ci';
   scope: 'download' | 'upload' | 'full';
-  channel: string | null;
 }
 
 export interface AppVariables {
