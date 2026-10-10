@@ -374,6 +374,10 @@ const zh: Dict = {
   'files.colCustomer': '客户',
   'files.colProject': '项目',
   'files.empty': '没有可访问的文件。',
+  'files.searchExpandedHint': '已展开匹配文件，可单独收起；清除搜索后恢复原来的展开状态。',
+  'files.expandVersion': '展开 {project} 的 {version} 文件',
+  'files.collapseVersion': '收起 {project} 的 {version} 文件',
+  'files.downloadFile': '下载 {filename}',
 
   // memberships
   'mem.title': '成员授权',
@@ -770,6 +774,10 @@ const en: Dict = {
   'files.colCustomer': 'Customer',
   'files.colProject': 'Project',
   'files.empty': 'No accessible files.',
+  'files.searchExpandedHint': 'Matching files are expanded. You can collapse each group; clearing search restores the previous view.',
+  'files.expandVersion': 'Expand files for {project}, {version}',
+  'files.collapseVersion': 'Collapse files for {project}, {version}',
+  'files.downloadFile': 'Download {filename}',
 
   'mem.title': 'Memberships',
   'mem.allCustomers': 'All customers',
