@@ -16,6 +16,7 @@ import apiApp from '../src/index.ts';
 import { createSqliteD1 } from './d1-sqlite.mjs';
 import { runMigrations } from './migrate.mjs';
 import { makeLocalStorage } from './local-storage.mjs';
+import { connectSMTP } from './smtp-socket.mjs';
 
 // ---- load .env / .dev.vars (so dev:node reuses the same config as wrangler) -
 // Looks in cwd (apps/worker) and the repo root. Existing process.env wins.
@@ -81,6 +82,7 @@ if (STORAGE_DRIVER === 'local') {
 const env = {
   DB: db,
   STORAGE: storage,
+  SMTP_CONNECT: connectSMTP,
   ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS || '*',
   JWT_TTL_SECONDS: process.env.JWT_TTL_SECONDS || '43200',
   DOWNLOAD_URL_TTL_SECONDS: process.env.DOWNLOAD_URL_TTL_SECONDS || '300',

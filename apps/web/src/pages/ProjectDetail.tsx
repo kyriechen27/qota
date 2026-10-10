@@ -7,6 +7,7 @@ import { formatBytes } from '../lib/utils';
 import { useI18n } from '../lib/i18n';
 import VersionNotesPreview from '../components/VersionNotesPreview';
 import AnnouncementBoard from '../components/AnnouncementBoard';
+import MailRecipients, { emptyMailSelection } from '../components/MailRecipients';
 import type { ApiToken, Project, Version } from '@qota/shared';
 
 export default function ProjectDetail() {
@@ -562,13 +563,6 @@ export default function ProjectDetail() {
         </div>
       )}
 
-      <AnnouncementBoard
-        key={projectId}
-        projectId={projectId}
-        refreshKey={announcementRefresh}
-        onPublishPermissionChange={setCanPublishAnnouncements}
-      />
-
       <div className="card version-card">
         <div className="version-card-header">
           <div className="version-section-title"><h3>{t('pd.versions')}</h3><span className="version-count">{versionGroups.length}</span></div>
@@ -580,6 +574,13 @@ export default function ProjectDetail() {
         </div>
         {renderVersionsTable(versionGroups)}
       </div>
+
+      <AnnouncementBoard
+        key={`announcements-${projectId}`}
+        projectId={projectId}
+        refreshKey={announcementRefresh}
+        onPublishPermissionChange={setCanPublishAnnouncements}
+      />
 
       <div className="card version-card version-archive-card">
         <div className="version-card-header">
@@ -710,7 +711,7 @@ export default function ProjectDetail() {
 
       {showUpload && (
         <UploadFilesDialog
-          key={projectId}
+          key={`upload-${projectId}`}
           projectId={projectId}
           defaultChannel={project.defaultChannel || 'stable'}
           channels={channelList}
@@ -923,6 +924,8 @@ function UploadFilesDialog({
   const [specialVersion, setSpecialVersion] = useState('');
   const [publishAnnouncement, setPublishAnnouncement] = useState(false);
   const [announcementContent, setAnnouncementContent] = useState('');
+  const [mailSelection, setMailSelection] = useState(emptyMailSelection);
+  const [mailReady, setMailReady] = useState(true);
   const announcementBatchKey = useRef<string | null>(null);
   const [mandatory, setMandatory] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -1019,7 +1022,7 @@ function UploadFilesDialog({
             notes: item.notes || undefined,
             versionNotes: uploadVersionNotes,
             specialVersion: uploadSpecialVersion,
-            announcement: publishAnnouncement ? { batchKey: announcementBatchKey.current!, content: announcementContent.trim() } : undefined,
+            announcement: publishAnnouncement ? { batchKey: announcementBatchKey.current!, content: announcementContent.trim(), recipientIds: mailSelection.enabled ? mailSelection.recipientIds : undefined } : undefined,
             isMandatory: mandatory,
             overwriteExisting: overwriteIds.has(item.id),
             concurrency: 4,
@@ -1066,6 +1069,10 @@ function UploadFilesDialog({
     if (busyRef.current || !version) return;
     if (publishAnnouncement && !announcementContent.trim()) {
       setError(t('pd.uploadAnnouncementRequired'));
+      return;
+    }
+    if (publishAnnouncement && mailSelection.enabled && (!mailReady || !mailSelection.recipientIds.length)) {
+      setError(t('mail.chooseRecipients'));
       return;
     }
     if (duplicateIds.size) {
@@ -1117,6 +1124,10 @@ function UploadFilesDialog({
       setError(t('pd.uploadAnnouncementRequired'));
       return;
     }
+    if (publishAnnouncement && mailSelection.enabled && (!mailReady || !mailSelection.recipientIds.length)) {
+      setError(t('mail.chooseRecipients'));
+      return;
+    }
     busyRef.current = true;
     cancelRef.current = false;
     setBusy(true);
@@ -1143,6 +1154,8 @@ function UploadFilesDialog({
     setConflict(null);
     setPublishAnnouncement(false);
     setAnnouncementContent('');
+    setMailSelection(emptyMailSelection());
+    setMailReady(true);
     announcementBatchKey.current = null;
   }
 
@@ -1305,7 +1318,7 @@ function UploadFilesDialog({
               <input
                 type="checkbox"
                 checked={publishAnnouncement}
-                onChange={(e) => { setPublishAnnouncement(e.target.checked); setError(null); setConflict(null); }}
+                onChange={(e) => { setPublishAnnouncement(e.target.checked); setMailSelection(emptyMailSelection()); setMailReady(true); setError(null); setConflict(null); }}
                 disabled={busy || started}
               />
               <span>{t('pd.uploadAnnouncement')}</span>
@@ -1327,6 +1340,7 @@ function UploadFilesDialog({
                   />
                   <span className="upload-announcement-count">{announcementContent.length.toLocaleString()} / 10,000</span>
                 </label>
+                <MailRecipients projectId={projectId} value={mailSelection} onChange={setMailSelection} onReadyChange={setMailReady} disabled={busy || started} />
                 {successCount > 0 && <p className="success upload-announcement-success" role="status">{t('pd.uploadAnnouncementPublished')}</p>}
               </>
             )}
@@ -1355,7 +1369,7 @@ function UploadFilesDialog({
             ) : (
               <>
                 {started && <button type="button" onClick={newBatch}>{t('pd.newUploadBatch')}</button>}
-                {readyCount > 0 && <button type="submit" className="primary" disabled={!version || !!conflict || duplicateIds.size > 0}>{t(started ? 'pd.retryRemaining' : 'pd.startUpload')}</button>}
+                {readyCount > 0 && <button type="submit" className="primary" disabled={!version || !!conflict || duplicateIds.size > 0 || (publishAnnouncement && mailSelection.enabled && (!mailReady || !mailSelection.recipientIds.length))}>{t(started ? 'pd.retryRemaining' : 'pd.startUpload')}</button>}
                 {started && readyCount === 0 && <button type="button" className="primary" onClick={onClose}>{t('common.done')}</button>}
               </>
             )}

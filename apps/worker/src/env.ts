@@ -1,5 +1,6 @@
 import type { D1Database, R2Bucket } from '@cloudflare/workers-types';
 import type { StorageBackend } from './lib/s3';
+import type { SMTPConfig, SMTPConnector, MailMessage } from './lib/smtp';
 
 export interface Bindings {
   // D1
@@ -13,6 +14,11 @@ export interface Bindings {
   // binding) or the S3/R2 vars below. The Node runtime can inject a
   // local-filesystem backend here (see apps/worker/node/server.mjs).
   STORAGE?: StorageBackend;
+
+  // Node injects its TLS socket adapter; Workers use cloudflare:sockets.
+  SMTP_CONNECT?: SMTPConnector;
+  // Test transport injection. Never populated from client input or settings.
+  MAILER?: { send(config: SMTPConfig, message: MailMessage): Promise<void> };
 
   // Plain vars
   ALLOWED_ORIGINS: string;

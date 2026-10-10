@@ -20,7 +20,7 @@ export interface UploadJobOptions {
   notes?: string;
   versionNotes?: string | null;
   specialVersion?: string | null;
-  announcement?: { batchKey: string; content: string };
+  announcement?: { batchKey: string; content: string; recipientIds?: number[] };
   isMandatory?: boolean;
   minVersion?: string | null;
   maxVersion?: string | null;

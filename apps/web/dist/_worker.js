@@ -28936,6 +28936,456 @@ publicRoutes.get("/download/:slug", async (c) => {
   return c.redirect(url, 302);
 });
 
+// apps/worker/src/lib/mail-config.ts
+var DEFAULT_SETTINGS = {
+  enabled: false,
+  host: "",
+  port: 465,
+  security: "tls",
+  username: "",
+  fromEmail: "",
+  fromName: "",
+  hasPassword: false
+};
+var CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
+function headerText(value, field, maximum) {
+  if (typeof value !== "string" || CONTROL_CHARACTERS.test(value) || value.length > maximum) {
+    throw badRequest(`invalid ${field}`);
+  }
+  return value.trim();
+}
+function smtpHost(value) {
+  const host = headerText(value, "host", 253).toLowerCase();
+  if (!host) return host;
+  if (host.includes(":")) {
+    if (!/^[0-9a-f:.]+$/.test(host)) throw badRequest("invalid host");
+    try {
+      new URL(`http://[${host}]/`);
+    } catch {
+      throw badRequest("invalid host");
+    }
+    return host;
+  }
+  if (!host.split(".").every((part) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(part))) {
+    throw badRequest("invalid host");
+  }
+  return host;
+}
+function mailAddress(value) {
+  const address = headerText(value, "email address", 254);
+  const parts = address.split("@");
+  const local = parts[0] ?? "";
+  const domain = parts[1] ?? "";
+  if (parts.length !== 2 || !local || local.length > 64 || !/^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+$/.test(local) || local.startsWith(".") || local.endsWith(".") || local.includes("..") || !domain || !domain.split(".").every((part) => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(part))) {
+    throw badRequest("invalid email address");
+  }
+  return address;
+}
+function validateSettings(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw badRequest("mail settings required");
+  const body = value;
+  if (typeof body.enabled !== "boolean") throw badRequest("enabled must be a boolean");
+  if (typeof body.port !== "number" || !Number.isSafeInteger(body.port) || body.port < 1 || body.port > 65535 || body.port === 25) {
+    throw badRequest("port must be 1-65535 except 25; use 465 or 587 when possible");
+  }
+  if (body.security !== "tls" && body.security !== "starttls") throw badRequest("security must be tls or starttls");
+  if (body.password !== void 0 && (typeof body.password !== "string" || body.password.length > 4096 || CONTROL_CHARACTERS.test(body.password))) {
+    throw badRequest("invalid password");
+  }
+  const fromEmail = headerText(body.fromEmail, "fromEmail", 254);
+  return {
+    enabled: body.enabled,
+    host: smtpHost(body.host),
+    port: body.port,
+    security: body.security,
+    username: headerText(body.username, "username", 320),
+    fromEmail: fromEmail ? mailAddress(fromEmail) : "",
+    fromName: headerText(body.fromName, "fromName", 200),
+    ...body.password === void 0 ? {} : { password: body.password }
+  };
+}
+async function storedSettings(env) {
+  return env.DB.prepare("SELECT enabled, host, port, security, username, password_enc, from_email, from_name FROM mail_settings WHERE id = 1").first();
+}
+function settingsDto(row) {
+  if (!row) return { ...DEFAULT_SETTINGS };
+  return {
+    enabled: !!row.enabled,
+    host: row.host,
+    port: row.port,
+    security: row.security,
+    username: row.username,
+    fromEmail: row.from_email,
+    fromName: row.from_name,
+    hasPassword: !!row.password_enc
+  };
+}
+async function configFromRow(row, secret) {
+  try {
+    if (!row) throw new Error();
+    const fields = validateSettings(settingsDto(row));
+    const password = row.password_enc ? await decryptSecret(row.password_enc, secret) : null;
+    if (!fields.host || !fields.username || !fields.fromEmail || !password || CONTROL_CHARACTERS.test(password)) throw new Error();
+    return {
+      host: fields.host,
+      port: fields.port,
+      security: fields.security,
+      username: fields.username,
+      password,
+      fromEmail: fields.fromEmail,
+      fromName: fields.fromName
+    };
+  } catch {
+    throw new HttpError(400, "mail_not_configured", "mail settings are incomplete; ask an administrator to configure them");
+  }
+}
+async function getMailSettings(env) {
+  return settingsDto(await storedSettings(env));
+}
+async function getMailStatus(env) {
+  const row = await storedSettings(env);
+  let configured = false;
+  try {
+    await configFromRow(row, env.JWT_SECRET);
+    configured = true;
+  } catch {
+  }
+  return { enabled: !!row?.enabled, configured };
+}
+async function getMailConfig(env, options = {}) {
+  const row = await storedSettings(env);
+  if ((options.requireEnabled ?? true) && !row?.enabled) {
+    throw new HttpError(400, "mail_disabled", "mail notifications are disabled");
+  }
+  return configFromRow(row, env.JWT_SECRET);
+}
+async function saveMailSettings(env, userId, body) {
+  const fields = validateSettings(body);
+  const existing = await storedSettings(env);
+  const passwordEnc = fields.password === void 0 ? existing?.password_enc ?? null : fields.password ? await encryptSecret(fields.password, env.JWT_SECRET) : null;
+  const candidate = {
+    enabled: fields.enabled ? 1 : 0,
+    host: fields.host,
+    port: fields.port,
+    security: fields.security,
+    username: fields.username,
+    password_enc: passwordEnc,
+    from_email: fields.fromEmail,
+    from_name: fields.fromName
+  };
+  if (fields.enabled) await configFromRow(candidate, env.JWT_SECRET);
+  await env.DB.prepare(
+    `INSERT INTO mail_settings (id, enabled, host, port, security, username, password_enc, from_email, from_name, updated_by, updated_at)
+     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET enabled = excluded.enabled, host = excluded.host, port = excluded.port,
+       security = excluded.security, username = excluded.username,
+       password_enc = CASE WHEN ? = 1 THEN excluded.password_enc ELSE mail_settings.password_enc END,
+       from_email = excluded.from_email, from_name = excluded.from_name, updated_by = excluded.updated_by, updated_at = excluded.updated_at`
+  ).bind(
+    candidate.enabled,
+    candidate.host,
+    candidate.port,
+    candidate.security,
+    candidate.username,
+    candidate.password_enc,
+    candidate.from_email,
+    candidate.from_name,
+    userId,
+    Date.now(),
+    fields.password === void 0 ? 0 : 1
+  ).run();
+  return getMailSettings(env);
+}
+
+// apps/worker/src/lib/smtp.ts
+var SMTPError = class extends Error {
+  constructor(code) {
+    super(code);
+    this.code = code;
+  }
+};
+function base64(value) {
+  let binary = "";
+  for (const byte of new TextEncoder().encode(value)) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+function encodedHeader(value) {
+  const chunks = [];
+  let chunk = "";
+  for (const char of value) {
+    if (new TextEncoder().encode(chunk + char).length > 42) {
+      chunks.push(chunk);
+      chunk = "";
+    }
+    chunk += char;
+  }
+  if (chunk) chunks.push(chunk);
+  return chunks.map((part) => `=?UTF-8?B?${base64(part)}?=`).join("\r\n ");
+}
+function messageData(config, message) {
+  const body = base64(message.text.replace(/\r?\n/g, "\r\n")).match(/.{1,76}/g)?.join("\r\n") ?? "";
+  return [
+    `Date: ${(/* @__PURE__ */ new Date()).toUTCString()}`,
+    `Message-ID: <${crypto.randomUUID()}@${config.fromEmail.split("@")[1]}>`,
+    `From: ${config.fromName ? encodedHeader(config.fromName) + " " : ""}<${config.fromEmail}>`,
+    `To: <${message.to}>`,
+    `Subject: ${encodedHeader(message.subject)}`,
+    "MIME-Version: 1.0",
+    "Content-Type: text/plain; charset=UTF-8",
+    "Content-Transfer-Encoding: base64",
+    "",
+    body,
+    ".",
+    ""
+  ].join("\r\n");
+}
+var SMTPConversation = class {
+  lastCode = 0;
+  reader;
+  writer;
+  buffer = "";
+  decoder = new TextDecoder();
+  constructor(socket) {
+    this.reader = socket.readable.getReader();
+    this.writer = socket.writable.getWriter();
+  }
+  release() {
+    this.reader.releaseLock();
+    this.writer.releaseLock();
+  }
+  write(value) {
+    return this.writer.write(new TextEncoder().encode(value));
+  }
+  async reply(allowed, failure = "smtp_send") {
+    const lines = [];
+    let code;
+    let length = 0;
+    while (true) {
+      let end = this.buffer.indexOf("\r\n");
+      while (end === -1) {
+        const part = await this.reader.read();
+        if (part.done) throw new SMTPError(failure);
+        this.buffer += this.decoder.decode(part.value, { stream: true });
+        if (this.buffer.length > 32768) throw new SMTPError(failure);
+        end = this.buffer.indexOf("\r\n");
+      }
+      const line = this.buffer.slice(0, end);
+      this.buffer = this.buffer.slice(end + 2);
+      const match2 = /^(\d{3})(?:([ -])(.*))?$/.exec(line);
+      length += line.length;
+      if (!match2 || length > 32768 || code && match2[1] !== code) throw new SMTPError(failure);
+      code = match2[1];
+      lines.push(match2[3] ?? "");
+      if (match2[2] !== "-") {
+        this.lastCode = Number(code);
+        if (!allowed.includes(Number(code))) throw new SMTPError(failure);
+        return lines.join("\n");
+      }
+    }
+  }
+  async command(value, allowed, failure) {
+    await this.write(value + "\r\n");
+    return this.reply(allowed, failure);
+  }
+};
+async function cloudflareConnect(config) {
+  const { connect } = await import("cloudflare:sockets");
+  return connect({ hostname: config.host, port: config.port }, {
+    secureTransport: config.security === "tls" ? "on" : "starttls",
+    allowHalfOpen: false
+  });
+}
+async function sendMail(env, config, message) {
+  const mailbox = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/;
+  if (![config.fromEmail, message.to].every((value) => value.length <= 254 && mailbox.test(value)) || /[\r\n\0]/.test(config.username + config.password) || !["tls", "starttls"].includes(config.security)) {
+    throw new SMTPError("smtp_send");
+  }
+  if (env.MAILER) return env.MAILER.send(config, message);
+  let socket;
+  let timedOut = false;
+  let stage = "smtp_connect";
+  const close = () => {
+    void socket?.close().catch(() => {
+    });
+  };
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      close();
+      reject(new SMTPError("smtp_timeout"));
+    }, 15e3);
+  });
+  const run = async () => {
+    socket = await (env.SMTP_CONNECT ?? cloudflareConnect)(config);
+    socket.closed.catch(() => {
+    });
+    socket.opened.catch(() => {
+    });
+    if (timedOut) {
+      close();
+      throw new SMTPError("smtp_timeout");
+    }
+    await socket.opened;
+    let smtp = new SMTPConversation(socket);
+    await smtp.reply([220], "smtp_connect");
+    let capabilities = await smtp.command("EHLO qota.local", [250]);
+    if (config.security === "starttls") {
+      stage = "smtp_tls";
+      if (!/^STARTTLS\b/im.test(capabilities)) throw new SMTPError("smtp_tls");
+      await smtp.command("STARTTLS", [220], "smtp_tls");
+      smtp.release();
+      socket = socket.startTls();
+      socket.closed.catch(() => {
+      });
+      await socket.opened;
+      smtp = new SMTPConversation(socket);
+      capabilities = await smtp.command("EHLO qota.local", [250], "smtp_tls");
+    }
+    stage = "smtp_auth";
+    const auth = capabilities.split("\n").find((line) => /^AUTH(?:[ =])/i.test(line)) ?? "";
+    if (/\bPLAIN\b/i.test(auth)) {
+      const token = base64(`\0${config.username}\0${config.password}`);
+      const command = `AUTH PLAIN ${token}`;
+      await smtp.command(command.length + 2 <= 512 ? command : "AUTH PLAIN", [235, 334], "smtp_auth");
+      if (smtp.lastCode === 334) await smtp.command(token, [235], "smtp_auth");
+    } else if (/\bLOGIN\b/i.test(auth)) {
+      await smtp.command("AUTH LOGIN", [334], "smtp_auth");
+      await smtp.command(base64(config.username), [334], "smtp_auth");
+      await smtp.command(base64(config.password), [235], "smtp_auth");
+    } else {
+      throw new SMTPError("smtp_auth");
+    }
+    stage = "smtp_send";
+    await smtp.command(`MAIL FROM:<${config.fromEmail}>`, [250]);
+    await smtp.command(`RCPT TO:<${message.to}>`, [250, 251], "smtp_recipient");
+    await smtp.command("DATA", [354]);
+    await smtp.write(messageData(config, message));
+    await smtp.reply([250]);
+  };
+  try {
+    await Promise.race([run(), timeout]);
+  } catch (error) {
+    throw error instanceof SMTPError ? error : new SMTPError(stage);
+  } finally {
+    clearTimeout(timer);
+    close();
+  }
+}
+
+// apps/worker/src/lib/announcement-mail.ts
+var MAX_RECIPIENTS = 200;
+var SEND_BATCH_SIZE = 3;
+var STALE_CLAIM_MS = 5 * 6e4;
+var RECIPIENTS_SQL = `SELECT u.id, u.email, u.display_name AS displayName
+  FROM users u JOIN projects p ON p.id = ?
+  LEFT JOIN user_global_roles gr ON gr.user_id = u.id
+  LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = u.id
+  LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = u.id
+  WHERE u.is_active = 1 AND (
+    COALESCE(gr.role, u.role) IN ('super_admin', 'admin', 'observer') OR
+    (COALESCE(gr.role, u.role) = 'developer' AND COALESCE(pm.role, cm.role) IS NOT NULL)
+  )`;
+function announcementRecipientIds(value) {
+  if (value === void 0) return [];
+  if (!Array.isArray(value) || value.length > MAX_RECIPIENTS || value.some((id) => typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0)) {
+    throw badRequest("recipientIds must contain at most 200 positive user ids");
+  }
+  return [...new Set(value)].sort((a, b) => a - b);
+}
+async function announcementRecipients(db, projectId) {
+  const result = await db.prepare(`${RECIPIENTS_SQL} ORDER BY u.display_name, u.email, u.id`).bind(projectId).all();
+  return result.results ?? [];
+}
+async function validateAnnouncementRecipients(env, projectId, ids) {
+  if (!ids.length) return;
+  await getMailConfig(env);
+  const allowed = new Set((await announcementRecipients(env.DB, projectId)).map((user) => user.id));
+  if (ids.some((id) => !allowed.has(id))) {
+    throw badRequest("every email recipient must be active and able to view this project", "invalid_recipients");
+  }
+}
+function queueAnnouncementMail(db, ids, now) {
+  return db.prepare(`WITH published AS MATERIALIZED (
+      SELECT last_insert_rowid() AS id WHERE changes() = 1
+    )
+    INSERT INTO announcement_mail_deliveries
+      (announcement_id, user_id, status, created_at, updated_at)
+    SELECT published.id, recipients.value, 'pending', ?, ?
+      FROM published CROSS JOIN json_each(?) recipients
+     WHERE 1
+    ON CONFLICT (announcement_id, user_id) DO NOTHING`).bind(now, now, JSON.stringify(ids));
+}
+function safeMailError(error) {
+  const code = error?.code;
+  return typeof code === "string" && /^(smtp_(connect|timeout|tls|auth|recipient|send)|mail_(disabled|not_configured))$/.test(code) ? code : "smtp_send";
+}
+async function sendAnnouncementMail(env, announcementId, retry = false) {
+  try {
+    const db = env.DB;
+    const now = Date.now();
+    if (retry) {
+      await db.prepare(`UPDATE announcement_mail_deliveries
+        SET status = 'failed', error = 'smtp_timeout', claim_token = NULL, updated_at = ?
+        WHERE announcement_id = ? AND status = 'sending' AND updated_at < ?`).bind(now, announcementId, now - STALE_CLAIM_MS).run();
+    }
+    const statuses = retry ? "('pending', 'failed')" : "('pending')";
+    await db.prepare(`UPDATE announcement_mail_deliveries SET status = 'skipped', error = NULL, updated_at = ?
+      WHERE announcement_id = ? AND status IN ${statuses}
+        AND NOT EXISTS (SELECT 1 FROM announcements WHERE id = ? AND deleted_at IS NULL)`).bind(now, announcementId, announcementId).run();
+    const selected = await db.prepare(`SELECT id, user_id FROM announcement_mail_deliveries
+      WHERE announcement_id = ? AND status IN ${statuses}
+      ORDER BY ${retry ? "CASE status WHEN 'failed' THEN 0 ELSE 1 END, updated_at," : ""} id LIMIT ?`).bind(announcementId, SEND_BATCH_SIZE).all();
+    if (!selected.results?.length) return;
+    let config;
+    try {
+      config = await getMailConfig(env);
+    } catch (error) {
+      await db.prepare(`UPDATE announcement_mail_deliveries SET status = 'failed', error = ?, updated_at = ?
+        WHERE announcement_id = ? AND status = 'pending'`).bind(safeMailError(error), now, announcementId).run();
+      return;
+    }
+    const smtpConfig = config;
+    await Promise.allSettled(selected.results.map(async (delivery) => {
+      const claimToken = crypto.randomUUID();
+      const claim = await db.prepare(`UPDATE announcement_mail_deliveries
+        SET status = 'sending', error = NULL, claim_token = ?, updated_at = ?
+        WHERE id = ? AND status IN ${statuses}
+          AND EXISTS (SELECT 1 FROM announcements WHERE id = ? AND deleted_at IS NULL)`).bind(claimToken, Date.now(), delivery.id, announcementId).run();
+      if (!claim.meta.changes) return;
+      const finish = async (status, error = null) => {
+        await db.prepare(`UPDATE announcement_mail_deliveries SET status = ?, error = ?, claim_token = NULL, updated_at = ?
+          WHERE id = ? AND status = 'sending' AND claim_token = ?`).bind(status, error, Date.now(), delivery.id, claimToken).run();
+      };
+      try {
+        const announcement = await db.prepare(`SELECT a.id, a.project_id, a.version, a.content,
+            p.name AS project_name, c.name AS customer_name
+          FROM announcements a JOIN projects p ON p.id = a.project_id JOIN customers c ON c.id = p.customer_id
+          WHERE a.id = ? AND a.deleted_at IS NULL`).bind(announcementId).first();
+        const recipient = announcement ? await db.prepare(`${RECIPIENTS_SQL} AND u.id = ?
+          AND EXISTS (SELECT 1 FROM announcements WHERE id = ? AND deleted_at IS NULL)`).bind(announcement.project_id, delivery.user_id, announcementId).first() : null;
+        if (!announcement || !recipient) {
+          await finish("skipped");
+          return;
+        }
+        await sendMail(env, smtpConfig, {
+          to: recipient.email,
+          subject: `\u9879\u76EE\u516C\u544A\uFF1A${announcement.project_name}${announcement.version ? ` \xB7 ${announcement.version}` : ""}`,
+          text: `${announcement.customer_name} / ${announcement.project_name}
+${announcement.version ? `\u7248\u672C\uFF1A${announcement.version}
+` : ""}
+${announcement.content}`
+        });
+        await finish("sent");
+      } catch (error) {
+        await finish("failed", safeMailError(error));
+      }
+    }));
+  } catch {
+    console.warn("[announcement.mail] delivery incomplete; retry available");
+  }
+}
+
 // apps/worker/src/lib/announcements.ts
 var ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL = `EXISTS (
   SELECT 1 FROM users au JOIN projects ap ON ap.id = ?
@@ -28964,7 +29414,11 @@ function uploadAnnouncement(value) {
   if (typeof announcement.batchKey !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(announcement.batchKey)) {
     throw badRequest("announcement batchKey must be a UUID");
   }
-  return { batchKey: announcement.batchKey.toLowerCase(), content: announcementContent(announcement.content) };
+  return {
+    batchKey: announcement.batchKey.toLowerCase(),
+    content: announcementContent(announcement.content),
+    ...announcement.recipientIds === void 0 ? {} : { recipientIds: announcementRecipientIds(announcement.recipientIds) }
+  };
 }
 function createUploadAnnouncement(db, sessionId, now) {
   return db.prepare(
@@ -29022,7 +29476,11 @@ function sessionDto(r) {
     notes: r.notes,
     ...r.has_version_notes ? { versionNotes: r.version_notes } : {},
     ...r.has_special_version ? { specialVersion: r.special_version } : {},
-    ...r.announcement_batch_key ? { announcement: { batchKey: r.announcement_batch_key, content: r.announcement_content } } : {},
+    ...r.announcement_batch_key ? { announcement: {
+      batchKey: r.announcement_batch_key,
+      content: r.announcement_content,
+      ...r.announcement_recipient_ids ? { recipientIds: JSON.parse(r.announcement_recipient_ids) } : {}
+    } } : {},
     isMandatory: !!r.is_mandatory,
     minVersion: r.min_version,
     maxVersion: r.max_version,
@@ -29112,6 +29570,9 @@ uploadRoutes.post("/init", async (c) => {
       body.version
     ).first();
     if (reused) throw conflict("announcement batchKey already belongs to another version");
+    const published = await c.env.DB.prepare(`SELECT id FROM announcements
+      WHERE project_id = ? AND author_id = ? AND upload_batch_key = ?`).bind(body.projectId, me.id, announcement.batchKey).first();
+    if (!published) await validateAnnouncementRecipients(c.env, body.projectId, announcement.recipientIds ?? []);
   }
   const totalSize = body.totalSize;
   const partSize = clampPartSize(body.partSizeHint, totalSize);
@@ -29126,8 +29587,8 @@ uploadRoutes.post("/init", async (c) => {
        (project_id, r2_key, filename, total_size, part_size, upload_id, expected_sha256, release_channel,
         target_version, content_type, notes, version_notes, has_version_notes, special_version, has_special_version,
         is_mandatory, min_version, max_version, rollout_percentage, version_id,
-        status, initiated_by, created_at, announcement_content, announcement_batch_key)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?)`
+        status, initiated_by, created_at, announcement_content, announcement_batch_key, announcement_recipient_ids)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?)`
   ).bind(
     body.projectId,
     key,
@@ -29152,7 +29613,8 @@ uploadRoutes.post("/init", async (c) => {
     me.id,
     now,
     announcement?.content ?? null,
-    announcement?.batchKey ?? null
+    announcement?.batchKey ?? null,
+    announcement?.recipientIds === void 0 ? null : JSON.stringify(announcement.recipientIds)
   ).run();
   const sessionId = Number(r.meta.last_row_id);
   await audit(c, {
@@ -29208,6 +29670,13 @@ uploadRoutes.post("/complete", async (c) => {
   const project = await requireProjectAccess(c.env.DB, me, session.project_id, "upload");
   if (session.announcement_batch_key) {
     await requireAnnouncementAuthor(c.env.DB, session.project_id, session.initiated_by);
+    const published = await c.env.DB.prepare(`SELECT id FROM announcements
+      WHERE project_id = ? AND author_id = ? AND upload_batch_key = ?`).bind(session.project_id, session.initiated_by, session.announcement_batch_key).first();
+    if (!published) await validateAnnouncementRecipients(
+      c.env,
+      session.project_id,
+      JSON.parse(session.announcement_recipient_ids ?? "[]")
+    );
   }
   if (session.expected_sha256 && body.sha256 && session.expected_sha256.toLowerCase() !== body.sha256.toLowerCase()) {
     throw badRequest("sha256 mismatch with init expectedSha256");
@@ -29428,13 +29897,18 @@ uploadRoutes.post("/complete", async (c) => {
        ) WHERE id = ? AND status = 'in_progress' AND changes() = 1`
     ).bind(now, session.project_id, session.r2_key, session.id);
     const writes = [metadataWrite, artifactWrite, completeSession];
-    if (session.announcement_batch_key) writes.push(createUploadAnnouncement(c.env.DB, session.id, now));
+    if (session.announcement_batch_key) {
+      writes.push(createUploadAnnouncement(c.env.DB, session.id, now));
+      const recipientIds = JSON.parse(session.announcement_recipient_ids ?? "[]");
+      if (recipientIds.length) writes.push(queueAnnouncementMail(c.env.DB, recipientIds, now));
+    }
     const [, artifactResult, , announcementResult] = await c.env.DB.batch(writes);
     if (!artifactResult || artifactResult.meta.changes === 0) {
       throw conflict("version or filename changed; refresh before retrying the upload");
     }
     if (!existing) versionId = Number(artifactResult.meta.last_row_id);
     if (announcementResult?.meta.changes) {
+      await sendAnnouncementMail(c.env, Number(announcementResult.meta.last_row_id));
       await audit(c, {
         action: "announcement.create",
         actorType: "user",
@@ -29672,13 +30146,22 @@ var announcementRoutes = new Hono2();
 announcementRoutes.use("*", requireUser);
 var SELECT_ANNOUNCEMENTS = `SELECT a.id, a.project_id, p.name AS project_name, c.name AS customer_name,
   a.version, a.content, a.author_id, COALESCE(NULLIF(u.display_name, ''), u.email) AS author_name,
-  a.created_at, a.updated_at, COALESCE(pm.role, cm.role) AS project_role
+  a.created_at, a.updated_at, COALESCE(pm.role, cm.role) AS project_role,
+  COALESCE(mail.total, 0) AS mail_total, COALESCE(mail.sent, 0) AS mail_sent,
+  COALESCE(mail.failed, 0) AS mail_failed, COALESCE(mail.pending, 0) AS mail_pending,
+  COALESCE(mail.skipped, 0) AS mail_skipped
   FROM announcements a
   JOIN projects p ON p.id = a.project_id
   JOIN customers c ON c.id = p.customer_id
   JOIN users u ON u.id = a.author_id
   LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = ?
-  LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = ?`;
+  LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = ?
+  LEFT JOIN (
+    SELECT announcement_id, COUNT(*) AS total,
+      SUM(status = 'sent') AS sent, SUM(status = 'failed') AS failed,
+      SUM(status IN ('pending', 'sending')) AS pending, SUM(status = 'skipped') AS skipped
+    FROM announcement_mail_deliveries GROUP BY announcement_id
+  ) mail ON mail.announcement_id = a.id`;
 function globalAdmin(user) {
   return user.role === "admin" || user.role === "super_admin";
 }
@@ -29696,7 +30179,8 @@ function dto7(row, user) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     canEdit: canManage,
-    canDelete: canManage
+    canDelete: canManage,
+    mail: { total: row.mail_total, sent: row.mail_sent, failed: row.mail_failed, pending: row.mail_pending, skipped: row.mail_skipped }
   };
 }
 function positiveInteger(value, name) {
@@ -29755,22 +30239,71 @@ announcementRoutes.get("/", async (c) => {
     }))
   });
 });
+announcementRoutes.get("/recipients", async (c) => {
+  const projectId = positiveInteger(c.req.query("projectId"), "projectId");
+  await requireProjectAccess(c.env.DB, c.get("user"), projectId, "upload");
+  return c.json({ items: await announcementRecipients(c.env.DB, projectId) });
+});
 announcementRoutes.post("/", async (c) => {
   const user = c.get("user");
   const body = await c.req.json().catch(() => null);
   if (!body) throw badRequest("projectId and content required");
   const projectId = positiveInteger(body.projectId, "projectId");
   const content = announcementContent(body.content);
+  const recipientIds = announcementRecipientIds(body.recipientIds);
+  const version = body.version ?? null;
+  if (version !== null && (typeof version !== "string" || !/^[A-Za-z0-9._+-]{1,64}$/.test(version))) {
+    throw badRequest("version must match [A-Za-z0-9._+-], 1-64 chars");
+  }
   const project = await requireProjectAccess(c.env.DB, user, projectId, "upload");
+  await validateAnnouncementRecipients(c.env, projectId, recipientIds);
+  const versionExistsSql = `EXISTS (
+    SELECT 1 FROM versions WHERE project_id = ? AND version = ? AND status IN ('ready', 'archived')
+  )`;
+  if (version !== null) {
+    const available = await c.env.DB.prepare(`SELECT ${versionExistsSql} AS available`).bind(projectId, version).first();
+    if (!available?.available) throw notFound("version not found in this project");
+  }
   const now = Date.now();
-  const result = await c.env.DB.prepare(
-    `INSERT INTO announcements (project_id, content, author_id, created_at, updated_at)
-     SELECT ?, ?, ?, ?, ? WHERE ${ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL}`
-  ).bind(projectId, content, user.id, now, now, projectId, user.id).run();
-  if (!result.meta.changes) throw forbidden("no permission to publish announcements");
+  const insert = c.env.DB.prepare(
+    `INSERT INTO announcements (project_id, version, content, author_id, created_at, updated_at)
+     SELECT ?, ?, ?, ?, ?, ? WHERE ${ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL}
+       ${version !== null ? `AND ${versionExistsSql}` : ""}`
+  ).bind(
+    projectId,
+    version,
+    content,
+    user.id,
+    now,
+    now,
+    projectId,
+    user.id,
+    ...version !== null ? [projectId, version] : []
+  );
+  const result = recipientIds.length ? (await c.env.DB.batch([insert, queueAnnouncementMail(c.env.DB, recipientIds, now)]))[0] : await insert.run();
+  if (!result.meta.changes) {
+    if (version !== null) {
+      await requireAnnouncementAuthor(c.env.DB, projectId, user.id);
+      throw conflict("selected version is no longer available");
+    }
+    throw forbidden("no permission to publish announcements");
+  }
   const id = Number(result.meta.last_row_id);
-  await audit(c, { action: "announcement.create", projectId, customerId: project.customer_id, targetType: "announcement", targetId: id });
+  if (recipientIds.length) await sendAnnouncementMail(c.env, id);
+  await audit(c, { action: "announcement.create", projectId, customerId: project.customer_id, targetType: "announcement", targetId: id, meta: { version } });
   return c.json((await loadAnnouncement(c.env.DB, user, id)).announcement, 201);
+});
+announcementRoutes.post("/:id/mail/retry", async (c) => {
+  const user = c.get("user");
+  const id = positiveInteger(c.req.param("id"), "id");
+  const body = await c.req.json().catch(() => null);
+  if (body?.retryFailed !== void 0 && typeof body.retryFailed !== "boolean") {
+    throw badRequest("retryFailed must be a boolean");
+  }
+  const { announcement } = await loadAnnouncement(c.env.DB, user, id);
+  if (!announcement.canEdit) throw forbidden("only the author or an administrator can send announcement emails");
+  await sendAnnouncementMail(c.env, id, body?.retryFailed !== false);
+  return c.json((await loadAnnouncement(c.env.DB, user, id)).announcement);
 });
 announcementRoutes.patch("/:id", async (c) => {
   const user = c.get("user");
@@ -29793,7 +30326,52 @@ announcementRoutes.delete("/:id", async (c) => {
   const now = Date.now();
   const result = await c.env.DB.prepare("UPDATE announcements SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL").bind(now, now, id).run();
   if (!result.meta.changes) throw notFound("announcement not found");
+  await c.env.DB.prepare(`UPDATE announcement_mail_deliveries SET status = 'skipped', error = NULL, updated_at = ?
+    WHERE announcement_id = ? AND status IN ('pending', 'failed')`).bind(now, id).run();
   await audit(c, { action: "announcement.delete", projectId: row.project_id, customerId: project.customer_id, targetType: "announcement", targetId: id });
+  return c.json({ ok: true });
+});
+
+// apps/worker/src/routes/mail.ts
+var mailRoutes = new Hono2();
+mailRoutes.use("*", requireUser);
+mailRoutes.get("/status", async (c) => c.json(await getMailStatus(c.env)));
+mailRoutes.get("/settings", requireAdmin, async (c) => c.json(await getMailSettings(c.env)));
+mailRoutes.put("/settings", requireAdmin, async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const settings = await saveMailSettings(c.env, c.get("user").id, body);
+  await audit(c, {
+    action: "mail.settings.update",
+    targetType: "mail_settings",
+    targetId: 1,
+    meta: { enabled: settings.enabled }
+  });
+  return c.json(settings);
+});
+mailRoutes.post("/test", requireAdmin, async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const to = mailAddress(body?.to);
+  const config = await getMailConfig(c.env, { requireEnabled: false });
+  try {
+    await sendMail(c.env, config, {
+      to,
+      subject: "QOTA \u90AE\u4EF6\u914D\u7F6E\u6D4B\u8BD5",
+      text: "\u8FD9\u662F\u4E00\u5C01 QOTA \u90AE\u4EF6\u914D\u7F6E\u6D4B\u8BD5\u90AE\u4EF6\u3002\u6536\u5230\u6B64\u90AE\u4EF6\u8868\u793A\u90AE\u4EF6\u53D1\u9001\u914D\u7F6E\u53EF\u7528\u3002"
+    });
+  } catch (error) {
+    await audit(c, { action: "mail.test", targetType: "mail_settings", targetId: 1, meta: { ok: false } });
+    const safeCodes = ["smtp_auth", "smtp_connect", "smtp_tls", "smtp_timeout", "smtp_recipient", "smtp_send"];
+    const code = error instanceof SMTPError && safeCodes.includes(error.code) ? error.code : "mail_test_failed";
+    const messages = {
+      smtp_auth: "mail authentication failed; check the username and password",
+      smtp_connect: "could not connect to the mail server; check the host and port",
+      smtp_tls: "secure mail connection failed; check the security mode and server certificate",
+      smtp_timeout: "the mail server timed out; try again later",
+      smtp_recipient: "the mail server did not accept the recipient address"
+    };
+    throw new HttpError(502, code, messages[code] ?? "test email could not be sent; check the saved mail settings");
+  }
+  await audit(c, { action: "mail.test", targetType: "mail_settings", targetId: 1, meta: { ok: true } });
   return c.json({ ok: true });
 });
 
@@ -29862,6 +30440,7 @@ app.route("/api/public", publicRoutes);
 app.route("/api/api-tokens", apiTokenRoutes);
 app.route("/api/audit", auditRoutes);
 app.route("/api/announcements", announcementRoutes);
+app.route("/api/mail", mailRoutes);
 app.onError((err, c) => {
   if (err instanceof HttpError) {
     return c.json({ error: err.code, message: err.message }, err.status);
@@ -30141,6 +30720,9 @@ var special_version_default = "-- Optional metadata shared by all files of a ver
 // apps/worker/migrations/0012_announcements.sql
 var announcements_default = "CREATE TABLE announcements (\n  id INTEGER PRIMARY KEY AUTOINCREMENT,\n  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  version TEXT,\n  content TEXT NOT NULL,\n  author_id INTEGER NOT NULL REFERENCES users(id),\n  created_at INTEGER NOT NULL,\n  updated_at INTEGER NOT NULL,\n  deleted_at INTEGER,\n  upload_batch_key TEXT,\n  UNIQUE (project_id, author_id, upload_batch_key)\n);\nCREATE INDEX idx_announcements_project ON announcements(project_id, id DESC);\n\n-- Keep the announcement key after soft deletion, so remaining files from a\n-- published upload batch cannot recreate an announcement the user removed.\nALTER TABLE upload_sessions ADD COLUMN announcement_content TEXT;\nALTER TABLE upload_sessions ADD COLUMN announcement_batch_key TEXT;\nCREATE INDEX idx_upload_sessions_announcement ON upload_sessions(project_id, initiated_by, announcement_batch_key);\n";
 
+// apps/worker/migrations/0013_mail.sql
+var mail_default = "CREATE TABLE mail_settings (\n  id INTEGER PRIMARY KEY CHECK (id = 1),\n  enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),\n  host TEXT NOT NULL DEFAULT '',\n  port INTEGER NOT NULL DEFAULT 465,\n  security TEXT NOT NULL DEFAULT 'tls' CHECK (security IN ('tls', 'starttls')),\n  username TEXT NOT NULL DEFAULT '',\n  password_enc TEXT,\n  from_email TEXT NOT NULL DEFAULT '',\n  from_name TEXT NOT NULL DEFAULT '',\n  updated_by INTEGER REFERENCES users(id),\n  updated_at INTEGER NOT NULL\n);\n\nALTER TABLE upload_sessions ADD COLUMN announcement_recipient_ids TEXT;\nCREATE TABLE announcement_mail_deliveries (\n  id INTEGER PRIMARY KEY AUTOINCREMENT,\n  announcement_id INTEGER NOT NULL REFERENCES announcements(id) ON DELETE CASCADE,\n  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\n  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sending', 'sent', 'failed', 'skipped')),\n  error TEXT,\n  claim_token TEXT,\n  created_at INTEGER NOT NULL DEFAULT 0,\n  updated_at INTEGER NOT NULL DEFAULT 0,\n  UNIQUE (announcement_id, user_id)\n);\nCREATE INDEX idx_announcement_mail_deliveries_status ON announcement_mail_deliveries(announcement_id, status);\n";
+
 // apps/worker/pages-entry.ts
 function statements(sql) {
   return sql.replace(/--[^\n]*/g, "").split(";").map((s) => s.trim()).filter((s) => s.length > 0 && !/^PRAGMA/i.test(s));
@@ -30167,6 +30749,7 @@ async function ensureSchema(env) {
     await ensureUploadVersionNotes(env);
     await ensureSpecialVersion(env);
     await ensureAnnouncements(env);
+    await ensureMail(env);
     schemaReady = true;
     console.log("[schema] initialized D1 tables on first run");
     return;
@@ -30181,6 +30764,7 @@ async function ensureSchema(env) {
   await ensureUploadVersionNotes(env);
   await ensureSpecialVersion(env);
   await ensureAnnouncements(env);
+  await ensureMail(env);
   schemaReady = true;
 }
 async function ensureColumn(env, table, column, stmts) {
@@ -30245,6 +30829,13 @@ async function ensureAnnouncements(env) {
   if (!row) {
     await env.DB.batch(statements(announcements_default).map((stmt) => env.DB.prepare(stmt)));
     console.log("[schema] added project announcements");
+  }
+}
+async function ensureMail(env) {
+  const row = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mail_settings'").first();
+  if (!row) {
+    await env.DB.batch(statements(mail_default).map((stmt) => env.DB.prepare(stmt)));
+    console.log("[schema] added SMTP settings and announcement notifications");
   }
 }
 var pages_entry_default = {

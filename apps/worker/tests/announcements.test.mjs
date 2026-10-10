@@ -69,7 +69,11 @@ async function fixture(t) {
     return result;
   }
   const create = (content, options = {}) => request('/api/announcements', {
-    method: 'POST', body: { projectId: options.projectId ?? 1, content }, status: 201, ...options,
+    method: 'POST', body: {
+      projectId: options.projectId ?? 1, content,
+      ...(Object.hasOwn(options, 'version') ? { version: options.version } : {}),
+      ...(Object.hasOwn(options, 'recipientIds') ? { recipientIds: options.recipientIds } : {}),
+    }, status: 201, ...options,
   });
   const list = (options = {}, query = '') => request(`/api/announcements${query}`, options);
   const init = (filename, announcement, options = {}) => {
@@ -82,8 +86,101 @@ async function fixture(t) {
   const complete = (session, options = {}) => request('/api/upload/complete', {
     method: 'POST', status: 201, body: { sessionId: session.sessionId, parts: [{ partNumber: 1, etag: 'etag', size: 1024 }] }, ...options,
   });
-  return { db, request, create, list, init, complete, storage, objects };
+  const sent = [];
+  env.MAILER = { send: async (_config, message) => { sent.push(message); } };
+  const configureMail = () => request('/api/mail/settings', { method: 'PUT', userId: 1, body: {
+    enabled: true, host: 'smtp.example.test', port: 465, security: 'tls',
+    username: 'test-user', password: 'synthetic-password', fromEmail: 'sender@example.test', fromName: 'Test QOTA',
+  } });
+  const retry = (item, options = {}) => request(`/api/announcements/${item.id}/mail/retry`, {
+    method: 'POST', body: {}, ...options,
+  });
+  return { db, request, create, list, init, complete, storage, objects, env, sent, configureMail, retry };
 }
+
+function seedVersion(f, version, { projectId = 1, status = 'ready', filename = 'firmware.bin' } = {}) {
+  const result = f.db._db.prepare(`
+    INSERT INTO versions (project_id,version,release_channel,status,r2_key,filename,size,uploaded_by,created_at,updated_at)
+    VALUES (?,?,'ota',?,?,?,1024,2,1,1)
+  `).run(projectId, version, status, randomUUID(), filename);
+  return Number(result.lastInsertRowid);
+}
+
+test('standalone announcement version omission and explicit null keep project-wide compatibility', async (t) => {
+  const f = await fixture(t);
+  seedVersion(f, 'v1');
+  const omitted = await f.create('Project-wide announcement');
+  const explicitNull = await f.create('Explicitly project-wide announcement', { version: null });
+  assert.equal(omitted.version, null);
+  assert.equal(explicitNull.version, null);
+  assert.ok((await f.list()).items.every((item) => item.version === null));
+});
+
+test('standalone announcements can link ready or archived versions and labels with multiple files', async (t) => {
+  const f = await fixture(t);
+  seedVersion(f, 'v1.2.3', { filename: 'firmware.bin' });
+  seedVersion(f, 'v1.2.3', { filename: 'resources.bin' });
+  seedVersion(f, 'v0.9', { status: 'archived' });
+  const ready = await f.create('Ready version notice', { version: 'v1.2.3' });
+  const archived = await f.create('Archived version notice', { version: 'v0.9' });
+  assert.equal(ready.version, 'v1.2.3');
+  assert.equal(archived.version, 'v0.9');
+  assert.equal(ready.projectId, 1);
+  assert.equal(ready.authorId, 2);
+  const rows = (await f.list()).items;
+  assert.equal(rows.length, 2, 'multiple files must not duplicate one standalone announcement');
+  assert.equal(rows.find((item) => item.id === ready.id).version, 'v1.2.3');
+  assert.equal(rows.find((item) => item.id === archived.id).version, 'v0.9');
+});
+
+test('standalone announcement versions reject invalid, pending-only, missing and cross-project labels', async (t) => {
+  const f = await fixture(t);
+  seedVersion(f, 'pending', { status: 'pending' });
+  seedVersion(f, 'private-only', { projectId: 2 });
+  for (const version of ['', false, 123, ' v1 ', 'contains space', 'x'.repeat(65)]) {
+    await f.create('Invalid version reference', { version, status: 400 });
+  }
+  for (const version of ['pending', 'missing', 'private-only']) {
+    await f.create('Unavailable version reference', { version, status: 404 });
+  }
+  await f.create('Even a global admin must match the target project', { userId: 1, version: 'private-only', status: 404 });
+  await f.create('No publish access to this project', { projectId: 2, version: 'private-only', status: 403 });
+  assert.deepEqual((await f.list({ userId: 1 })).items, []);
+  const allowed = await f.create('Correct project and authorized publisher', { userId: 1, projectId: 2, version: 'private-only' });
+  assert.equal(allowed.projectId, 2);
+  assert.equal(allowed.version, 'private-only');
+});
+
+test('standalone version association is checked atomically and requires at least one eligible file', async (t) => {
+  for (const removeAll of [false, true]) {
+    const f = await fixture(t);
+    const first = seedVersion(f, 'v1', { filename: 'firmware.bin' });
+    seedVersion(f, 'v1', { filename: 'resources.bin', status: 'archived' });
+    const prepare = f.db.prepare.bind(f.db);
+    let interleaved = false;
+    f.db.prepare = (sql) => {
+      const statement = prepare(sql);
+      if (/INSERT INTO announcements/.test(sql)) {
+        const bind = statement.bind.bind(statement);
+        statement.bind = (...args) => {
+          const bound = bind(...args);
+          const run = bound.run.bind(bound);
+          bound.run = async () => {
+            if (removeAll) f.db._db.prepare("DELETE FROM versions WHERE project_id=1 AND version='v1'").run();
+            else f.db._db.prepare('DELETE FROM versions WHERE id=?').run(first);
+            interleaved = true;
+            return run();
+          };
+          return bound;
+        };
+      }
+      return statement;
+    };
+    await f.create('Version association during deletion', { version: 'v1', status: removeAll ? 409 : 201 });
+    assert.equal(interleaved, true);
+    assert.equal((await f.list()).items.length, removeAll ? 0 : 1);
+  }
+});
 
 test('announcement visibility and publishing follow effective project permissions', async (t) => {
   const f = await fixture(t);
@@ -336,4 +433,236 @@ test('a final-batch current lock rejects the new file and its announcement toget
   assert.equal(await f.db.prepare('SELECT COUNT(*) AS count FROM versions').first('count'), 1);
   assert.equal((await f.db.prepare("SELECT notes FROM version_metadata WHERE project_id=1 AND version='v1'").first()).notes, 'Published summary');
   assert.ok(!f.objects.has(session.key));
+});
+
+test('mail recipient choices include only active project viewers and require publish permission', async (t) => {
+  const f = await fixture(t);
+  f.db._db.prepare('UPDATE users SET is_active=0 WHERE id=7').run();
+  f.db._db.prepare("INSERT INTO project_memberships(user_id,project_id,role,created_at) VALUES(9,1,'viewer',1)").run();
+  const choices = await f.request('/api/announcements/recipients?projectId=1');
+  assert.deepEqual(choices.items.map((u) => u.id).sort((a, b) => a - b), [1, 2, 3, 4, 5, 6, 9]);
+  assert.ok(choices.items.every((u) => Object.keys(u).sort().join() === 'displayName,email,id'));
+  for (const userId of [3, 4, 8, 9]) {
+    await f.request('/api/announcements/recipients?projectId=1', { userId, status: 403 });
+  }
+  await f.request('/api/announcements/recipients?projectId=3', { userId: 5, status: 403 });
+  await f.request('/api/announcements/recipients', { status: 400 });
+  await f.request('/api/announcements/recipients?projectId=999', { status: 404 });
+});
+
+test('mail selection validates settings, user ids and project access before publication or upload', async (t) => {
+  const f = await fixture(t);
+  const noMail = await f.create('No SMTP configuration needed');
+  assert.deepEqual(noMail.mail, { total: 0, sent: 0, failed: 0, pending: 0, skipped: 0 });
+  await f.create('Missing configuration', { recipientIds: [3], status: 400 });
+  await f.init('missing-mail-config.bin', { batchKey: randomUUID(), content: 'Missing configuration', recipientIds: [3] }, { status: 400 });
+  await f.configureMail();
+  for (const recipientIds of [null, '3', [0], ['3'], [1.5], [999], [8], Array(201).fill(3)]) {
+    await f.create('Invalid selection', { recipientIds, status: 400 });
+    await f.init('invalid-mail-selection.bin', { batchKey: randomUUID(), content: 'Invalid selection', recipientIds }, { status: 400 });
+  }
+  f.db._db.prepare('UPDATE users SET is_active=0 WHERE id=3').run();
+  await f.create('Inactive recipient', { recipientIds: [3], status: 400 });
+  assert.equal((await f.list()).items.length, 1);
+  assert.equal(await f.db.prepare('SELECT COUNT(*) AS count FROM upload_sessions').first('count'), 0);
+  assert.equal(f.sent.length, 0);
+});
+
+test('standalone email sends private messages once per selected user and editing never resends', async (t) => {
+  const f = await fixture(t);
+  await f.configureMail();
+  seedVersion(f, 'v1');
+  const item = await f.create('Release details\nSecond line', { version: 'v1', recipientIds: [7, 3, 3, 4] });
+  assert.deepEqual(item.mail, { total: 3, sent: 3, failed: 0, pending: 0, skipped: 0 });
+  assert.deepEqual(f.sent.map((m) => m.to).sort(), ['peer@example.test', 'viewer@example.test', 'observer@example.test'].sort());
+  assert.ok(f.sent.every((m) => typeof m.to === 'string' && !('cc' in m) && !('bcc' in m)));
+  assert.ok(f.sent.every((m) => m.subject.includes('Main project') && m.subject.includes('v1') && m.text.includes('Release details\nSecond line')));
+  await f.request(`/api/announcements/${item.id}`, { method: 'PATCH', body: { content: 'Revised text' } });
+  await f.retry(item);
+  assert.equal(f.sent.length, 3);
+  assert.equal((await f.list()).items[0].mail.sent, 3);
+});
+
+test('bounded mail continuation sends pending only and explicit retry excludes already sent recipients', async (t) => {
+  const f = await fixture(t);
+  await f.configureMail();
+  let fail = true;
+  f.env.MAILER.send = async (_config, message) => {
+    f.sent.push(message);
+    if (fail && message.to === 'viewer@example.test') throw Object.assign(new Error('remote secret must not persist'), { code: 'smtp_recipient' });
+  };
+  const item = await f.create('Bounded delivery', { recipientIds: [1, 2, 3, 4, 5, 6, 7] });
+  assert.deepEqual(item.mail, { total: 7, sent: 2, failed: 1, pending: 4, skipped: 0 });
+  assert.equal(f.sent.length, 3);
+  const next = await f.retry(item, { body: { retryFailed: false } });
+  assert.deepEqual(next.mail, { total: 7, sent: 5, failed: 1, pending: 1, skipped: 0 });
+  const completed = await f.retry(item, { body: { retryFailed: false } });
+  assert.deepEqual(completed.mail, { total: 7, sent: 6, failed: 1, pending: 0, skipped: 0 });
+  await f.retry(item, { body: { retryFailed: false } });
+  assert.equal(f.sent.length, 7, 'automatic continuation does not retry failures');
+  assert.equal((await f.db.prepare('SELECT error FROM announcement_mail_deliveries WHERE user_id=3').first()).error, 'smtp_recipient');
+  fail = false;
+  const retried = await f.retry(item);
+  assert.deepEqual(retried.mail, { total: 7, sent: 7, failed: 0, pending: 0, skipped: 0 });
+  assert.equal(f.sent.length, 8);
+  assert.equal(f.sent.filter((m) => m.to === 'viewer@example.test').length, 2);
+  assert.ok(f.sent.filter((m) => m.to !== 'viewer@example.test').every((m, index, messages) => messages.findIndex((other) => other.to === m.to) === index));
+});
+
+test('mail retry requires author or effective administrator with current view access', async (t) => {
+  const f = await fixture(t);
+  await f.configureMail();
+  const item = await f.create('Author management', { recipientIds: [1, 2, 3, 4] });
+  for (const userId of [3, 4, 7, 8]) await f.retry(item, { userId, status: 403 });
+  await f.retry(item, { body: { retryFailed: 'false' }, status: 400 });
+  f.db._db.prepare("UPDATE memberships SET role='viewer' WHERE user_id=2").run();
+  assert.equal((await f.retry(item)).mail.sent, 4, 'author may finish after viewer downgrade');
+  f.db._db.prepare('DELETE FROM memberships WHERE user_id=2').run();
+  await f.retry(item, { status: 403 });
+  await f.retry(item, { userId: 5 });
+  const restricted = await f.create('Scoped override', { userId: 7, projectId: 3, recipientIds: [1, 3, 4, 5] });
+  await f.retry(restricted, { userId: 5, status: 403 });
+  await f.retry(restricted, { userId: 6 });
+});
+
+test('manual retries prioritize failures and rotate old failures so persistent rejects cannot block others', async (t) => {
+  const f = await fixture(t);
+  await f.configureMail();
+  const persistent = new Set(['super@example.test', 'author@example.test', 'viewer@example.test']);
+  let failAll = true;
+  f.env.MAILER.send = async (_config, message) => {
+    f.sent.push(message);
+    if (failAll || persistent.has(message.to)) throw Object.assign(new Error('rejected'), { code: 'smtp_recipient' });
+  };
+  const item = await f.create('Fair retry ordering', { recipientIds: [1, 2, 3, 4, 5, 6, 7] });
+  assert.deepEqual(item.mail, { total: 7, sent: 0, failed: 3, pending: 4, skipped: 0 });
+  const manual = await f.retry(item);
+  assert.deepEqual(manual.mail, item.mail, 'manual retry must attempt failed addresses before pending recipients');
+  assert.deepEqual(new Set(f.sent.slice(3).map((message) => message.to)), persistent);
+  await f.retry(item, { body: { retryFailed: false } });
+  const allFailed = await f.retry(item, { body: { retryFailed: false } });
+  assert.equal(allFailed.mail.failed, 7);
+  assert.equal(allFailed.mail.pending, 0);
+  // Make the ordering deterministic without relying on millisecond clock resolution.
+  f.db._db.prepare('UPDATE announcement_mail_deliveries SET updated_at=1 WHERE announcement_id=?').run(item.id);
+  failAll = false;
+  const first = await f.retry(item);
+  assert.equal(first.mail.failed, 7);
+  const second = await f.retry(item);
+  assert.equal(second.mail.sent, 3, 'next retry must move past the three newly attempted permanent failures');
+  const third = await f.retry(item);
+  assert.equal(third.mail.sent, 4);
+  assert.equal(third.mail.failed, 3);
+  const sentUsers = (await f.db.prepare("SELECT user_id FROM announcement_mail_deliveries WHERE announcement_id=? AND status='sent' ORDER BY user_id").bind(item.id).all()).results;
+  assert.deepEqual(sentUsers.map((row) => row.user_id), [4, 5, 6, 7]);
+});
+
+test('recipient permission is rechecked after publishing and before pending mail is sent', async (t) => {
+  const f = await fixture(t);
+  await f.configureMail();
+  const batch = f.db.batch.bind(f.db);
+  f.db.batch = async (queries) => {
+    f.db.batch = batch;
+    const results = await batch(queries);
+    f.db._db.prepare('DELETE FROM memberships WHERE user_id=3').run();
+    return results;
+  };
+  const item = await f.create('Permission changed during publication', { recipientIds: [3, 4] });
+  assert.deepEqual(item.mail, { total: 2, sent: 1, failed: 0, pending: 0, skipped: 1 });
+  assert.deepEqual(f.sent.map((m) => m.to), ['observer@example.test']);
+  await f.retry(item);
+  assert.equal(f.sent.length, 1, 'skipped recipient must not be retried');
+});
+
+test('concurrent upload files persist recipients and publish one immutable mail recipient set', async (t) => {
+  const f = await fixture(t);
+  await f.configureMail();
+  const batchKey = randomUUID();
+  const first = await f.init('firmware-mail.bin', { batchKey, content: 'First content', recipientIds: [3, 3] });
+  const second = await f.init('resources-mail.bin', { batchKey, content: 'Different draft', recipientIds: [7] });
+  const session = await f.request(`/api/upload/sessions/${first.sessionId}`);
+  assert.deepEqual(session.announcement.recipientIds, [3]);
+  assert.equal(f.sent.length, 0);
+  await Promise.all([f.complete(first), f.complete(second)]);
+  const item = (await f.list()).items[0];
+  assert.equal(item.mail.total, 1);
+  assert.equal(item.mail.sent, 1);
+  assert.equal(f.sent[0].to, item.content === 'First content' ? 'viewer@example.test' : 'peer@example.test');
+  await f.request(`/api/announcements/${item.id}`, { method: 'PATCH', body: { content: 'Manually edited' } });
+  await f.complete(await f.init('third-mail.bin', { batchKey, content: 'Third draft', recipientIds: [1, 2, 3] }));
+  assert.equal((await f.list()).items[0].mail.total, 1);
+  assert.equal(f.sent.length, 1);
+  await f.request(`/api/announcements/${item.id}`, { method: 'DELETE' });
+  await f.complete(await f.init('fourth-mail.bin', { batchKey, content: 'Deleted draft', recipientIds: [7] }));
+  assert.equal(f.sent.length, 1);
+  assert.deepEqual((await f.list()).items, []);
+});
+
+test('failed and aborted upload announcements never send and mail failure never fails completed firmware', async (t) => {
+  const f = await fixture(t);
+  await f.configureMail();
+  const draft = () => ({ batchKey: randomUUID(), content: 'Upload notice', recipientIds: [3] });
+  const aborted = await f.init('aborted-mail.bin', draft());
+  await f.request('/api/upload/abort', { method: 'POST', body: { sessionId: aborted.sessionId } });
+  const failed = await f.init('failed-mail.bin', draft());
+  const complete = f.storage.completeMultipartUpload;
+  f.storage.completeMultipartUpload = async () => { throw new HttpError(503, 'storage_unavailable'); };
+  await f.complete(failed, { status: 503 });
+  f.storage.completeMultipartUpload = complete;
+  assert.equal(f.sent.length, 0);
+  assert.equal(await f.db.prepare('SELECT COUNT(*) AS count FROM announcement_mail_deliveries').first('count'), 0);
+  f.env.MAILER.send = async () => { throw new Error('untrusted SMTP error with a secret'); };
+  const good = await f.init('good-mail.bin', draft());
+  const version = await f.complete(good);
+  assert.equal(version.status, 'ready');
+  assert.equal((await f.request(`/api/upload/sessions/${good.sessionId}`)).status, 'completed');
+  const item = (await f.list()).items[0];
+  assert.deepEqual(item.mail, { total: 1, sent: 0, failed: 1, pending: 0, skipped: 0 });
+  assert.equal((await f.db.prepare('SELECT error FROM announcement_mail_deliveries').first()).error, 'smtp_send');
+});
+
+test('concurrent retry claims prevent duplicate sends and explicit retry recovers only stale claims', async (t) => {
+  const f = await fixture(t);
+  await f.configureMail();
+  const item = await f.create('Continuation claims', { recipientIds: [1, 2, 3, 4] });
+  const sending = [];
+  f.env.MAILER.send = async (_config, message) => {
+    f.sent.push(message);
+    await new Promise((resolve) => { sending.push(resolve); setTimeout(resolve, 5); });
+  };
+  await Promise.all([f.retry(item), f.retry(item)]);
+  assert.equal(f.sent.length, 4);
+  assert.equal((await f.list()).items[0].mail.sent, 4);
+  f.db._db.prepare("UPDATE announcement_mail_deliveries SET status='sending',claim_token='old',updated_at=? WHERE announcement_id=? AND user_id=4")
+    .run(Date.now(), item.id);
+  await f.retry(item);
+  assert.equal(f.sent.length, 4, 'fresh claim must not be stolen');
+  f.db._db.prepare('UPDATE announcement_mail_deliveries SET updated_at=1 WHERE announcement_id=? AND user_id=4').run(item.id);
+  await f.retry(item, { body: { retryFailed: false } });
+  assert.equal(f.sent.length, 4, 'automatic continuation must not recover ambiguous SMTP outcomes');
+  assert.equal((await f.retry(item)).mail.sent, 4);
+  assert.equal(f.sent.length, 5);
+  assert.equal((await f.db.prepare('SELECT claim_token FROM announcement_mail_deliveries WHERE announcement_id=? AND user_id=4').bind(item.id).first()).claim_token, null);
+});
+
+test('deletion cancels pending mail and SMTP disabled after publication records a retryable failure', async (t) => {
+  const f = await fixture(t);
+  await f.configureMail();
+  const deleted = await f.create('Cancel remaining mail', { recipientIds: [1, 2, 3, 4, 5] });
+  await f.request(`/api/announcements/${deleted.id}`, { method: 'DELETE' });
+  await f.retry(deleted, { status: 404 });
+  assert.equal(f.sent.length, 3);
+  assert.equal(await f.db.prepare("SELECT COUNT(*) AS count FROM announcement_mail_deliveries WHERE announcement_id=? AND status='skipped'").bind(deleted.id).first('count'), 2);
+  const batch = f.db.batch.bind(f.db);
+  f.db.batch = async (queries) => {
+    f.db.batch = batch;
+    const results = await batch(queries);
+    f.db._db.prepare('UPDATE mail_settings SET enabled=0').run();
+    return results;
+  };
+  const disabled = await f.create('Publication still succeeds', { recipientIds: [3] });
+  assert.equal(disabled.mail.failed, 1);
+  assert.equal(f.sent.length, 3);
+  await f.configureMail();
+  assert.equal((await f.retry(disabled)).mail.sent, 1);
 });

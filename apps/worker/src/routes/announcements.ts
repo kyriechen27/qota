@@ -4,9 +4,10 @@ import type { Announcement } from '@qota/shared';
 import type { AppEnv, AuthedUser, CustomerRole } from '../env';
 import { requireUser } from '../middleware/auth';
 import { requireProjectAccess } from '../lib/memberships';
-import { announcementContent, ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL } from '../lib/announcements';
+import { announcementContent, requireAnnouncementAuthor, ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL } from '../lib/announcements';
 import { audit } from '../lib/audit';
-import { badRequest, forbidden, notFound } from '../utils/errors';
+import { badRequest, conflict, forbidden, notFound } from '../utils/errors';
+import { announcementRecipientIds, announcementRecipients, validateAnnouncementRecipients, queueAnnouncementMail, sendAnnouncementMail } from '../lib/announcement-mail';
 
 export const announcementRoutes = new Hono<AppEnv>();
 announcementRoutes.use('*', requireUser);
@@ -23,17 +24,31 @@ interface AnnouncementRow {
   created_at: number;
   updated_at: number;
   project_role: CustomerRole | null;
+  mail_total: number;
+  mail_sent: number;
+  mail_failed: number;
+  mail_pending: number;
+  mail_skipped: number;
 }
 
 const SELECT_ANNOUNCEMENTS = `SELECT a.id, a.project_id, p.name AS project_name, c.name AS customer_name,
   a.version, a.content, a.author_id, COALESCE(NULLIF(u.display_name, ''), u.email) AS author_name,
-  a.created_at, a.updated_at, COALESCE(pm.role, cm.role) AS project_role
+  a.created_at, a.updated_at, COALESCE(pm.role, cm.role) AS project_role,
+  COALESCE(mail.total, 0) AS mail_total, COALESCE(mail.sent, 0) AS mail_sent,
+  COALESCE(mail.failed, 0) AS mail_failed, COALESCE(mail.pending, 0) AS mail_pending,
+  COALESCE(mail.skipped, 0) AS mail_skipped
   FROM announcements a
   JOIN projects p ON p.id = a.project_id
   JOIN customers c ON c.id = p.customer_id
   JOIN users u ON u.id = a.author_id
   LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = ?
-  LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = ?`;
+  LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = ?
+  LEFT JOIN (
+    SELECT announcement_id, COUNT(*) AS total,
+      SUM(status = 'sent') AS sent, SUM(status = 'failed') AS failed,
+      SUM(status IN ('pending', 'sending')) AS pending, SUM(status = 'skipped') AS skipped
+    FROM announcement_mail_deliveries GROUP BY announcement_id
+  ) mail ON mail.announcement_id = a.id`;
 
 function globalAdmin(user: AuthedUser) {
   return user.role === 'admin' || user.role === 'super_admin';
@@ -46,6 +61,7 @@ function dto(row: AnnouncementRow, user: AuthedUser): Announcement {
     id: row.id, projectId: row.project_id, projectName: row.project_name, customerName: row.customer_name,
     version: row.version, content: row.content, authorId: row.author_id, authorName: row.author_name,
     createdAt: row.created_at, updatedAt: row.updated_at, canEdit: canManage, canDelete: canManage,
+    mail: { total: row.mail_total, sent: row.mail_sent, failed: row.mail_failed, pending: row.mail_pending, skipped: row.mail_skipped },
   };
 }
 
@@ -109,22 +125,67 @@ announcementRoutes.get('/', async (c) => {
   });
 });
 
+announcementRoutes.get('/recipients', async (c) => {
+  const projectId = positiveInteger(c.req.query('projectId'), 'projectId');
+  await requireProjectAccess(c.env.DB, c.get('user')!, projectId, 'upload');
+  return c.json({ items: await announcementRecipients(c.env.DB, projectId) });
+});
+
 announcementRoutes.post('/', async (c) => {
   const user = c.get('user')!;
-  const body = await c.req.json<{ projectId?: number; content?: unknown }>().catch(() => null);
+  const body = await c.req.json<{ projectId?: number; content?: unknown; version?: unknown; recipientIds?: unknown }>().catch(() => null);
   if (!body) throw badRequest('projectId and content required');
   const projectId = positiveInteger(body.projectId, 'projectId');
   const content = announcementContent(body.content);
+  const recipientIds = announcementRecipientIds(body.recipientIds);
+  const version = body.version ?? null;
+  if (version !== null && (typeof version !== 'string' || !/^[A-Za-z0-9._+-]{1,64}$/.test(version))) {
+    throw badRequest('version must match [A-Za-z0-9._+-], 1-64 chars');
+  }
   const project = await requireProjectAccess(c.env.DB, user, projectId, 'upload');
+  await validateAnnouncementRecipients(c.env, projectId, recipientIds);
+  const versionExistsSql = `EXISTS (
+    SELECT 1 FROM versions WHERE project_id = ? AND version = ? AND status IN ('ready', 'archived')
+  )`;
+  if (version !== null) {
+    const available = await c.env.DB.prepare(`SELECT ${versionExistsSql} AS available`)
+      .bind(projectId, version).first<{ available: number }>();
+    if (!available?.available) throw notFound('version not found in this project');
+  }
   const now = Date.now();
-  const result = await c.env.DB.prepare(
-    `INSERT INTO announcements (project_id, content, author_id, created_at, updated_at)
-     SELECT ?, ?, ?, ?, ? WHERE ${ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL}`,
-  ).bind(projectId, content, user.id, now, now, projectId, user.id).run();
-  if (!result.meta.changes) throw forbidden('no permission to publish announcements');
+  const insert = c.env.DB.prepare(
+    `INSERT INTO announcements (project_id, version, content, author_id, created_at, updated_at)
+     SELECT ?, ?, ?, ?, ?, ? WHERE ${ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL}
+       ${version !== null ? `AND ${versionExistsSql}` : ''}`,
+  ).bind(projectId, version, content, user.id, now, now, projectId, user.id,
+    ...(version !== null ? [projectId, version] : []));
+  const result = recipientIds.length
+    ? (await c.env.DB.batch([insert, queueAnnouncementMail(c.env.DB, recipientIds, now)]))[0]!
+    : await insert.run();
+  if (!result.meta.changes) {
+    if (version !== null) {
+      await requireAnnouncementAuthor(c.env.DB, projectId, user.id);
+      throw conflict('selected version is no longer available');
+    }
+    throw forbidden('no permission to publish announcements');
+  }
   const id = Number(result.meta.last_row_id);
-  await audit(c, { action: 'announcement.create', projectId, customerId: project.customer_id, targetType: 'announcement', targetId: id });
+  if (recipientIds.length) await sendAnnouncementMail(c.env, id);
+  await audit(c, { action: 'announcement.create', projectId, customerId: project.customer_id, targetType: 'announcement', targetId: id, meta: { version } });
   return c.json((await loadAnnouncement(c.env.DB, user, id)).announcement, 201);
+});
+
+announcementRoutes.post('/:id/mail/retry', async (c) => {
+  const user = c.get('user')!;
+  const id = positiveInteger(c.req.param('id'), 'id');
+  const body = await c.req.json<{ retryFailed?: unknown } | null>().catch(() => null);
+  if (body?.retryFailed !== undefined && typeof body.retryFailed !== 'boolean') {
+    throw badRequest('retryFailed must be a boolean');
+  }
+  const { announcement } = await loadAnnouncement(c.env.DB, user, id);
+  if (!announcement.canEdit) throw forbidden('only the author or an administrator can send announcement emails');
+  await sendAnnouncementMail(c.env, id, body?.retryFailed !== false);
+  return c.json((await loadAnnouncement(c.env.DB, user, id)).announcement);
 });
 
 announcementRoutes.patch('/:id', async (c) => {
@@ -151,6 +212,8 @@ announcementRoutes.delete('/:id', async (c) => {
   const result = await c.env.DB.prepare('UPDATE announcements SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL')
     .bind(now, now, id).run();
   if (!result.meta.changes) throw notFound('announcement not found');
+  await c.env.DB.prepare(`UPDATE announcement_mail_deliveries SET status = 'skipped', error = NULL, updated_at = ?
+    WHERE announcement_id = ? AND status IN ('pending', 'failed')`).bind(now, id).run();
   await audit(c, { action: 'announcement.delete', projectId: row.project_id, customerId: project.customer_id, targetType: 'announcement', targetId: id });
   return c.json({ ok: true });
 });

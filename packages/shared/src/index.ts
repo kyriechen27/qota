@@ -74,6 +74,21 @@ export interface Announcement {
   updatedAt: number;
   canEdit: boolean;
   canDelete: boolean;
+  mail: AnnouncementMailSummary;
+}
+
+export interface AnnouncementMailSummary {
+  total: number;
+  sent: number;
+  failed: number;
+  pending: number;
+  skipped: number;
+}
+
+export interface AnnouncementRecipient {
+  id: number;
+  email: string;
+  displayName: string | null;
 }
 
 export interface AnnouncementListResponse {
@@ -86,6 +101,29 @@ export interface UploadAnnouncement {
   /** One UUID shared by all files and retries of the same upload batch. */
   batchKey: string;
   content: string;
+  /** Active users who can view this project; omit or use [] for no email. */
+  recipientIds?: number[];
+}
+
+export interface MailSettings {
+  enabled: boolean;
+  host: string;
+  port: number;
+  security: 'tls' | 'starttls';
+  username: string;
+  fromEmail: string;
+  fromName: string;
+  hasPassword: boolean;
+}
+
+export type MailSettingsInput = Omit<MailSettings, 'hasPassword'> & {
+  /** Omit to retain the saved password. An explicit empty string clears it. */
+  password?: string;
+};
+
+export interface MailStatus {
+  enabled: boolean;
+  configured: boolean;
 }
 
 export interface Version {

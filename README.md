@@ -27,6 +27,44 @@ OTA 升级包多租户版本管理平台,部署到 Cloudflare Workers + Pages,�
 任何列表接口在 SQL 层就 JOIN 权限表过滤,无权限的客户/项目根本不会出现在响应里。
 每一次状态变更/上传/下载都写 `audit_logs`,带 IP / UA / actor。
 
+## 公告与邮件通知
+
+登录首页是公告栏。公告按项目权限显示；单独发布时可关联该项目已有版本，
+也可选择不关联版本。上传固件时可以同时发布公告，同一批文件只发布一次。
+
+管理员在侧栏「邮箱配置」中保存 SMTP 服务器、端口、加密方式、发件人、
+登录账号和密码/授权码。支持 SSL/TLS（通常 465）和 STARTTLS（通常 587），
+始终校验证书并在加密连接中登录。配置下方的「邮箱测试」可填写测试收件地址，
+使用已保存配置发送测试邮件；无需先开启公告通知。
+Cloudflare 默认不允许 SMTP 25 端口，详情见
+[Cloudflare TCP sockets 文档](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/)。
+
+启用邮箱后，发布公告可以勾选「邮件通知」，从有权查看该项目的活跃用户中
+选择收件人，支持全选和取消全选（每次最多 200 人）。通知逐人发送，互不暴露
+收件地址。发送前再次检查权限；关闭账号或撤销权限的收件人会跳过。
+邮件失败不影响公告和固件保存，公告会显示发送进度及继续发送/重试入口。
+页面在打开期间自动分批续发待发送邮件；离开页面导致中断时，可重新进入公告栏继续。
+已成功发送的记录不再发送，编辑公告正文不会重新发送已发送的邮件。
+
+邮件密码以 AES-GCM 加密存储，接口不回传密码。保存时省略 `password` 保留原值；
+更换 `JWT_SECRET` 后需要重新保存邮箱密码。
+
+相关接口（使用浏览器用户 Bearer token）：
+
+| 接口 | 用途 |
+| --- | --- |
+| `GET/PUT /api/mail/settings` | 管理员读取/保存邮箱配置 |
+| `GET /api/mail/status` | 查询邮箱是否已配置、是否已启用 |
+| `POST /api/mail/test` | 管理员测试，正文 `{ "to": "test@example.com" }` |
+| `GET /api/announcements/recipients?projectId=1` | 发布者查询项目可选收件人 |
+| `POST /api/announcements` | `projectId`、`content`、可选 `version`、可选 `recipientIds` |
+| `POST /api/announcements/:id/mail/retry` | 公告管理者继续/重试；`retryFailed: false` 只处理待发送项 |
+
+上传接口中的 `announcement` 同样支持 `recipientIds`。未提供或空数组均不发邮件。
+通知接口每次最多处理 3 封，调用方可根据公告的 `mail.pending` 分批继续；失败项
+需主动重试。发送后进程突然中断可能无法确认服务器是否已接收，5 分钟后手动
+恢复此类记录可能重复发送，请先核对收件箱。
+
 ## 目录
 
 ```

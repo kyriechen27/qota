@@ -1,6 +1,7 @@
 import type { D1Database } from '@cloudflare/workers-types';
 import type { UploadAnnouncement } from '@qota/shared';
 import { badRequest, forbidden } from '../utils/errors';
+import { announcementRecipientIds } from './announcement-mail';
 
 // Parameters: project id, author id. Keep the original session author as the
 // publisher, including when another authorized user finishes their upload.
@@ -31,12 +32,15 @@ export function announcementContent(value: unknown): string {
 export function uploadAnnouncement(value: unknown): UploadAnnouncement | undefined {
   if (value === undefined) return undefined;
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw badRequest('announcement must contain batchKey and content');
-  const announcement = value as { batchKey?: unknown; content?: unknown };
+  const announcement = value as { batchKey?: unknown; content?: unknown; recipientIds?: unknown };
   if (typeof announcement.batchKey !== 'string' ||
       !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(announcement.batchKey)) {
     throw badRequest('announcement batchKey must be a UUID');
   }
-  return { batchKey: announcement.batchKey.toLowerCase(), content: announcementContent(announcement.content) };
+  return {
+    batchKey: announcement.batchKey.toLowerCase(), content: announcementContent(announcement.content),
+    ...(announcement.recipientIds === undefined ? {} : { recipientIds: announcementRecipientIds(announcement.recipientIds) }),
+  };
 }
 
 // Must immediately follow the successful session-completion UPDATE in the

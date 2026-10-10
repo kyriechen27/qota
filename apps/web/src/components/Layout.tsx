@@ -34,6 +34,9 @@ export default function Layout({ children }: { children: ReactNode }) {
             <NavLink to="/permissions" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
               {t('nav.memberships')}
             </NavLink>
+            <NavLink to="/mail" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
+              {t('mailSettings.title')}
+            </NavLink>
           </>
         )}
         <div className="spacer" />

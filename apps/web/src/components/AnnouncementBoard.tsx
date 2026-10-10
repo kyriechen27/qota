@@ -3,6 +3,8 @@ import { Link } from 'react-router-dom';
 import type { Announcement, Project } from '@qota/shared';
 import { api } from '../lib/api';
 import { useI18n } from '../lib/i18n';
+import { useAnnouncementMail } from '../lib/announcement-mail';
+import MailRecipients, { emptyMailSelection } from './MailRecipients';
 import './announcements.css';
 
 type PublishableProject = { id: number; name: string; customerName: string };
@@ -32,6 +34,7 @@ export default function AnnouncementBoard({
   const moreRequest = useRef<number | null>(null);
   const deleteBusy = useRef(false);
   const previousFilter = useRef<number | undefined>();
+  const mailDelivery = useAnnouncementMail(items, setItems, t('mail.noProgress'));
   const selectedProjectId = projectId ?? (filter ? Number(filter) : undefined);
   const limit = projectId === undefined ? 20 : 3;
   const availableProjects = projectId === undefined
@@ -151,6 +154,10 @@ export default function AnnouncementBoard({
               busy={deletingId !== null}
               onEdit={() => setEditor({ item })}
               onDelete={() => void remove(item)}
+              mailSending={mailDelivery.sendingId === item.id}
+              mailBusy={mailDelivery.sendingId !== null}
+              mailError={mailDelivery.errors[item.id]}
+              onRetryMail={() => mailDelivery.retry(item)}
             />
           ))}
           {!items.length && !error && <div className="announcement-empty"><AnnouncementIcon /><strong>{t('ann.empty')}</strong><p>{t('ann.emptyHint')}</p></div>}
@@ -176,12 +183,16 @@ export default function AnnouncementBoard({
   );
 }
 
-function AnnouncementCard({ item, compact, busy, onEdit, onDelete }: {
+function AnnouncementCard({ item, compact, busy, onEdit, onDelete, mailSending, mailBusy, mailError, onRetryMail }: {
   item: Announcement;
   compact: boolean;
   busy: boolean;
   onEdit: () => void;
   onDelete: () => void;
+  mailSending: boolean;
+  mailBusy: boolean;
+  mailError?: string;
+  onRetryMail: () => void;
 }) {
   const { t } = useI18n();
   const contentRef = useRef<HTMLDivElement>(null);
@@ -208,6 +219,14 @@ function AnnouncementCard({ item, compact, busy, onEdit, onDelete }: {
         <time className="announcement-time" dateTime={new Date(item.createdAt).toISOString()} title={new Date(item.createdAt).toLocaleString()}>{new Date(item.createdAt).toLocaleDateString()} {new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })}</time>
       </div>
       <div ref={contentRef} className={`announcement-content${expanded ? ' is-expanded' : ''}${compact ? ' is-compact' : ''}`} id={`announcement-content-${item.id}`} tabIndex={expanded ? 0 : undefined}>{item.content}</div>
+      {(item.mail?.total ?? 0) > 0 && <div className={`announcement-mail${item.mail.failed ? ' is-failed' : ''}`} aria-live="polite">
+        <span>{t('mail.sentCount', { sent: item.mail.sent, total: item.mail.total })}</span>
+        {item.mail.pending > 0 && <span>{t(mailSending ? 'mail.sendingCount' : 'mail.pendingCount', { count: item.mail.pending })}</span>}
+        {item.mail.failed > 0 && <span className="mail-failed">{t('mail.failedCount', { count: item.mail.failed })}</span>}
+        {item.mail.skipped > 0 && <span>{t('mail.skippedCount', { count: item.mail.skipped })}</span>}
+        {item.canEdit && (item.mail.failed > 0 || item.mail.pending > 0) && <button type="button" disabled={busy || mailBusy} onClick={onRetryMail}>{t(mailSending ? 'mail.sending' : item.mail.failed > 0 ? 'mail.retryFailed' : 'mail.continue')}</button>}
+        {mailError && <p className="announcement-mail-error" role="alert">{mailError}</p>}
+      </div>}
       <div className="announcement-card-footer">
         <div className="announcement-author"><span className="announcement-author-dot" aria-hidden="true">{(item.authorName || '?').slice(0, 1)}</span><span>{item.authorName || t('ann.unknownAuthor')}</span>{item.updatedAt > item.createdAt && <span className="announcement-edited" title={new Date(item.updatedAt).toLocaleString()}>{t('ann.edited')}</span>}</div>
         <div className="announcement-card-actions">
@@ -232,10 +251,19 @@ function AnnouncementEditor({ item, initialProjectId, fixedProjectId, projects, 
   const dialogRef = useRef<HTMLDialogElement>(null);
   const busyRef = useRef(false);
   const [projectId, setProjectId] = useState(item?.projectId ?? fixedProjectId ?? (projects.some((project) => project.id === initialProjectId) ? initialProjectId : projects.length === 1 ? projects[0]!.id : undefined));
+  const [selectedVersion, setSelectedVersion] = useState<string | null | undefined>(undefined);
+  const [versionOptions, setVersionOptions] = useState<{ label: string; isCurrent: boolean; archived: boolean }[]>([]);
+  const [versionsProjectId, setVersionsProjectId] = useState<number | null>(null);
+  const [versionsLoading, setVersionsLoading] = useState(false);
+  const [versionsError, setVersionsError] = useState<string | null>(null);
+  const [versionsRetry, setVersionsRetry] = useState(0);
+  const [mailSelection, setMailSelection] = useState(emptyMailSelection);
+  const [mailReady, setMailReady] = useState(true);
   const [content, setContent] = useState(item?.content ?? '');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const projectName = item?.projectName ?? projects.find((project) => project.id === projectId)?.name;
+  const versionsReady = Boolean(item) || (versionsProjectId === projectId && !versionsLoading && !versionsError && selectedVersion !== undefined);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -243,16 +271,48 @@ function AnnouncementEditor({ item, initialProjectId, fixedProjectId, projects, 
     return () => dialog?.close();
   }, []);
 
+  useEffect(() => {
+    if (item) return;
+    let active = true;
+    setSelectedVersion(undefined);
+    setVersionOptions([]);
+    setVersionsProjectId(null);
+    setVersionsError(null);
+    setVersionsLoading(Boolean(projectId));
+    if (!projectId) return;
+    void api.listVersions(projectId).then((files) => {
+      if (!active) return;
+      const labels = new Map<string, { label: string; isCurrent: boolean; archived: boolean }>();
+      for (const file of files) {
+        if (file.status !== 'ready' && file.status !== 'archived') continue;
+        const label = labels.get(file.version);
+        if (label) {
+          label.isCurrent ||= file.isCurrent;
+          label.archived &&= file.status === 'archived';
+        } else {
+          labels.set(file.version, { label: file.version, isCurrent: file.isCurrent, archived: file.status === 'archived' });
+        }
+      }
+      setVersionOptions([...labels.values()]);
+      setVersionsProjectId(projectId);
+    }).catch((e: any) => {
+      if (active) setVersionsError(e?.message ?? String(e));
+    }).finally(() => {
+      if (active) setVersionsLoading(false);
+    });
+    return () => { active = false; };
+  }, [item, projectId, versionsRetry]);
+
   async function save(e: FormEvent) {
     e.preventDefault();
-    if (busyRef.current || !projectId || !content.trim()) return;
+    if (busyRef.current || !projectId || !content.trim() || !versionsReady || (!item && (!mailReady || (mailSelection.enabled && !mailSelection.recipientIds.length)))) return;
     busyRef.current = true;
     setBusy(true);
     setError(null);
     try {
       const updated = item
         ? await api.updateAnnouncement(item.id, { content: content.trim() })
-        : await api.createAnnouncement({ projectId, content: content.trim() });
+        : await api.createAnnouncement({ projectId, version: selectedVersion ?? null, content: content.trim(), recipientIds: mailSelection.enabled ? mailSelection.recipientIds : undefined });
       onSaved(updated);
     } catch (e: any) {
       setError(e?.message ?? String(e));
@@ -268,12 +328,33 @@ function AnnouncementEditor({ item, initialProjectId, fixedProjectId, projects, 
         <div className="announcement-editor-heading"><h3 id="announcement-editor-title">{t(item ? 'ann.editTitle' : 'ann.publishTitle')}</h3><button type="button" disabled={busy} onClick={onClose}>{t('common.close')}</button></div>
         <p className="announcement-editor-hint">{t('ann.visibilityHint')}</p>
         {!item && fixedProjectId === undefined ? (
-          <label><span className="lbl">{t('ann.project')}</span><select aria-label={t('ann.project')} value={projectId ?? ''} onChange={(e) => setProjectId(Number(e.target.value))} required disabled={busy}><option value="" disabled>{t('common.select')}</option>{projects.map((project) => <option value={project.id} key={project.id}>{project.customerName} / {project.name}</option>)}</select></label>
+          <label><span className="lbl">{t('ann.project')}</span><select aria-label={t('ann.project')} value={projectId ?? ''} onChange={(e) => { setProjectId(Number(e.target.value)); setSelectedVersion(undefined); setMailSelection(emptyMailSelection()); setMailReady(true); setError(null); }} required disabled={busy}><option value="" disabled>{t('common.select')}</option>{projects.map((project) => <option value={project.id} key={project.id}>{project.customerName} / {project.name}</option>)}</select></label>
         ) : <div className="announcement-editor-context"><span>{projectName}</span>{item?.version && <span className="announcement-source announcement-source-version">{t('ann.versionSource', { version: item.version })}</span>}</div>}
+        {!item && <div className="announcement-version-field">
+          <label>
+            <span className="lbl">{t('ann.version')}</span>
+            <select
+              aria-label={t('ann.version')}
+              aria-describedby="announcement-version-hint"
+              value={selectedVersion === undefined ? '' : selectedVersion === null ? 'project' : JSON.stringify(selectedVersion)}
+              onChange={(e) => setSelectedVersion(e.target.value === 'project' ? null : JSON.parse(e.target.value))}
+              required
+              disabled={busy || !projectId || versionsLoading || versionsProjectId !== projectId || Boolean(versionsError)}
+            >
+              <option value="" disabled>{t('ann.versionPlaceholder')}</option>
+              <option value="project">{t('ann.noVersion')}</option>
+              {versionOptions.map((version) => <option key={version.label} value={JSON.stringify(version.label)}>{version.label}{version.isCurrent ? ` · ${t('pd.currentTag')}` : ''}{version.archived ? ` · ${t('status.archived')}` : ''}</option>)}
+            </select>
+          </label>
+          {versionsError ? <div id="announcement-version-hint" className="announcement-version-error" role="alert"><span>{t('ann.versionsLoadFailed')} {versionsError}</span><button type="button" disabled={busy} onClick={() => setVersionsRetry((value) => value + 1)}>{t('ann.retry')}</button></div> : (
+            <p id="announcement-version-hint" className="announcement-version-hint" role="status">{t(!projectId ? 'ann.selectProjectFirst' : versionsLoading || versionsProjectId !== projectId ? 'ann.versionsLoading' : !versionOptions.length ? 'ann.noProjectVersions' : 'ann.versionHint')}</p>
+          )}
+        </div>}
         <label><span className="lbl">{t('ann.content')}</span><textarea aria-label={t('ann.content')} value={content} onChange={(e) => setContent(e.target.value)} rows={9} maxLength={10000} required disabled={busy} autoFocus placeholder={t('ann.contentPlaceholder')} /></label>
         <div className="announcement-editor-count">{content.length.toLocaleString()} / 10,000</div>
+        {!item ? <MailRecipients projectId={projectId} value={mailSelection} onChange={setMailSelection} onReadyChange={setMailReady} disabled={busy} /> : <p className="announcement-mail-edit-hint">{t('mail.editHint')}</p>}
         {error && <p className="error" role="alert">{error}</p>}
-        <div className="dialog-actions"><button type="button" disabled={busy} onClick={onClose}>{t('common.cancel')}</button><button type="submit" className="primary" disabled={busy || !projectId || !content.trim()}>{t(busy ? 'ann.saving' : item ? 'common.save' : 'ann.publishSubmit')}</button></div>
+        <div className="dialog-actions"><button type="button" disabled={busy} onClick={onClose}>{t('common.cancel')}</button><button type="submit" className="primary" disabled={busy || !projectId || !content.trim() || !versionsReady || (!item && (!mailReady || (mailSelection.enabled && !mailSelection.recipientIds.length)))}>{t(busy ? 'ann.saving' : item ? 'common.save' : 'ann.publishSubmit')}</button></div>
       </form>
     </dialog>
   );

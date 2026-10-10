@@ -23,6 +23,18 @@ import type {
 
 const TOKEN_KEY = 'qota.token';
 
+export interface MailSettings {
+  enabled: boolean;
+  host: string;
+  port: number;
+  security: 'tls' | 'starttls';
+  username: string;
+  fromEmail: string;
+  fromName: string;
+  hasPassword: boolean;
+}
+export interface MailRecipient { id: number; email: string; displayName: string | null }
+
 export function getToken(): string | null {
   return localStorage.getItem(TOKEN_KEY);
 }
@@ -143,12 +155,21 @@ export const api = {
     if (opts?.limit !== undefined) qs.set('limit', String(opts.limit));
     return request<AnnouncementListResponse>(`/api/announcements${qs.size ? `?${qs}` : ''}`);
   },
-  createAnnouncement: (body: { projectId: number; content: string }) =>
+  createAnnouncement: (body: { projectId: number; content: string; version?: string | null; recipientIds?: number[] }) =>
     request<Announcement>('/api/announcements', { method: 'POST', body: JSON.stringify(body) }),
   updateAnnouncement: (id: number, body: { content: string }) =>
     request<Announcement>(`/api/announcements/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   deleteAnnouncement: (id: number) =>
     request<{ ok: true }>(`/api/announcements/${id}`, { method: 'DELETE' }),
+  listAnnouncementRecipients: (projectId: number) =>
+    request<{ items: MailRecipient[] }>(`/api/announcements/recipients?projectId=${projectId}`),
+  retryAnnouncementMail: (id: number, retryFailed = true) =>
+    request<Announcement>(`/api/announcements/${id}/mail/retry`, { method: 'POST', body: JSON.stringify({ retryFailed }) }),
+  getMailSettings: () => request<MailSettings>('/api/mail/settings'),
+  updateMailSettings: (body: Omit<MailSettings, 'hasPassword'> & { password?: string }) =>
+    request<MailSettings>('/api/mail/settings', { method: 'PUT', body: JSON.stringify(body) }),
+  getMailStatus: () => request<{ enabled: boolean; configured: boolean }>('/api/mail/status'),
+  testMail: (to: string) => request<{ ok: true }>('/api/mail/test', { method: 'POST', body: JSON.stringify({ to }) }),
 
   // Versions
   // Cross-project catalog of everything the logged-in user may download.

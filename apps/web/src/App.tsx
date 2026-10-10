@@ -11,6 +11,7 @@ import Files from './pages/Files';
 import Users from './pages/Users';
 import Permissions from './pages/Permissions';
 import Account from './pages/Account';
+import MailSettings from './pages/MailSettings';
 import LangSwitch from './components/LangSwitch';
 
 export default function App() {
@@ -51,6 +52,7 @@ export default function App() {
             <>
               <Route path="/users" element={<Users />} />
               <Route path="/permissions" element={<Permissions />} />
+              <Route path="/mail" element={<MailSettings />} />
             </>
           )}
           <Route path="/account" element={<Account />} />

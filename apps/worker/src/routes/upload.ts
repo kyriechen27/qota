@@ -21,6 +21,7 @@ import { versionDto } from './versions';
 import { IS_CURRENT_SQL } from '../lib/current-versions';
 import { requireNotesEdit, withNotePermissions, normalizeSpecialVersion } from '../lib/version-notes';
 import { uploadAnnouncement, createUploadAnnouncement, requireAnnouncementAuthor, ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL } from '../lib/announcements';
+import { validateAnnouncementRecipients, queueAnnouncementMail, sendAnnouncementMail } from '../lib/announcement-mail';
 
 export const uploadRoutes = new Hono<AppEnv>();
 
@@ -78,6 +79,7 @@ interface SessionRow {
   has_special_version: number;
   announcement_content: string | null;
   announcement_batch_key: string | null;
+  announcement_recipient_ids: string | null;
   is_mandatory: number;
   min_version: string | null;
   max_version: string | null;
@@ -105,7 +107,10 @@ function sessionDto(r: SessionRow) {
     notes: r.notes,
     ...(r.has_version_notes ? { versionNotes: r.version_notes } : {}),
     ...(r.has_special_version ? { specialVersion: r.special_version } : {}),
-    ...(r.announcement_batch_key ? { announcement: { batchKey: r.announcement_batch_key, content: r.announcement_content! } } : {}),
+    ...(r.announcement_batch_key ? { announcement: {
+      batchKey: r.announcement_batch_key, content: r.announcement_content!,
+      ...(r.announcement_recipient_ids ? { recipientIds: JSON.parse(r.announcement_recipient_ids) as number[] } : {}),
+    } } : {}),
     isMandatory: !!r.is_mandatory,
     minVersion: r.min_version,
     maxVersion: r.max_version,
@@ -217,6 +222,10 @@ uploadRoutes.post('/init', async (c) => {
     ).bind(body.projectId, me.id, announcement.batchKey, body.version,
       body.projectId, me.id, announcement.batchKey, body.version).first();
     if (reused) throw conflict('announcement batchKey already belongs to another version');
+    const published = await c.env.DB.prepare(`SELECT id FROM announcements
+      WHERE project_id = ? AND author_id = ? AND upload_batch_key = ?`)
+      .bind(body.projectId, me.id, announcement.batchKey).first();
+    if (!published) await validateAnnouncementRecipients(c.env, body.projectId, announcement.recipientIds ?? []);
   }
 
   const totalSize = body.totalSize!;
@@ -234,8 +243,8 @@ uploadRoutes.post('/init', async (c) => {
        (project_id, r2_key, filename, total_size, part_size, upload_id, expected_sha256, release_channel,
         target_version, content_type, notes, version_notes, has_version_notes, special_version, has_special_version,
         is_mandatory, min_version, max_version, rollout_percentage, version_id,
-        status, initiated_by, created_at, announcement_content, announcement_batch_key)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?)`,
+        status, initiated_by, created_at, announcement_content, announcement_batch_key, announcement_recipient_ids)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?)`,
   )
     .bind(
       body.projectId,
@@ -262,6 +271,7 @@ uploadRoutes.post('/init', async (c) => {
       now,
       announcement?.content ?? null,
       announcement?.batchKey ?? null,
+      announcement?.recipientIds === undefined ? null : JSON.stringify(announcement.recipientIds),
     )
     .run();
   const sessionId = Number(r.meta.last_row_id);
@@ -347,6 +357,11 @@ uploadRoutes.post('/complete', async (c) => {
   const project = await requireProjectAccess(c.env.DB, me, session.project_id, 'upload');
   if (session.announcement_batch_key) {
     await requireAnnouncementAuthor(c.env.DB, session.project_id, session.initiated_by);
+    const published = await c.env.DB.prepare(`SELECT id FROM announcements
+      WHERE project_id = ? AND author_id = ? AND upload_batch_key = ?`)
+      .bind(session.project_id, session.initiated_by, session.announcement_batch_key).first();
+    if (!published) await validateAnnouncementRecipients(c.env, session.project_id,
+      JSON.parse(session.announcement_recipient_ids ?? '[]') as number[]);
   }
   if (session.expected_sha256 && body.sha256 && session.expected_sha256.toLowerCase() !== body.sha256.toLowerCase()) {
     throw badRequest('sha256 mismatch with init expectedSha256');
@@ -556,7 +571,11 @@ uploadRoutes.post('/complete', async (c) => {
     // changes() links the session transition to the preceding artifact write,
     // including legacy sessions whose object key may match the existing file.
     const writes = [metadataWrite, artifactWrite, completeSession];
-    if (session.announcement_batch_key) writes.push(createUploadAnnouncement(c.env.DB, session.id, now));
+    if (session.announcement_batch_key) {
+      writes.push(createUploadAnnouncement(c.env.DB, session.id, now));
+      const recipientIds = JSON.parse(session.announcement_recipient_ids ?? '[]') as number[];
+      if (recipientIds.length) writes.push(queueAnnouncementMail(c.env.DB, recipientIds, now));
+    }
     const [, artifactResult, , announcementResult] = await c.env.DB.batch(writes);
     if (!artifactResult || artifactResult.meta.changes === 0) {
       throw conflict('version or filename changed; refresh before retrying the upload');
@@ -564,6 +583,7 @@ uploadRoutes.post('/complete', async (c) => {
     if (!existing) versionId = Number(artifactResult.meta.last_row_id);
 
     if (announcementResult?.meta.changes) {
+      await sendAnnouncementMail(c.env, Number(announcementResult.meta.last_row_id));
       await audit(c, {
         action: 'announcement.create', actorType: 'user', actorId: session.initiated_by,
         customerId: project.customer_id, projectId: session.project_id,
