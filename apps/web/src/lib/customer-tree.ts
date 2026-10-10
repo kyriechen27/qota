@@ -18,7 +18,7 @@ export function customerHierarchy(customers: Customer[]) {
   function visit(customer: Customer, depth: number, prefix: string, parentId: number | null) {
     if (visited.has(customer.id)) return;
     visited.add(customer.id);
-    const path = prefix ? `${prefix} / ${customer.name}` : customer.name;
+    const path = prefix ? `${prefix}-${customer.name}` : customer.name;
     entries.push({ customer, depth, path, parentId });
     paths.set(customer.id, path);
     for (const child of children.get(customer.id) ?? []) visit(child, depth + 1, path, customer.id);
