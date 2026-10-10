@@ -102,6 +102,8 @@ a:hover { color: var(--accent-hover); }
 }
 .page-actions { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
 
+.project-detail-title { overflow-wrap: anywhere; }
+
 button, .btn {
   background: var(--panel-2);
   color: var(--text);

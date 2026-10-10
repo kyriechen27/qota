@@ -5,6 +5,7 @@ import { api } from '../lib/api';
 import { startUpload, type UploadJobHandle } from '../lib/upload';
 import { formatBytes } from '../lib/utils';
 import { useI18n } from '../lib/i18n';
+import { customerHierarchy } from '../lib/customer-tree';
 import VersionNotesPreview from '../components/VersionNotesPreview';
 import AnnouncementBoard from '../components/AnnouncementBoard';
 import MailRecipients, { emptyMailSelection } from '../components/MailRecipients';
@@ -18,6 +19,7 @@ export default function ProjectDetail() {
   const loadGeneration = useRef(0);
   const { t } = useI18n();
   const [project, setProject] = useState<Project | null>(null);
+  const [customerPath, setCustomerPath] = useState('');
   const [versions, setVersions] = useState<Version[]>([]);
   const [expandedVersionGroups, setExpandedVersionGroups] = useState<Set<string>>(() => new Set());
   const [notesDialog, setNotesDialog] = useState<{ version: string; items: Version[]; scope: 'version' | 'file' } | null>(null);
@@ -119,9 +121,10 @@ export default function ProjectDetail() {
     const requestGeneration = ++loadGeneration.current;
     const isCurrentRequest = () => activeProjectId.current === projectId && loadGeneration.current === requestGeneration;
     try {
-      const p = await api.getProject(projectId);
+      const [p, customers] = await Promise.all([api.getProject(projectId), api.listCustomers()]);
       if (!isCurrentRequest()) return;
       setProject(p);
+      setCustomerPath(customerHierarchy(customers).paths.get(p.customerId) ?? '');
       const [v, tk] = await Promise.all([
         api.listVersions(projectId),
         api.listApiTokens(projectId).catch(() => [] as ApiToken[]),
@@ -153,6 +156,7 @@ export default function ProjectDetail() {
     setTokenCopied(false);
     setCopiedTokenId(null);
     setProject(null);
+    setCustomerPath('');
     setVersions([]);
     setTokens([]);
     setErr(null);
@@ -644,8 +648,8 @@ export default function ProjectDetail() {
 
   return (
     <>
-      <h2 className="page-title">
-        {project.name}{' '}
+      <h2 className="page-title project-detail-title">
+        {customerPath ? `${customerPath}-${project.name}` : project.name}{' '}
         <span className="muted code" style={{ fontSize: 13 }}>
           {project.code}
         </span>
