@@ -59,12 +59,18 @@ export default function Memberships() {
   const tree = useMemo(() => customerHierarchy(customers), [customers]);
   const userMap = useMemo(() => new Map(users.map((user) => [user.id, user])), [users]);
   const projectMap = useMemo(() => new Map(projects.map((project) => [project.id, project])), [projects]);
-  const filteredProjects = projects.filter((project) => !filterCustomer || project.customerId === filterCustomer);
+  const filterCustomerSubtree = useMemo(() => filterCustomer ? tree.descendants(filterCustomer) : null, [tree, filterCustomer]);
+  const filterCustomerAncestors = useMemo(() => filterCustomer ? tree.ancestors(filterCustomer) : null, [tree, filterCustomer]);
+  const projectCustomerId = filterProject ? projectMap.get(filterProject)?.customerId : undefined;
+  const projectCustomerAncestors = useMemo(() => projectCustomerId !== undefined ? tree.ancestors(projectCustomerId) : null, [tree, projectCustomerId]);
+  const filteredProjects = projects.filter((project) => !filterCustomerSubtree || filterCustomerSubtree.has(project.customerId));
   const filteredRows = rows.filter((row) => {
     if (filterUser && row.userId !== filterUser) return false;
-    if (filterProject) return row.scope === 'project' ? row.projectId === filterProject : row.customerId === projectMap.get(filterProject)?.customerId;
+    if (filterProject) return row.scope === 'project' ? row.projectId === filterProject : projectCustomerAncestors?.has(row.customerId);
     if (!filterCustomer) return true;
-    return row.scope === 'customer' ? row.customerId === filterCustomer : projectMap.get(row.projectId)?.customerId === filterCustomer;
+    if (row.scope === 'customer') return filterCustomerSubtree?.has(row.customerId) || filterCustomerAncestors?.has(row.customerId);
+    const customerId = projectMap.get(row.projectId)?.customerId;
+    return customerId !== undefined && filterCustomerSubtree?.has(customerId);
   });
   const customerPath = (id: number) => tree.paths.get(id) ?? `#${id}`;
   const projectLabel = (project: Project) => `${project.name} (${project.code}) / ${customerPath(project.customerId)}`;
@@ -105,13 +111,13 @@ export default function Memberships() {
     </div>
     {err && <div className="error hierarchy-error" role="alert">{err}<button onClick={() => setReload((value) => value + 1)} disabled={loading || busyRow !== null}>{t('common.retry')}</button></div>}
     <p className="muted hierarchy-intro">{t('mem.rolesHint')}</p>
-    <p className="muted hierarchy-intro">{t('mem.independentHint')}</p>
+    <p className="muted hierarchy-intro">{t('mem.inheritanceHint')}</p>
     <div className="hierarchy-table-scroll"><table className="membership-table">
       <thead><tr><th>{t('mem.colUser')}</th><th>{t('mem.colScope')}</th><th>{t('mem.colTarget')}</th><th>{t('mem.colRole')}</th><th>{t('mem.colCreated')}</th><th>{t('customers.actions')}</th></tr></thead>
       <tbody>{filteredRows.map((row) => {
         const user = userMap.get(row.userId);
         return <tr key={`${row.scope}-${row.id}`} data-membership-id={`${row.scope}-${row.id}`}>
-          <td>{user ? userLabel(user) : `#${row.userId}`}</td><td><span className="tag">{t(row.scope === 'customer' ? 'mem.customerGrantLabel' : 'mscope.project')}</span></td><td className="membership-target">{scopeLabel(row)}</td>
+          <td>{user ? userLabel(user) : `#${row.userId}`}</td><td><span className="tag" title={row.scope === 'customer' ? t('mem.customerScopeHint') : undefined}>{t(row.scope === 'customer' ? 'mem.customerGrantLabel' : 'mscope.project')}</span></td><td className="membership-target">{scopeLabel(row)}{row.scope === 'customer' && <small className="membership-grant-coverage">{t('mem.customerCoverage')}</small>}</td>
           <td><select aria-label={t('mem.roleFor', { user: user ? userLabel(user) : `#${row.userId}`, target: scopeLabel(row) })} value={row.role} disabled={loading || busyRow !== null} onChange={(event) => void mutate(row, event.target.value as CustomerRole)}>{ROLES.map((role) => <option key={role} value={role}>{t(`role.${role}`)}</option>)}</select></td>
           <td className="muted customer-tree-date">{new Date(row.createdAt).toLocaleString()}</td>
           <td><button className="danger" disabled={loading || busyRow !== null} onClick={() => void mutate(row)}>{busyRow === `${row.scope}-${row.id}` ? t('common.loading') : t('common.revoke')}</button></td>
@@ -142,7 +148,9 @@ function GrantDialog({ users, customers, projects, rows, loading, loadError, ini
   const hasGlobalAccess = selectedUser && ['super_admin', 'admin', 'observer'].includes(selectedUser.role);
   const directProjects = projects.filter((project) => project.customerId === customerId);
   const existingProjects = new Map(rows.filter((row): row is ProjectMembership & { scope: 'project' } => row.scope === 'project' && row.userId === userId).map((row) => [row.projectId, row]));
-  const existingCustomer = rows.find((row) => row.scope === 'customer' && row.customerId === customerId && row.userId === userId);
+  const customerGrants = new Map(rows.filter((row): row is Membership & { scope: 'customer' } => row.scope === 'customer' && row.userId === userId).map((row) => [row.customerId, row]));
+  const existingCustomer = customerGrants.get(customerId);
+  const applicableCustomer = [...tree.ancestors(customerId)].map((id) => customerGrants.get(id)).find((grant) => grant !== undefined);
   const eligible = directProjects.filter((project) => !existingProjects.has(project.id));
   const selectedIds = eligible.filter((project) => selected.has(project.id)).map((project) => project.id);
   const eligibleKey = eligible.map((project) => project.id).join(',');
@@ -182,7 +190,7 @@ function GrantDialog({ users, customers, projects, rows, loading, loadError, ini
         <label><span className="lbl">{t('mem.fldCustomer')}</span><select aria-label={t('mem.fldCustomer')} value={customerId || ''} onChange={(event) => { setCustomerId(Number(event.target.value)); resetChoices(); }} required><option value="" disabled>{t('common.select')}</option>{tree.entries.map(({ customer, path }) => <option key={customer.id} value={customer.id}>{path} ({customer.code})</option>)}</select></label>
         <label><span className="lbl">{t('mem.fldScope')}</span><select aria-label={t('mem.fldScope')} value={scope} onChange={(event) => { setScope(event.target.value as 'project' | 'customer'); resetChoices(); }}><option value="project">{t('mem.scopeProject')}</option><option value="customer">{t('mem.scopeCustomer')}</option></select></label>
         <p className="membership-scope-note">{t(scope === 'project' ? 'mem.projectScopeHint' : 'mem.customerScopeHint')}</p>
-        {existingCustomer && <p className="membership-scope-note membership-existing-note">{t(scope === 'project' ? 'mem.existingCustomerHint' : 'mem.existingCustomer', { role: t(`role.${existingCustomer.role}`) })}</p>}
+        {applicableCustomer && <p className="membership-scope-note membership-existing-note">{t(scope === 'project' ? 'mem.existingCustomerHint' : existingCustomer ? 'mem.existingCustomer' : 'mem.inheritedCustomerHint', { customer: tree.paths.get(applicableCustomer.customerId) ?? `#${applicableCustomer.customerId}`, role: t(`role.${applicableCustomer.role}`) })}</p>}
         {scope === 'project' && <section className="membership-project-picker" aria-labelledby="membership-projects-title">
           <div className="membership-picker-heading"><strong id="membership-projects-title">{t('mem.selectProjects')}</strong><span className="muted" aria-live="polite">{t('mem.selectedCount', { count: selectedIds.length })}</span></div>
           {customerId && userId ? <>

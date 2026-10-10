@@ -1,6 +1,6 @@
 import type { D1Database } from '@cloudflare/workers-types';
 import type { AuthedUser, CustomerRole } from '../env';
-import { roleHas } from './memberships';
+import { customerMembershipIdSql, roleHas } from './memberships';
 import { badRequest, conflict, forbidden, notFound } from '../utils/errors';
 
 export interface NotesVersion {
@@ -37,7 +37,7 @@ async function notesContexts(db: D1Database, user: AuthedUser, projectIds: numbe
       db.prepare(
         `SELECT p.id, COALESCE(pm.role, cm.role) AS role FROM projects p
          LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = ?
-         LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = ?
+         LEFT JOIN memberships cm ON cm.id = ${customerMembershipIdSql('p.customer_id', '?')}
          WHERE p.id IN (${placeholders})`,
       ).bind(user.id, user.id, ...ids).all<{ id: number; role: CustomerRole | null }>(),
       db.prepare(`SELECT project_id, version FROM project_current_versions WHERE project_id IN (${placeholders})`)

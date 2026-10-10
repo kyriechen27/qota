@@ -1,8 +1,8 @@
 // Audit log reader. Scoped by caller's visibility:
 //   - super_admin/admin/observer see everything (optionally filtered)
-//   - unfiltered non-global readers see authorized projects, directly granted
-//     customer-only events, and their own actions; a project grant cannot reveal
-//     its customer's other projects or any parent/child customer's events
+//   - unfiltered non-global readers see authorized projects, inherited customer
+//     events, and their own actions; a project-only grant cannot reveal its
+//     customer's other projects or customer-wide events
 
 import { Hono } from 'hono';
 import type { AppEnv } from '../env';
@@ -11,6 +11,7 @@ import { badRequest } from '../utils/errors';
 import {
   canDoOnCustomer,
   canDoOnProject,
+  inheritedCustomerIdsSql,
   visibleProjectIds,
 } from '../lib/memberships';
 
@@ -101,7 +102,7 @@ auditRoutes.get('/', async (c) => {
     const visibleProj = await visibleProjectIds(c.env.DB, user);
     const clauses: string[] = [
       '(actor_type = ? AND actor_id = ?)',
-      '(project_id IS NULL AND customer_id IN (SELECT customer_id FROM memberships WHERE user_id = ?))',
+      `(project_id IS NULL AND customer_id IN ${inheritedCustomerIdsSql('?')})`,
     ];
     args.push('user', user.id, user.id);
     if (visibleProj && visibleProj.length > 0) {

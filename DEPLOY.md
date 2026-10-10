@@ -197,6 +197,12 @@ also be wired into `pages-entry.ts` to use this automatic upgrade path. Standalo
 Worker deployments still apply migrations with `npm run d1:migrate:remote`
 (using the database ID configured in `apps/worker/wrangler.toml`).
 
+Customer-wide memberships include every descendant customer and its current and
+future projects. This applies to existing grants without a schema change or
+re-granting. Explicit project roles take precedence; otherwise the nearest
+customer membership in the ancestor chain determines the role. Moving a subtree
+or revoking a customer membership immediately updates inherited access.
+
 ### Local preview of the Pages build
 
 ```bash

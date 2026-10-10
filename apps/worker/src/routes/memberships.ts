@@ -9,7 +9,7 @@ import { Hono } from 'hono';
 import type { AppEnv, CustomerRole } from '../env';
 import { requireUser } from '../middleware/auth';
 import { badRequest, conflict, forbidden, notFound } from '../utils/errors';
-import { requireCustomerAccess, requireProjectAccess } from '../lib/memberships';
+import { customerMembershipIdSql, requireCustomerAccess, requireProjectAccess } from '../lib/memberships';
 import { audit } from '../lib/audit';
 
 export const membershipRoutes = new Hono<AppEnv>();
@@ -136,7 +136,7 @@ membershipRoutes.post('/batch', async (c) => {
   const projects = await c.env.DB.prepare(`SELECT p.id, p.customer_id, COALESCE(pm.role, cm.role) AS role
     FROM projects p
     LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = ?
-    LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = ?
+    LEFT JOIN memberships cm ON cm.id = ${customerMembershipIdSql('p.customer_id', '?')}
     WHERE p.id IN (SELECT value FROM json_each(?))`).bind(me.id, me.id, idsJson)
     .all<{ id: number; customer_id: number; role: CustomerRole | null }>();
   const projectMap = new Map((projects.results ?? []).map((project) => [project.id, project]));
@@ -158,7 +158,7 @@ membershipRoutes.post('/batch', async (c) => {
       JOIN users actor ON actor.id = ?
       LEFT JOIN user_global_roles gr ON gr.user_id = actor.id
       LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = actor.id
-      LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = actor.id
+      LEFT JOIN memberships cm ON cm.id = ${customerMembershipIdSql('p.customer_id', 'actor.id')}
       WHERE actor.is_active = 1 AND (
         COALESCE(gr.role, actor.role) IN ('super_admin', 'admin') OR
         (COALESCE(gr.role, actor.role) = 'developer' AND COALESCE(pm.role, cm.role) = 'customer_admin')

@@ -36,5 +36,15 @@ export function customerHierarchy(customers: Customer[]) {
     }
     return ids;
   }
-  return { entries, paths, children, descendants };
+  /** Nearest first, stopping before an ancestor outside the visible customer list. */
+  function ancestors(id: number) {
+    const ids = new Set<number>([id]);
+    let parentId = byId.get(id)?.parentId;
+    while (parentId != null && byId.has(parentId) && !ids.has(parentId)) {
+      ids.add(parentId);
+      parentId = byId.get(parentId)?.parentId;
+    }
+    return ids;
+  }
+  return { entries, paths, children, descendants, ancestors };
 }

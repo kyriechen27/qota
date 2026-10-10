@@ -3,8 +3,8 @@ import type { D1Database } from '@cloudflare/workers-types';
 import type { Announcement } from '@qota/shared';
 import type { AppEnv, AuthedUser, CustomerRole } from '../env';
 import { requireUser } from '../middleware/auth';
-import { requireProjectAccess } from '../lib/memberships';
-import { announcementContent, requireAnnouncementAuthor, ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL } from '../lib/announcements';
+import { customerMembershipIdSql, requireProjectAccess } from '../lib/memberships';
+import { announcementContent, requireAnnouncementAuthor, ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL, ANNOUNCEMENT_CAN_MANAGE_SQL } from '../lib/announcements';
 import { audit } from '../lib/audit';
 import { badRequest, conflict, forbidden, notFound } from '../utils/errors';
 import { announcementRecipientIds, announcementRecipients, validateAnnouncementRecipients, queueAnnouncementMail, sendAnnouncementMail } from '../lib/announcement-mail';
@@ -42,7 +42,7 @@ const SELECT_ANNOUNCEMENTS = `SELECT a.id, a.project_id, p.name AS project_name,
   JOIN customers c ON c.id = p.customer_id
   JOIN users u ON u.id = a.author_id
   LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = ?
-  LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = ?
+  LEFT JOIN memberships cm ON cm.id = ${customerMembershipIdSql('p.customer_id', '?')}
   LEFT JOIN (
     SELECT announcement_id, COUNT(*) AS total,
       SUM(status = 'sent') AS sent, SUM(status = 'failed') AS failed,
@@ -108,7 +108,7 @@ announcementRoutes.get('/', async (c) => {
       `SELECT p.id, p.name, c.name AS customer_name FROM projects p
        JOIN customers c ON c.id = p.customer_id
        LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = ?
-       LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = ?
+       LEFT JOIN memberships cm ON cm.id = ${customerMembershipIdSql('p.customer_id', '?')}
        WHERE ? = 1 OR (? = 1 AND COALESCE(pm.role, cm.role) IN ('developer', 'customer_admin'))
        ORDER BY c.name, p.name, p.id`,
     ).bind(user.id, user.id, globalAdmin(user) ? 1 : 0, user.role === 'developer' ? 1 : 0)
@@ -196,9 +196,13 @@ announcementRoutes.patch('/:id', async (c) => {
   const { row, project, announcement } = await loadAnnouncement(c.env.DB, user, id);
   if (!announcement.canEdit) throw forbidden('only the author or an administrator can edit this announcement');
   const updatedAt = Date.now();
-  const result = await c.env.DB.prepare('UPDATE announcements SET content = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL')
-    .bind(content, updatedAt, id).run();
-  if (!result.meta.changes) throw notFound('announcement not found');
+  const result = await c.env.DB.prepare(`UPDATE announcements SET content = ?, updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL AND ${ANNOUNCEMENT_CAN_MANAGE_SQL}`)
+    .bind(content, updatedAt, id, user.id).run();
+  if (!result.meta.changes) {
+    await loadAnnouncement(c.env.DB, user, id);
+    throw forbidden('no permission to edit this announcement');
+  }
   await audit(c, { action: 'announcement.update', projectId: row.project_id, customerId: project.customer_id, targetType: 'announcement', targetId: id });
   return c.json({ ...announcement, content, updatedAt });
 });
@@ -209,9 +213,13 @@ announcementRoutes.delete('/:id', async (c) => {
   const { row, project, announcement } = await loadAnnouncement(c.env.DB, user, id);
   if (!announcement.canDelete) throw forbidden('only the author or an administrator can delete this announcement');
   const now = Date.now();
-  const result = await c.env.DB.prepare('UPDATE announcements SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL')
-    .bind(now, now, id).run();
-  if (!result.meta.changes) throw notFound('announcement not found');
+  const result = await c.env.DB.prepare(`UPDATE announcements SET deleted_at = ?, updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL AND ${ANNOUNCEMENT_CAN_MANAGE_SQL}`)
+    .bind(now, now, id, user.id).run();
+  if (!result.meta.changes) {
+    await loadAnnouncement(c.env.DB, user, id);
+    throw forbidden('no permission to delete this announcement');
+  }
   await c.env.DB.prepare(`UPDATE announcement_mail_deliveries SET status = 'skipped', error = NULL, updated_at = ?
     WHERE announcement_id = ? AND status IN ('pending', 'failed')`).bind(now, id).run();
   await audit(c, { action: 'announcement.delete', projectId: row.project_id, customerId: project.customer_id, targetType: 'announcement', targetId: id });

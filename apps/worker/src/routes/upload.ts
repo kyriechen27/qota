@@ -14,7 +14,7 @@ import type { AppEnv, AuthedUser } from '../env';
 import type { D1Database } from '@cloudflare/workers-types';
 import { requireUser } from '../middleware/auth';
 import { badRequest, conflict, forbidden, notFound } from '../utils/errors';
-import { requireProjectAccess } from '../lib/memberships';
+import { projectAccessSql, requireProjectAccess } from '../lib/memberships';
 import { makeStorage, type StorageBackend } from '../lib/s3';
 import { audit } from '../lib/audit';
 import { versionDto } from './versions';
@@ -443,8 +443,11 @@ uploadRoutes.post('/complete', async (c) => {
     const unlocked = `NOT EXISTS (
       SELECT 1 FROM project_current_versions WHERE project_id = ? AND version = ?
     )`;
-    const guards = [`EXISTS (SELECT 1 FROM upload_sessions WHERE id = ? AND status = 'in_progress')`];
-    const guardArgs: unknown[] = [session.id];
+    const guards = [
+      `EXISTS (SELECT 1 FROM upload_sessions WHERE id = ? AND status = 'in_progress')`,
+      projectAccessSql('?', '?', 'upload'),
+    ];
+    const guardArgs: unknown[] = [session.id, session.project_id, me.id];
     if (session.announcement_batch_key) {
       guards.push(ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL);
       guardArgs.push(session.project_id, session.initiated_by);
@@ -458,10 +461,10 @@ uploadRoutes.post('/complete', async (c) => {
     if (existing) {
       guards.push(`EXISTS (
         SELECT 1 FROM versions v WHERE v.id = ? AND v.project_id = ? AND v.uploaded_by = ? AND v.r2_key = ?
-          AND (v.notes IS ? OR (? = 1 AND ${unlocked}))
+          AND (v.notes IS ? OR (${projectAccessSql('v.project_id', '?', 'manage_versions', 'v.uploaded_by')} AND ${unlocked}))
       )`);
       guardArgs.push(session.version_id, session.project_id, existing.uploaded_by, existing.r2_key,
-        session.notes, notesPermission.can_edit_notes ? 1 : 0, session.project_id, session.target_version);
+        session.notes, me.id, session.project_id, session.target_version);
     } else {
       guards.push(`NOT EXISTS (
         SELECT 1 FROM versions WHERE project_id = ? AND version = ? AND release_channel = ? AND filename = ?
@@ -477,11 +480,11 @@ uploadRoutes.post('/complete', async (c) => {
         NOT EXISTS (SELECT 1 FROM version_metadata WHERE project_id = ? AND version = ?)
         OR EXISTS (
           SELECT 1 FROM version_metadata vm WHERE vm.project_id = ? AND vm.version = ?
-            AND (vm.${field.column} IS ? OR (? = 1 AND vm.created_by = ? AND ${unlocked}))
+            AND (vm.${field.column} IS ? OR (${projectAccessSql('vm.project_id', '?', 'manage_versions', 'vm.created_by')} AND vm.created_by = ? AND ${unlocked}))
         )
       )`);
       guardArgs.push(session.project_id, session.target_version, session.project_id, session.target_version,
-        field.value, notesPermission.can_edit_version_notes ? 1 : 0,
+        field.value, me.id,
         notesPermission.version_notes_creator ?? -1, session.project_id, session.target_version);
     }
     const guardSql = guards.join(' AND ');

@@ -11,8 +11,8 @@
 //   - developer      → upload + view + download + delete versions
 //   - viewer         → view + download only
 //
-// `project_memberships`, when present, takes precedence over the customer-level
-// membership for that specific project.
+// Project overrides win. Otherwise the closest customer grant, starting at
+// the project's customer and walking toward the root, applies to descendants.
 
 import type { D1Database } from '@cloudflare/workers-types';
 import type { AuthedUser, CustomerRole } from '../env';
@@ -73,14 +73,70 @@ export function roleHas(role: CustomerRole, action: Action): boolean {
   return ROLE_GRANTS[role].has(action);
 }
 
+// Arguments are trusted SQL expressions/placeholders, never request values.
+// Reuse this in inline permission guards so a nearer viewer cannot be bypassed
+// by selecting a more privileged ancestor. The path guard also tolerates a
+// malformed legacy cycle without allowing an unbounded recursive query.
+export function customerMembershipIdSql(customerIdSql: string, userIdSql: string): string {
+  return `(WITH RECURSIVE lineage(id, parent_id, depth, path) AS (
+    SELECT ancestor_customer.id, ancestor_customer.parent_id, 0, '/' || ancestor_customer.id || '/'
+      FROM customers ancestor_customer WHERE ancestor_customer.id = ${customerIdSql}
+    UNION ALL
+    SELECT parent.id, parent.parent_id, lineage.depth + 1, lineage.path || parent.id || '/'
+      FROM customers parent JOIN lineage ON parent.id = lineage.parent_id
+     WHERE instr(lineage.path, '/' || parent.id || '/') = 0
+  )
+  SELECT inherited.id FROM lineage JOIN memberships inherited ON inherited.customer_id = lineage.id
+   WHERE inherited.user_id = ${userIdSql} ORDER BY lineage.depth ASC LIMIT 1)`;
+}
+
+// All customer roles permit viewing. Descendant expansion therefore only needs
+// membership existence, while mutations use the nearest-role resolver above.
+// UNION, rather than UNION ALL, terminates even if legacy data contains a cycle.
+export function inheritedCustomerIdsSql(userIdSql: string): string {
+  return `(WITH RECURSIVE inherited_customers(id) AS (
+    SELECT customer_id FROM memberships WHERE user_id = ${userIdSql}
+    UNION
+    SELECT child.id FROM customers child JOIN inherited_customers parent ON child.parent_id = parent.id
+  ) SELECT id FROM inherited_customers)`;
+}
+
+// Live mutation guard for work that may await external storage after its initial
+// permission check. Optional ownership is used by notes: scoped administrators
+// may edit any uploader's notes, while developers may only edit their own.
+export function projectAccessSql(
+  projectIdSql: string,
+  userIdSql: string,
+  action: Action,
+  ownerIdSql?: string,
+): string {
+  const roles = (Object.keys(ROLE_GRANTS) as CustomerRole[])
+    .filter((role) => roleHas(role, action)).map((role) => `'${role}'`).join(', ');
+  return `EXISTS (
+    SELECT 1 FROM users permission_user JOIN projects permission_project ON permission_project.id = ${projectIdSql}
+    LEFT JOIN user_global_roles permission_global ON permission_global.user_id = permission_user.id
+    LEFT JOIN project_memberships permission_pm
+      ON permission_pm.project_id = permission_project.id AND permission_pm.user_id = permission_user.id
+    LEFT JOIN memberships permission_cm
+      ON permission_cm.id = ${customerMembershipIdSql('permission_project.customer_id', 'permission_user.id')}
+    WHERE permission_user.id = ${userIdSql} AND permission_user.is_active = 1 AND (
+      COALESCE(permission_global.role, permission_user.role) IN ('super_admin', 'admin')
+      ${GLOBAL_OBSERVER_ACTIONS.has(action) ? "OR COALESCE(permission_global.role, permission_user.role) = 'observer'" : ''}
+      OR (COALESCE(permission_global.role, permission_user.role) = 'developer'
+        AND COALESCE(permission_pm.role, permission_cm.role) IN (${roles})
+        ${ownerIdSql ? `AND (permission_user.id = ${ownerIdSql} OR COALESCE(permission_pm.role, permission_cm.role) = 'customer_admin')` : ''})
+    )
+  )`;
+}
+
 export async function effectiveRoleOnCustomer(
   db: D1Database,
   userId: number,
   customerId: number,
 ): Promise<CustomerRole | null> {
   const row = await db
-    .prepare('SELECT role FROM memberships WHERE user_id = ? AND customer_id = ?')
-    .bind(userId, customerId)
+    .prepare(`SELECT role FROM memberships WHERE id = ${customerMembershipIdSql('?', '?')}`)
+    .bind(customerId, userId)
     .first<{ role: CustomerRole }>();
   return row?.role ?? null;
 }
@@ -90,22 +146,11 @@ export async function effectiveRoleOnProject(
   userId: number,
   projectId: number,
 ): Promise<CustomerRole | null> {
-  // project-level override wins
-  const proj = await db
-    .prepare('SELECT role FROM project_memberships WHERE user_id = ? AND project_id = ?')
-    .bind(userId, projectId)
-    .first<{ role: CustomerRole }>();
-  if (proj) return proj.role;
-  const cust = await db
-    .prepare(
-      `SELECT m.role
-         FROM memberships m
-         JOIN projects p ON p.customer_id = m.customer_id
-        WHERE m.user_id = ? AND p.id = ?`,
-    )
-    .bind(userId, projectId)
-    .first<{ role: CustomerRole }>();
-  return cust?.role ?? null;
+  const row = await db.prepare(`SELECT COALESCE(pm.role, cm.role) AS role FROM projects p
+    LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = ?
+    LEFT JOIN memberships cm ON cm.id = ${customerMembershipIdSql('p.customer_id', '?')}
+    WHERE p.id = ?`).bind(userId, userId, projectId).first<{ role: CustomerRole | null }>();
+  return row?.role ?? null;
 }
 
 export async function canDoOnCustomer(
@@ -172,23 +217,11 @@ export async function visibleCustomerIds(
   user: AuthedUser,
 ): Promise<number[] | null> {
   if (user.role === 'super_admin' || user.role === 'admin' || user.role === 'observer') return null;
-  const direct = await db
-    .prepare('SELECT customer_id FROM memberships WHERE user_id = ?')
-    .bind(user.id)
-    .all<{ customer_id: number }>();
-  const viaProj = await db
-    .prepare(
-      `SELECT DISTINCT p.customer_id
-         FROM project_memberships pm
-         JOIN projects p ON p.id = pm.project_id
-        WHERE pm.user_id = ?`,
-    )
-    .bind(user.id)
-    .all<{ customer_id: number }>();
-  const ids = new Set<number>();
-  for (const r of direct.results ?? []) ids.add(r.customer_id);
-  for (const r of viaProj.results ?? []) ids.add(r.customer_id);
-  return [...ids];
+  const rows = await db.prepare(`SELECT id FROM customers WHERE id IN ${inheritedCustomerIdsSql('?')}
+    UNION SELECT p.customer_id AS id FROM project_memberships pm
+      JOIN projects p ON p.id = pm.project_id WHERE pm.user_id = ?`)
+    .bind(user.id, user.id).all<{ id: number }>();
+  return (rows.results ?? []).map((row) => row.id);
 }
 
 /** Project ids the user can see. */
@@ -200,7 +233,7 @@ export async function visibleProjectIds(
   const rows = await db
     .prepare(
       `SELECT DISTINCT p.id FROM projects p
-        WHERE EXISTS (SELECT 1 FROM memberships m WHERE m.user_id = ? AND m.customer_id = p.customer_id)
+        WHERE p.customer_id IN ${inheritedCustomerIdsSql('?')}
            OR EXISTS (SELECT 1 FROM project_memberships pm WHERE pm.user_id = ? AND pm.project_id = p.id)`,
     )
     .bind(user.id, user.id)

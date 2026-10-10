@@ -37,7 +37,7 @@ export interface User {
 
 export interface Customer {
   id: number;
-  /** Organizational parent only; customer permissions do not inherit. */
+  /** Customer-wide memberships inherit down this parent chain; nearer grants take precedence. */
   parentId: number | null;
   code: string;
   name: string;

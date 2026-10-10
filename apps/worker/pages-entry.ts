@@ -201,7 +201,7 @@ async function ensureCustomerHierarchy(env: PagesEnv): Promise<void> {
     // semicolons inside BEGIN/END while keeping the upgrade one atomic batch.
     const sql = migration0015.split(/^-- statement-breakpoint\s*$/m).map((statement) => statement.trim()).filter(Boolean);
     await env.DB.batch(sql.map((statement) => env.DB.prepare(statement)));
-    console.log('[schema] added independent customer hierarchy');
+    console.log('[schema] added customer hierarchy');
   }
 }
 

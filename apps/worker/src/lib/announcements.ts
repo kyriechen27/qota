@@ -2,6 +2,7 @@ import type { D1Database } from '@cloudflare/workers-types';
 import type { UploadAnnouncement } from '@qota/shared';
 import { badRequest, forbidden } from '../utils/errors';
 import { announcementRecipientIds } from './announcement-mail';
+import { customerMembershipIdSql } from './memberships';
 
 // Parameters: project id, author id. Keep the original session author as the
 // publisher, including when another authorized user finishes their upload.
@@ -9,10 +10,28 @@ export const ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL = `EXISTS (
   SELECT 1 FROM users au JOIN projects ap ON ap.id = ?
   LEFT JOIN user_global_roles agr ON agr.user_id = au.id
   LEFT JOIN project_memberships apm ON apm.project_id = ap.id AND apm.user_id = au.id
-  LEFT JOIN memberships acm ON acm.customer_id = ap.customer_id AND acm.user_id = au.id
+  LEFT JOIN memberships acm ON acm.id = ${customerMembershipIdSql('ap.customer_id', 'au.id')}
   WHERE au.id = ? AND au.is_active = 1 AND (
     COALESCE(agr.role, au.role) IN ('super_admin', 'admin') OR
     (COALESCE(agr.role, au.role) = 'developer' AND COALESCE(apm.role, acm.role) IN ('developer', 'customer_admin'))
+  )
+)`;
+
+// One parameter: the acting user. Authors may still manage their announcement
+// after becoming viewers, provided they retain access to its project. Other
+// scoped users must remain administrators at the final write.
+export const ANNOUNCEMENT_CAN_MANAGE_SQL = `EXISTS (
+  SELECT 1 FROM users au JOIN projects ap ON ap.id = announcements.project_id
+  LEFT JOIN user_global_roles agr ON agr.user_id = au.id
+  LEFT JOIN project_memberships apm ON apm.project_id = ap.id AND apm.user_id = au.id
+  LEFT JOIN memberships acm ON acm.id = ${customerMembershipIdSql('ap.customer_id', 'au.id')}
+  WHERE au.id = ? AND au.is_active = 1 AND (
+    COALESCE(agr.role, au.role) IN ('super_admin', 'admin')
+    OR (COALESCE(agr.role, au.role) = 'developer' AND COALESCE(apm.role, acm.role) = 'customer_admin')
+    OR (au.id = announcements.author_id AND (
+      COALESCE(agr.role, au.role) = 'observer'
+      OR (COALESCE(agr.role, au.role) = 'developer' AND COALESCE(apm.role, acm.role) IS NOT NULL)
+    ))
   )
 )`;
 

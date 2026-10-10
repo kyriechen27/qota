@@ -2627,20 +2627,53 @@ function globalRoleHas(user, action) {
 function roleHas(role, action) {
   return ROLE_GRANTS[role].has(action);
 }
+function customerMembershipIdSql(customerIdSql, userIdSql) {
+  return `(WITH RECURSIVE lineage(id, parent_id, depth, path) AS (
+    SELECT ancestor_customer.id, ancestor_customer.parent_id, 0, '/' || ancestor_customer.id || '/'
+      FROM customers ancestor_customer WHERE ancestor_customer.id = ${customerIdSql}
+    UNION ALL
+    SELECT parent.id, parent.parent_id, lineage.depth + 1, lineage.path || parent.id || '/'
+      FROM customers parent JOIN lineage ON parent.id = lineage.parent_id
+     WHERE instr(lineage.path, '/' || parent.id || '/') = 0
+  )
+  SELECT inherited.id FROM lineage JOIN memberships inherited ON inherited.customer_id = lineage.id
+   WHERE inherited.user_id = ${userIdSql} ORDER BY lineage.depth ASC LIMIT 1)`;
+}
+function inheritedCustomerIdsSql(userIdSql) {
+  return `(WITH RECURSIVE inherited_customers(id) AS (
+    SELECT customer_id FROM memberships WHERE user_id = ${userIdSql}
+    UNION
+    SELECT child.id FROM customers child JOIN inherited_customers parent ON child.parent_id = parent.id
+  ) SELECT id FROM inherited_customers)`;
+}
+function projectAccessSql(projectIdSql, userIdSql, action, ownerIdSql) {
+  const roles = Object.keys(ROLE_GRANTS).filter((role) => roleHas(role, action)).map((role) => `'${role}'`).join(", ");
+  return `EXISTS (
+    SELECT 1 FROM users permission_user JOIN projects permission_project ON permission_project.id = ${projectIdSql}
+    LEFT JOIN user_global_roles permission_global ON permission_global.user_id = permission_user.id
+    LEFT JOIN project_memberships permission_pm
+      ON permission_pm.project_id = permission_project.id AND permission_pm.user_id = permission_user.id
+    LEFT JOIN memberships permission_cm
+      ON permission_cm.id = ${customerMembershipIdSql("permission_project.customer_id", "permission_user.id")}
+    WHERE permission_user.id = ${userIdSql} AND permission_user.is_active = 1 AND (
+      COALESCE(permission_global.role, permission_user.role) IN ('super_admin', 'admin')
+      ${GLOBAL_OBSERVER_ACTIONS.has(action) ? "OR COALESCE(permission_global.role, permission_user.role) = 'observer'" : ""}
+      OR (COALESCE(permission_global.role, permission_user.role) = 'developer'
+        AND COALESCE(permission_pm.role, permission_cm.role) IN (${roles})
+        ${ownerIdSql ? `AND (permission_user.id = ${ownerIdSql} OR COALESCE(permission_pm.role, permission_cm.role) = 'customer_admin')` : ""})
+    )
+  )`;
+}
 async function effectiveRoleOnCustomer(db, userId, customerId) {
-  const row = await db.prepare("SELECT role FROM memberships WHERE user_id = ? AND customer_id = ?").bind(userId, customerId).first();
+  const row = await db.prepare(`SELECT role FROM memberships WHERE id = ${customerMembershipIdSql("?", "?")}`).bind(customerId, userId).first();
   return row?.role ?? null;
 }
 async function effectiveRoleOnProject(db, userId, projectId) {
-  const proj = await db.prepare("SELECT role FROM project_memberships WHERE user_id = ? AND project_id = ?").bind(userId, projectId).first();
-  if (proj) return proj.role;
-  const cust = await db.prepare(
-    `SELECT m.role
-         FROM memberships m
-         JOIN projects p ON p.customer_id = m.customer_id
-        WHERE m.user_id = ? AND p.id = ?`
-  ).bind(userId, projectId).first();
-  return cust?.role ?? null;
+  const row = await db.prepare(`SELECT COALESCE(pm.role, cm.role) AS role FROM projects p
+    LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = ?
+    LEFT JOIN memberships cm ON cm.id = ${customerMembershipIdSql("p.customer_id", "?")}
+    WHERE p.id = ?`).bind(userId, userId, projectId).first();
+  return row?.role ?? null;
 }
 async function canDoOnCustomer(db, user, customerId, action) {
   const global = globalRoleHas(user, action);
@@ -2670,23 +2703,16 @@ async function requireCustomerAccess(db, user, customerId, action) {
 }
 async function visibleCustomerIds(db, user) {
   if (user.role === "super_admin" || user.role === "admin" || user.role === "observer") return null;
-  const direct = await db.prepare("SELECT customer_id FROM memberships WHERE user_id = ?").bind(user.id).all();
-  const viaProj = await db.prepare(
-    `SELECT DISTINCT p.customer_id
-         FROM project_memberships pm
-         JOIN projects p ON p.id = pm.project_id
-        WHERE pm.user_id = ?`
-  ).bind(user.id).all();
-  const ids = /* @__PURE__ */ new Set();
-  for (const r of direct.results ?? []) ids.add(r.customer_id);
-  for (const r of viaProj.results ?? []) ids.add(r.customer_id);
-  return [...ids];
+  const rows = await db.prepare(`SELECT id FROM customers WHERE id IN ${inheritedCustomerIdsSql("?")}
+    UNION SELECT p.customer_id AS id FROM project_memberships pm
+      JOIN projects p ON p.id = pm.project_id WHERE pm.user_id = ?`).bind(user.id, user.id).all();
+  return (rows.results ?? []).map((row) => row.id);
 }
 async function visibleProjectIds(db, user) {
   if (user.role === "super_admin" || user.role === "admin" || user.role === "observer") return null;
   const rows = await db.prepare(
     `SELECT DISTINCT p.id FROM projects p
-        WHERE EXISTS (SELECT 1 FROM memberships m WHERE m.user_id = ? AND m.customer_id = p.customer_id)
+        WHERE p.customer_id IN ${inheritedCustomerIdsSql("?")}
            OR EXISTS (SELECT 1 FROM project_memberships pm WHERE pm.user_id = ? AND pm.project_id = p.id)`
   ).bind(user.id, user.id).all();
   return (rows.results ?? []).map((r) => r.id);
@@ -27500,7 +27526,7 @@ membershipRoutes.post("/batch", async (c) => {
   const projects = await c.env.DB.prepare(`SELECT p.id, p.customer_id, COALESCE(pm.role, cm.role) AS role
     FROM projects p
     LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = ?
-    LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = ?
+    LEFT JOIN memberships cm ON cm.id = ${customerMembershipIdSql("p.customer_id", "?")}
     WHERE p.id IN (SELECT value FROM json_each(?))`).bind(me.id, me.id, idsJson).all();
   const projectMap = new Map((projects.results ?? []).map((project) => [project.id, project]));
   for (const id of projectIds) {
@@ -27521,7 +27547,7 @@ membershipRoutes.post("/batch", async (c) => {
       JOIN users actor ON actor.id = ?
       LEFT JOIN user_global_roles gr ON gr.user_id = actor.id
       LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = actor.id
-      LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = actor.id
+      LEFT JOIN memberships cm ON cm.id = ${customerMembershipIdSql("p.customer_id", "actor.id")}
       WHERE actor.is_active = 1 AND (
         COALESCE(gr.role, actor.role) IN ('super_admin', 'admin') OR
         (COALESCE(gr.role, actor.role) = 'developer' AND COALESCE(pm.role, cm.role) = 'customer_admin')
@@ -28210,7 +28236,7 @@ async function notesContexts(db, user, projectIds) {
       db.prepare(
         `SELECT p.id, COALESCE(pm.role, cm.role) AS role FROM projects p
          LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = ?
-         LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = ?
+         LEFT JOIN memberships cm ON cm.id = ${customerMembershipIdSql("p.customer_id", "?")}
          WHERE p.id IN (${placeholders})`
       ).bind(user.id, user.id, ...ids).all(),
       db.prepare(`SELECT project_id, version FROM project_current_versions WHERE project_id IN (${placeholders})`).bind(...ids).all(),
@@ -29494,7 +29520,7 @@ var RECIPIENTS_SQL = `SELECT u.id, u.email, u.display_name AS displayName
   FROM users u JOIN projects p ON p.id = ?
   LEFT JOIN user_global_roles gr ON gr.user_id = u.id
   LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = u.id
-  LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = u.id
+  LEFT JOIN memberships cm ON cm.id = ${customerMembershipIdSql("p.customer_id", "u.id")}
   WHERE u.is_active = 1 AND (
     COALESCE(gr.role, u.role) IN ('super_admin', 'admin', 'observer') OR
     (COALESCE(gr.role, u.role) = 'developer' AND COALESCE(pm.role, cm.role) IS NOT NULL)
@@ -29604,10 +29630,24 @@ var ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL = `EXISTS (
   SELECT 1 FROM users au JOIN projects ap ON ap.id = ?
   LEFT JOIN user_global_roles agr ON agr.user_id = au.id
   LEFT JOIN project_memberships apm ON apm.project_id = ap.id AND apm.user_id = au.id
-  LEFT JOIN memberships acm ON acm.customer_id = ap.customer_id AND acm.user_id = au.id
+  LEFT JOIN memberships acm ON acm.id = ${customerMembershipIdSql("ap.customer_id", "au.id")}
   WHERE au.id = ? AND au.is_active = 1 AND (
     COALESCE(agr.role, au.role) IN ('super_admin', 'admin') OR
     (COALESCE(agr.role, au.role) = 'developer' AND COALESCE(apm.role, acm.role) IN ('developer', 'customer_admin'))
+  )
+)`;
+var ANNOUNCEMENT_CAN_MANAGE_SQL = `EXISTS (
+  SELECT 1 FROM users au JOIN projects ap ON ap.id = announcements.project_id
+  LEFT JOIN user_global_roles agr ON agr.user_id = au.id
+  LEFT JOIN project_memberships apm ON apm.project_id = ap.id AND apm.user_id = au.id
+  LEFT JOIN memberships acm ON acm.id = ${customerMembershipIdSql("ap.customer_id", "au.id")}
+  WHERE au.id = ? AND au.is_active = 1 AND (
+    COALESCE(agr.role, au.role) IN ('super_admin', 'admin')
+    OR (COALESCE(agr.role, au.role) = 'developer' AND COALESCE(apm.role, acm.role) = 'customer_admin')
+    OR (au.id = announcements.author_id AND (
+      COALESCE(agr.role, au.role) = 'observer'
+      OR (COALESCE(agr.role, au.role) = 'developer' AND COALESCE(apm.role, acm.role) IS NOT NULL)
+    ))
   )
 )`;
 async function requireAnnouncementAuthor(db, projectId, authorId) {
@@ -29964,8 +30004,11 @@ uploadRoutes.post("/complete", async (c) => {
     const unlocked = `NOT EXISTS (
       SELECT 1 FROM project_current_versions WHERE project_id = ? AND version = ?
     )`;
-    const guards = [`EXISTS (SELECT 1 FROM upload_sessions WHERE id = ? AND status = 'in_progress')`];
-    const guardArgs = [session.id];
+    const guards = [
+      `EXISTS (SELECT 1 FROM upload_sessions WHERE id = ? AND status = 'in_progress')`,
+      projectAccessSql("?", "?", "upload")
+    ];
+    const guardArgs = [session.id, session.project_id, me.id];
     if (session.announcement_batch_key) {
       guards.push(ANNOUNCEMENT_AUTHOR_CAN_PUBLISH_SQL);
       guardArgs.push(session.project_id, session.initiated_by);
@@ -29977,7 +30020,7 @@ uploadRoutes.post("/complete", async (c) => {
     if (existing) {
       guards.push(`EXISTS (
         SELECT 1 FROM versions v WHERE v.id = ? AND v.project_id = ? AND v.uploaded_by = ? AND v.r2_key = ?
-          AND (v.notes IS ? OR (? = 1 AND ${unlocked}))
+          AND (v.notes IS ? OR (${projectAccessSql("v.project_id", "?", "manage_versions", "v.uploaded_by")} AND ${unlocked}))
       )`);
       guardArgs.push(
         session.version_id,
@@ -29985,7 +30028,7 @@ uploadRoutes.post("/complete", async (c) => {
         existing.uploaded_by,
         existing.r2_key,
         session.notes,
-        notesPermission.can_edit_notes ? 1 : 0,
+        me.id,
         session.project_id,
         session.target_version
       );
@@ -30004,7 +30047,7 @@ uploadRoutes.post("/complete", async (c) => {
         NOT EXISTS (SELECT 1 FROM version_metadata WHERE project_id = ? AND version = ?)
         OR EXISTS (
           SELECT 1 FROM version_metadata vm WHERE vm.project_id = ? AND vm.version = ?
-            AND (vm.${field.column} IS ? OR (? = 1 AND vm.created_by = ? AND ${unlocked}))
+            AND (vm.${field.column} IS ? OR (${projectAccessSql("vm.project_id", "?", "manage_versions", "vm.created_by")} AND vm.created_by = ? AND ${unlocked}))
         )
       )`);
       guardArgs.push(
@@ -30013,7 +30056,7 @@ uploadRoutes.post("/complete", async (c) => {
         session.project_id,
         session.target_version,
         field.value,
-        notesPermission.can_edit_version_notes ? 1 : 0,
+        me.id,
         notesPermission.version_notes_creator ?? -1,
         session.project_id,
         session.target_version
@@ -30327,7 +30370,7 @@ auditRoutes.get("/", async (c) => {
     const visibleProj = await visibleProjectIds(c.env.DB, user);
     const clauses = [
       "(actor_type = ? AND actor_id = ?)",
-      "(project_id IS NULL AND customer_id IN (SELECT customer_id FROM memberships WHERE user_id = ?))"
+      `(project_id IS NULL AND customer_id IN ${inheritedCustomerIdsSql("?")})`
     ];
     args.push("user", user.id, user.id);
     if (visibleProj && visibleProj.length > 0) {
@@ -30366,7 +30409,7 @@ var SELECT_ANNOUNCEMENTS = `SELECT a.id, a.project_id, p.name AS project_name, c
   JOIN customers c ON c.id = p.customer_id
   JOIN users u ON u.id = a.author_id
   LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = ?
-  LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = ?
+  LEFT JOIN memberships cm ON cm.id = ${customerMembershipIdSql("p.customer_id", "?")}
   LEFT JOIN (
     SELECT announcement_id, COUNT(*) AS total,
       SUM(status = 'sent') AS sent, SUM(status = 'failed') AS failed,
@@ -30433,7 +30476,7 @@ announcementRoutes.get("/", async (c) => {
       `SELECT p.id, p.name, c.name AS customer_name FROM projects p
        JOIN customers c ON c.id = p.customer_id
        LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = ?
-       LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = ?
+       LEFT JOIN memberships cm ON cm.id = ${customerMembershipIdSql("p.customer_id", "?")}
        WHERE ? = 1 OR (? = 1 AND COALESCE(pm.role, cm.role) IN ('developer', 'customer_admin'))
        ORDER BY c.name, p.name, p.id`
     ).bind(user.id, user.id, globalAdmin(user) ? 1 : 0, user.role === "developer" ? 1 : 0).all()
@@ -30524,8 +30567,12 @@ announcementRoutes.patch("/:id", async (c) => {
   const { row, project, announcement } = await loadAnnouncement(c.env.DB, user, id);
   if (!announcement.canEdit) throw forbidden("only the author or an administrator can edit this announcement");
   const updatedAt = Date.now();
-  const result = await c.env.DB.prepare("UPDATE announcements SET content = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL").bind(content, updatedAt, id).run();
-  if (!result.meta.changes) throw notFound("announcement not found");
+  const result = await c.env.DB.prepare(`UPDATE announcements SET content = ?, updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL AND ${ANNOUNCEMENT_CAN_MANAGE_SQL}`).bind(content, updatedAt, id, user.id).run();
+  if (!result.meta.changes) {
+    await loadAnnouncement(c.env.DB, user, id);
+    throw forbidden("no permission to edit this announcement");
+  }
   await audit(c, { action: "announcement.update", projectId: row.project_id, customerId: project.customer_id, targetType: "announcement", targetId: id });
   return c.json({ ...announcement, content, updatedAt });
 });
@@ -30535,8 +30582,12 @@ announcementRoutes.delete("/:id", async (c) => {
   const { row, project, announcement } = await loadAnnouncement(c.env.DB, user, id);
   if (!announcement.canDelete) throw forbidden("only the author or an administrator can delete this announcement");
   const now = Date.now();
-  const result = await c.env.DB.prepare("UPDATE announcements SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL").bind(now, now, id).run();
-  if (!result.meta.changes) throw notFound("announcement not found");
+  const result = await c.env.DB.prepare(`UPDATE announcements SET deleted_at = ?, updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL AND ${ANNOUNCEMENT_CAN_MANAGE_SQL}`).bind(now, now, id, user.id).run();
+  if (!result.meta.changes) {
+    await loadAnnouncement(c.env.DB, user, id);
+    throw forbidden("no permission to delete this announcement");
+  }
   await c.env.DB.prepare(`UPDATE announcement_mail_deliveries SET status = 'skipped', error = NULL, updated_at = ?
     WHERE announcement_id = ? AND status IN ('pending', 'failed')`).bind(now, id).run();
   await audit(c, { action: "announcement.delete", projectId: row.project_id, customerId: project.customer_id, targetType: "announcement", targetId: id });
@@ -31071,7 +31122,7 @@ async function ensureCustomerHierarchy(env) {
   if (row && !row.sql.includes("parent_id")) {
     const sql = customer_hierarchy_default.split(/^-- statement-breakpoint\s*$/m).map((statement) => statement.trim()).filter(Boolean);
     await env.DB.batch(sql.map((statement) => env.DB.prepare(statement)));
-    console.log("[schema] added independent customer hierarchy");
+    console.log("[schema] added customer hierarchy");
   }
 }
 var pages_entry_default = {
