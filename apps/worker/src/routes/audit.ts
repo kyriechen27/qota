@@ -1,7 +1,8 @@
 // Audit log reader. Scoped by caller's visibility:
 //   - super_admin/admin/observer see everything (optionally filtered)
-//   - others see logs for customers/projects they have manage_members rights on
-//     (else they could only see their own actions, which we expose separately)
+//   - unfiltered non-global readers see authorized projects, directly granted
+//     customer-only events, and their own actions; a project grant cannot reveal
+//     its customer's other projects or any parent/child customer's events
 
 import { Hono } from 'hono';
 import type { AppEnv } from '../env';
@@ -10,7 +11,6 @@ import { badRequest } from '../utils/errors';
 import {
   canDoOnCustomer,
   canDoOnProject,
-  visibleCustomerIds,
   visibleProjectIds,
 } from '../lib/memberships';
 
@@ -98,17 +98,15 @@ auditRoutes.get('/', async (c) => {
     }
   } else if (!isGlobalVisible(user.role)) {
     // No specific scope; restrict to logs the user can see.
-    const visibleCust = await visibleCustomerIds(c.env.DB, user);
     const visibleProj = await visibleProjectIds(c.env.DB, user);
-    const clauses: string[] = ['(actor_type = ? AND actor_id = ?)'];
-    args.push('user', user.id);
-    if (visibleCust && visibleCust.length > 0) {
-      clauses.push(`customer_id IN (${visibleCust.map(() => '?').join(',')})`);
-      args.push(...visibleCust);
-    }
+    const clauses: string[] = [
+      '(actor_type = ? AND actor_id = ?)',
+      '(project_id IS NULL AND customer_id IN (SELECT customer_id FROM memberships WHERE user_id = ?))',
+    ];
+    args.push('user', user.id, user.id);
     if (visibleProj && visibleProj.length > 0) {
-      clauses.push(`project_id IN (${visibleProj.map(() => '?').join(',')})`);
-      args.push(...visibleProj);
+      clauses.push('project_id IN (SELECT value FROM json_each(?))');
+      args.push(JSON.stringify(visibleProj));
     }
     where.push(`(${clauses.join(' OR ')})`);
   }

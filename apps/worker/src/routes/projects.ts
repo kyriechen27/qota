@@ -70,8 +70,8 @@ projectRoutes.get('/', async (c) => {
   }
   if (visible !== null) {
     if (visible.length === 0) return c.json([]);
-    conditions.push(`id IN (${visible.map(() => '?').join(',')})`);
-    args.push(...visible);
+    conditions.push('p.id IN (SELECT value FROM json_each(?))');
+    args.push(JSON.stringify(visible));
   }
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   const rows = await c.env.DB.prepare(

@@ -139,8 +139,8 @@ versionRoutes.get('/accessible', async (c) => {
   const args: unknown[] = [];
   if (visible !== null) {
     if (visible.length === 0) return c.json([]);
-    where.push(`v.project_id IN (${visible.map(() => '?').join(',')})`);
-    args.push(...visible);
+    where.push('v.project_id IN (SELECT value FROM json_each(?))');
+    args.push(JSON.stringify(visible));
   }
   const rows = await c.env.DB.prepare(
     `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size,

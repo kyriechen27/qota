@@ -1,10 +1,12 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { api } from '../lib/api';
 import { useAuth } from '../lib/auth';
 import { useI18n } from '../lib/i18n';
 import { slugify } from '../lib/slug';
+import { customerHierarchy } from '../lib/customer-tree';
 import type { Customer, Project } from '@qota/shared';
+import './customer-memberships.css';
 
 export default function Projects() {
   const { user } = useAuth();
@@ -19,6 +21,11 @@ export default function Projects() {
   const [err, setErr] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+  const busyRef = useRef(false);
+  const loadGeneration = useRef(0);
+  const currentCustomer = useRef(customerId);
+  currentCustomer.current = customerId;
   const [form, setForm] = useState({ customerId: customerId ?? 0, code: '', name: '', description: '' });
   const [codeEdited, setCodeEdited] = useState(false);
 
@@ -33,28 +40,34 @@ export default function Projects() {
   }
 
   async function load() {
+    if (currentCustomer.current !== customerId) return;
+    const generation = ++loadGeneration.current;
+    setErr(null);
     try {
       const [p, c] = await Promise.all([api.listProjects(customerId), api.listCustomers()]);
+      if (generation !== loadGeneration.current || currentCustomer.current !== customerId) return;
       setProjects(p);
       setCustomers(c);
     } catch (e: any) {
-      setErr(e?.message);
+      if (generation === loadGeneration.current && currentCustomer.current === customerId) setErr(e?.message);
     }
   }
   useEffect(() => {
+    setProjects([]);
     void load();
+    return () => { loadGeneration.current++; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [customerId]);
 
-  const customerName = useMemo(() => {
-    const m = new Map(customers.map((c) => [c.id, `${c.name} (${c.code})`]));
-    return (id: number) => m.get(id) ?? `#${id}`;
-  }, [customers]);
+  const tree = useMemo(() => customerHierarchy(customers), [customers]);
+  const customerName = (id: number) => tree.paths.get(id) ?? `#${id}`;
 
   async function create(e: FormEvent) {
     e.preventDefault();
+    if (busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
-    setErr(null);
+    setFormError(null);
     try {
       await api.createProject({
         customerId: Number(form.customerId),
@@ -67,8 +80,9 @@ export default function Projects() {
       setCodeEdited(false);
       await load();
     } catch (e: any) {
-      setErr(e?.message);
+      setFormError(e?.message);
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   }
@@ -88,6 +102,7 @@ export default function Projects() {
       <h2 className="page-title">{t('projects.title')}</h2>
       <div className="page-actions toolbar">
         <select
+          aria-label={t('mem.filterCustomer')}
           value={customerIdParam ?? ''}
           onChange={(e) => {
             const v = e.target.value;
@@ -96,9 +111,9 @@ export default function Projects() {
           }}
         >
           <option value="">{t('projects.allCustomers')}</option>
-          {customers.map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.name} ({c.code})
+          {tree.entries.map(({ customer, path }) => (
+            <option key={customer.id} value={customer.id}>
+              {path} ({customer.code})
             </option>
           ))}
         </select>
@@ -108,6 +123,7 @@ export default function Projects() {
             onClick={() => {
               setForm({ customerId: customerId ?? 0, code: '', name: '', description: '' });
               setCodeEdited(false);
+              setFormError(null);
               setOpen(true);
             }}
             disabled={customers.length === 0}
@@ -117,7 +133,7 @@ export default function Projects() {
         )}
       </div>
       {err && <div className="error" style={{ marginBottom: 12 }}>{err}</div>}
-      <table>
+      <div className="hierarchy-table-scroll"><table>
         <thead>
           <tr>
             <th>{t('projects.colCustomer')}</th>
@@ -130,7 +146,7 @@ export default function Projects() {
         <tbody>
           {projects.map((p) => (
             <tr key={p.id}>
-              <td><span className="code">{customerName(p.customerId)}</span></td>
+              <td className="membership-target">{customerName(p.customerId)}</td>
               <td>
                 <Link to={`/projects/${p.id}`}>{p.name}</Link>
               </td>
@@ -153,15 +169,18 @@ export default function Projects() {
             </tr>
           )}
         </tbody>
-      </table>
+      </table></div>
 
       {open && (
         <div className="dialog-backdrop" onClick={() => !busy && setOpen(false)}>
-          <form className="dialog" onSubmit={create} onClick={(e) => e.stopPropagation()}>
+          <form className="dialog hierarchy-dialog" onSubmit={create} onClick={(e) => e.stopPropagation()}>
             <h3>{t('projects.dlgNew')}</h3>
+            {formError && <div className="error" role="alert">{formError}</div>}
+            <fieldset disabled={busy}>
             <label>
               <span className="lbl">{t('projects.fldCustomer')}</span>
               <select
+                aria-label={t('projects.fldCustomer')}
                 value={form.customerId}
                 onChange={(e) => setForm({ ...form, customerId: Number(e.target.value) })}
                 required
@@ -170,9 +189,9 @@ export default function Projects() {
                 <option value={0} disabled>
                   {t('common.select')}
                 </option>
-                {customers.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name} ({c.code})
+                {tree.entries.map(({ customer, path }) => (
+                  <option key={customer.id} value={customer.id}>
+                    {path} ({customer.code})
                   </option>
                 ))}
               </select>
@@ -204,6 +223,7 @@ export default function Projects() {
                 style={{ width: '100%' }}
               />
             </label>
+            </fieldset>
             <div className="dialog-actions">
               <button type="button" onClick={() => setOpen(false)} disabled={busy}>
                 {t('common.cancel')}

@@ -1,4 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react';
+import { Link } from 'react-router-dom';
 import { api } from '../lib/api';
 import { useAuth } from '../lib/auth';
 import { useI18n } from '../lib/i18n';
@@ -155,6 +156,9 @@ export default function Users() {
                 </td>
                 <td>{u.isActive ? <span className="success">{t('users.active')}</span> : <span className="error">{t('users.disabled')}</span>}</td>
                 <td>
+                  <Link to={`/permissions?userId=${u.id}`} className="btn" style={{ marginRight: 6 }}>
+                    {t('mem.title')}
+                  </Link>
                   <button
                     onClick={() => toggle(u)}
                     style={{ marginRight: 6 }}

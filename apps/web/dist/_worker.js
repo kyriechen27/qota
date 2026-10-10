@@ -27039,6 +27039,7 @@ customerRoutes.use("*", requireUser);
 function dto3(r) {
   return {
     id: r.id,
+    parentId: r.parent_id,
     code: r.code,
     name: r.name,
     description: r.description,
@@ -27047,40 +27048,67 @@ function dto3(r) {
   };
 }
 var CODE_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+function routeId(value) {
+  const id = Number(value);
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(id) || id <= 0) throw badRequest("invalid id");
+  return id;
+}
+async function validateParent(db, value, id) {
+  if (value === null || value === void 0) return null;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) throw badRequest("parentId must be a positive integer or null");
+  if (value === id) throw badRequest("a customer cannot be its own parent");
+  if (!await db.prepare("SELECT id FROM customers WHERE id = ?").bind(value).first()) throw notFound("parent customer not found");
+  if (id !== void 0) {
+    const cycle = await db.prepare(`WITH RECURSIVE ancestors(id, parent_id) AS (
+      SELECT id, parent_id FROM customers WHERE id = ?
+      UNION SELECT c.id, c.parent_id FROM customers c JOIN ancestors a ON c.id = a.parent_id
+    ) SELECT id FROM ancestors WHERE id = ?`).bind(value, id).first();
+    if (cycle) throw badRequest("a customer cannot be moved under its descendant");
+  }
+  return value;
+}
+function customerWriteError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes("customer_hierarchy_cycle")) throw badRequest("a customer cannot be moved under itself or its descendant");
+  if (message.includes("FOREIGN KEY constraint failed")) throw conflict("customer relationships changed; refresh before retrying");
+  if (message.includes("UNIQUE constraint failed: customers.code")) throw conflict("code already exists");
+  throw error;
+}
 customerRoutes.get("/", async (c) => {
   const user = c.get("user");
   const visible = await visibleCustomerIds(c.env.DB, user);
   let rows;
   if (visible === null) {
     rows = await c.env.DB.prepare(
-      "SELECT id, code, name, description, created_at, updated_at FROM customers ORDER BY name ASC"
+      "SELECT id, parent_id, code, name, description, created_at, updated_at FROM customers ORDER BY name ASC"
     ).all();
   } else if (visible.length === 0) {
     return c.json([]);
   } else {
-    const placeholders = visible.map(() => "?").join(",");
     rows = await c.env.DB.prepare(
-      `SELECT id, code, name, description, created_at, updated_at FROM customers WHERE id IN (${placeholders}) ORDER BY name ASC`
-    ).bind(...visible).all();
+      `SELECT id, parent_id, code, name, description, created_at, updated_at FROM customers
+       WHERE id IN (SELECT value FROM json_each(?)) ORDER BY name ASC`
+    ).bind(JSON.stringify(visible)).all();
   }
   return c.json((rows.results ?? []).map(dto3));
 });
 customerRoutes.get("/:id", async (c) => {
-  const id = Number(c.req.param("id"));
-  if (!Number.isFinite(id)) throw badRequest("invalid id");
+  const id = routeId(c.req.param("id"));
   const user = c.get("user");
   const row = await requireCustomerAccess(c.env.DB, user, id, "view");
   const full = await c.env.DB.prepare(
-    "SELECT id, code, name, description, created_at, updated_at FROM customers WHERE id = ?"
+    "SELECT id, parent_id, code, name, description, created_at, updated_at FROM customers WHERE id = ?"
   ).bind(row.id).first();
   return c.json(dto3(full));
 });
 customerRoutes.post("/", requireAdmin, async (c) => {
   const body = await c.req.json().catch(() => ({}));
-  if (!body.name) throw badRequest("name required");
+  if (!body || typeof body.name !== "string" || !body.name.trim()) throw badRequest("name required");
+  if (body.description !== void 0 && body.description !== null && typeof body.description !== "string") throw badRequest("description must be a string or null");
+  const parentId = await validateParent(c.env.DB, body.parentId);
   let code;
   if (body.code) {
-    if (!CODE_RE.test(body.code)) throw badRequest("code must match [a-z0-9_-]");
+    if (typeof body.code !== "string" || !CODE_RE.test(body.code)) throw badRequest("code must match [a-z0-9_-]");
     if (await customerCodeTaken(c.env.DB, body.code)) throw conflict("code already exists");
     code = body.code;
   } else {
@@ -27088,28 +27116,36 @@ customerRoutes.post("/", requireAdmin, async (c) => {
   }
   const now = Date.now();
   const r = await c.env.DB.prepare(
-    "INSERT INTO customers (code, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
-  ).bind(code, body.name, body.description ?? null, now, now).run();
+    "INSERT INTO customers (code, name, description, parent_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
+  ).bind(code, body.name, body.description ?? null, parentId, now, now).run().catch(customerWriteError);
   const id = Number(r.meta.last_row_id);
   const row = await c.env.DB.prepare(
-    "SELECT id, code, name, description, created_at, updated_at FROM customers WHERE id = ?"
+    "SELECT id, parent_id, code, name, description, created_at, updated_at FROM customers WHERE id = ?"
   ).bind(id).first();
-  await audit(c, { action: "customer.create", customerId: id, targetType: "customer", targetId: id, meta: { code, name: body.name } });
+  await audit(c, { action: "customer.create", customerId: id, targetType: "customer", targetId: id, meta: { code, name: body.name, parentId } });
   return c.json(dto3(row), 201);
 });
 customerRoutes.patch("/:id", async (c) => {
-  const id = Number(c.req.param("id"));
-  if (!Number.isFinite(id)) throw badRequest("invalid id");
+  const id = routeId(c.req.param("id"));
   const user = c.get("user");
   await requireCustomerAccess(c.env.DB, user, id, "manage_customer");
   const body = await c.req.json().catch(() => ({}));
   const sets = [];
   const args = [];
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw badRequest("customer fields required");
+  if (body.parentId !== void 0) {
+    if (user.role !== "admin" && user.role !== "super_admin") throw forbidden("only global administrators can change the parent customer");
+    const parentId = await validateParent(c.env.DB, body.parentId, id);
+    sets.push("parent_id = ?");
+    args.push(parentId);
+  }
   if (body.name !== void 0) {
+    if (typeof body.name !== "string" || !body.name.trim()) throw badRequest("name required");
     sets.push("name = ?");
     args.push(body.name);
   }
   if (body.description !== void 0) {
+    if (body.description !== null && typeof body.description !== "string") throw badRequest("description must be a string or null");
     sets.push("description = ?");
     args.push(body.description);
   }
@@ -27117,18 +27153,23 @@ customerRoutes.patch("/:id", async (c) => {
   sets.push("updated_at = ?");
   args.push(Date.now());
   args.push(id);
-  await c.env.DB.prepare(`UPDATE customers SET ${sets.join(", ")} WHERE id = ?`).bind(...args).run();
+  const result = await c.env.DB.prepare(`UPDATE customers SET ${sets.join(", ")} WHERE id = ?`).bind(...args).run().catch(customerWriteError);
+  if (!result.meta.changes) throw notFound();
   const row = await c.env.DB.prepare(
-    "SELECT id, code, name, description, created_at, updated_at FROM customers WHERE id = ?"
+    "SELECT id, parent_id, code, name, description, created_at, updated_at FROM customers WHERE id = ?"
   ).bind(id).first();
   await audit(c, { action: "customer.update", customerId: id, targetType: "customer", targetId: id, meta: { fields: Object.keys(body) } });
   return c.json(dto3(row));
 });
 customerRoutes.delete("/:id", requireAdmin, async (c) => {
-  const id = Number(c.req.param("id"));
-  if (!Number.isFinite(id)) throw badRequest("invalid id");
-  const r = await c.env.DB.prepare("DELETE FROM customers WHERE id = ?").bind(id).run();
-  if (r.meta.changes === 0) throw notFound();
+  const id = routeId(c.req.param("id"));
+  const r = await c.env.DB.prepare(`DELETE FROM customers WHERE id = ? AND NOT EXISTS (
+    SELECT 1 FROM customers child WHERE child.parent_id = customers.id
+  )`).bind(id).run().catch(customerWriteError);
+  if (r.meta.changes === 0) {
+    if (await c.env.DB.prepare("SELECT id FROM customers WHERE id = ?").bind(id).first()) throw conflict("move or delete child customers before deleting this customer");
+    throw notFound();
+  }
   await audit(c, { action: "customer.delete", customerId: id, targetType: "customer", targetId: id });
   return c.json({ ok: true });
 });
@@ -27228,8 +27269,8 @@ projectRoutes.get("/", async (c) => {
   }
   if (visible !== null) {
     if (visible.length === 0) return c.json([]);
-    conditions.push(`id IN (${visible.map(() => "?").join(",")})`);
-    args.push(...visible);
+    conditions.push("p.id IN (SELECT value FROM json_each(?))");
+    args.push(JSON.stringify(visible));
   }
   const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
   const rows = await c.env.DB.prepare(
@@ -27381,6 +27422,14 @@ var ROLES2 = ["customer_admin", "developer", "viewer"];
 function isRole(s) {
   return typeof s === "string" && ROLES2.includes(s);
 }
+function positiveId(value, field) {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) throw badRequest(`invalid ${field}`);
+  return value;
+}
+function queryId(value, field) {
+  if (!/^\d+$/.test(value)) throw badRequest(`invalid ${field}`);
+  return positiveId(Number(value), field);
+}
 function dtoCust(r) {
   return {
     id: r.id,
@@ -27407,18 +27456,17 @@ membershipRoutes.get("/", async (c) => {
   const user = c.get("user");
   const customerIdQ = c.req.query("customerId");
   const projectIdQ = c.req.query("projectId");
-  if (customerIdQ) {
-    const customerId = Number(customerIdQ);
-    if (!Number.isFinite(customerId)) throw badRequest("invalid customerId");
+  if (customerIdQ !== void 0 && projectIdQ !== void 0) throw badRequest("specify exactly one of customerId or projectId");
+  if (customerIdQ !== void 0) {
+    const customerId = queryId(customerIdQ, "customerId");
     await requireCustomerAccess(c.env.DB, user, customerId, "manage_members");
     const rows = await c.env.DB.prepare(
       `SELECT id, user_id, customer_id, role, created_by, created_at FROM memberships WHERE customer_id = ? ORDER BY id ASC`
     ).bind(customerId).all();
     return c.json((rows.results ?? []).map(dtoCust));
   }
-  if (projectIdQ) {
-    const projectId = Number(projectIdQ);
-    if (!Number.isFinite(projectId)) throw badRequest("invalid projectId");
+  if (projectIdQ !== void 0) {
+    const projectId = queryId(projectIdQ, "projectId");
     await requireProjectAccess(c.env.DB, user, projectId, "manage_members");
     const rows = await c.env.DB.prepare(
       `SELECT id, user_id, project_id, role, created_by, created_at FROM project_memberships WHERE project_id = ? ORDER BY id ASC`
@@ -27436,15 +27484,92 @@ membershipRoutes.get("/", async (c) => {
     ...(proj.results ?? []).map(dtoProj)
   ]);
 });
+membershipRoutes.post("/batch", async (c) => {
+  const me = c.get("user");
+  const body = await c.req.json().catch(() => null);
+  if (!body || !isRole(body.role)) throw badRequest("userId, projectIds and role required");
+  const userId = positiveId(body.userId, "userId");
+  if (!Array.isArray(body.projectIds) || body.projectIds.length < 1 || body.projectIds.length > 200) {
+    throw badRequest("projectIds must contain 1-200 distinct project ids");
+  }
+  const projectIds = body.projectIds.map((id) => positiveId(id, "projectId"));
+  if (new Set(projectIds).size !== projectIds.length) throw badRequest("projectIds must not contain duplicates");
+  const role = body.role;
+  const idsJson = JSON.stringify(projectIds);
+  if (!await c.env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(userId).first()) throw notFound("user not found");
+  const projects = await c.env.DB.prepare(`SELECT p.id, p.customer_id, COALESCE(pm.role, cm.role) AS role
+    FROM projects p
+    LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = ?
+    LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = ?
+    WHERE p.id IN (SELECT value FROM json_each(?))`).bind(me.id, me.id, idsJson).all();
+  const projectMap = new Map((projects.results ?? []).map((project) => [project.id, project]));
+  for (const id of projectIds) {
+    const project = projectMap.get(id);
+    if (!project) throw notFound("project not found");
+    if (me.role !== "admin" && me.role !== "super_admin" && (me.role !== "developer" || project.role !== "customer_admin")) {
+      throw forbidden(`no 'manage_members' permission on project ${id}`);
+    }
+  }
+  const duplicate = await c.env.DB.prepare(`SELECT id FROM project_memberships
+    WHERE user_id = ? AND project_id IN (SELECT value FROM json_each(?)) LIMIT 1`).bind(userId, idsJson).first();
+  if (duplicate) throw conflict("membership already exists; use PATCH to change role");
+  const now = Date.now();
+  const result = await c.env.DB.prepare(`WITH
+    requested AS MATERIALIZED (SELECT value AS project_id FROM json_each(?)),
+    authorized AS MATERIALIZED (
+      SELECT p.id FROM requested r JOIN projects p ON p.id = r.project_id
+      JOIN users actor ON actor.id = ?
+      LEFT JOIN user_global_roles gr ON gr.user_id = actor.id
+      LEFT JOIN project_memberships pm ON pm.project_id = p.id AND pm.user_id = actor.id
+      LEFT JOIN memberships cm ON cm.customer_id = p.customer_id AND cm.user_id = actor.id
+      WHERE actor.is_active = 1 AND (
+        COALESCE(gr.role, actor.role) IN ('super_admin', 'admin') OR
+        (COALESCE(gr.role, actor.role) = 'developer' AND COALESCE(pm.role, cm.role) = 'customer_admin')
+      )
+    ),
+    eligible AS MATERIALIZED (
+      SELECT 1 WHERE (SELECT COUNT(*) FROM authorized) = ?
+        AND EXISTS (SELECT 1 FROM users WHERE id = ?)
+        AND NOT EXISTS (SELECT 1 FROM project_memberships existing
+          JOIN requested r ON r.project_id = existing.project_id WHERE existing.user_id = ?)
+    )
+    INSERT INTO project_memberships (user_id, project_id, role, created_by, created_at)
+    SELECT ?, requested.project_id, ?, ?, ? FROM requested CROSS JOIN eligible`).bind(idsJson, me.id, projectIds.length, userId, userId, userId, role, me.id, now).run();
+  if (result.meta.changes !== projectIds.length) throw conflict("memberships or permissions changed; refresh before retrying");
+  const rows = await c.env.DB.prepare(`SELECT id, user_id, project_id, role, created_by, created_at
+    FROM project_memberships WHERE user_id = ? AND project_id IN (SELECT value FROM json_each(?))`).bind(userId, idsJson).all();
+  const rowMap = new Map((rows.results ?? []).map((row) => [row.project_id, row]));
+  const ip = c.req.header("CF-Connecting-IP") ?? c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ?? null;
+  try {
+    await c.env.DB.prepare(`INSERT INTO audit_logs
+      (ts, actor_type, actor_id, customer_id, project_id, action, target_type, target_id, ip, user_agent, meta)
+      SELECT ?, 'user', ?, p.customer_id, pm.project_id, 'membership.create', 'membership', pm.id, ?, ?, ?
+      FROM project_memberships pm JOIN projects p ON p.id = pm.project_id
+      WHERE pm.user_id = ? AND pm.project_id IN (SELECT value FROM json_each(?))`).bind(
+      now,
+      me.id,
+      ip,
+      c.req.header("user-agent") ?? null,
+      JSON.stringify({ userId, role, scope: "project", batchKey: crypto.randomUUID(), batchSize: projectIds.length }),
+      userId,
+      idsJson
+    ).run();
+  } catch (error) {
+    console.error("[audit] batch membership insert failed", error);
+  }
+  return c.json({ items: projectIds.map((id) => dtoProj(rowMap.get(id))) }, 201);
+});
 membershipRoutes.post("/", async (c) => {
   const me = c.get("user");
   const body = await c.req.json().catch(() => ({}));
-  if (!body.userId || !isRole(body.role)) throw badRequest("userId and role required");
+  if (!body || !isRole(body.role)) throw badRequest("userId and role required");
+  const userId = positiveId(body.userId, "userId");
   const role = body.role;
-  const targetUser = await c.env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(body.userId).first();
+  const targetUser = await c.env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(userId).first();
   if (!targetUser) throw notFound("user not found");
-  if (body.customerId && body.projectId) throw badRequest("specify exactly one of customerId or projectId");
-  if (!body.customerId && !body.projectId) throw badRequest("customerId or projectId required");
+  if (body.customerId !== void 0 === (body.projectId !== void 0)) throw badRequest("specify exactly one of customerId or projectId");
+  if (body.customerId !== void 0) positiveId(body.customerId, "customerId");
+  if (body.projectId !== void 0) positiveId(body.projectId, "projectId");
   const now = Date.now();
   if (body.customerId) {
     await requireCustomerAccess(c.env.DB, me, body.customerId, "manage_members");
@@ -27492,12 +27617,11 @@ membershipRoutes.post("/", async (c) => {
   return c.json(dtoProj(row), 201);
 });
 membershipRoutes.patch("/:id", async (c) => {
-  const id = Number(c.req.param("id"));
+  const id = queryId(c.req.param("id"), "id");
   const scope = c.req.query("scope") ?? "customer";
-  if (!Number.isFinite(id)) throw badRequest("invalid id");
   if (scope !== "customer" && scope !== "project") throw badRequest("scope must be customer or project");
   const body = await c.req.json().catch(() => ({}));
-  if (!isRole(body.role)) throw badRequest("role required");
+  if (!body || !isRole(body.role)) throw badRequest("role required");
   const me = c.get("user");
   if (scope === "customer") {
     const row2 = await c.env.DB.prepare(
@@ -27538,9 +27662,8 @@ membershipRoutes.patch("/:id", async (c) => {
   return c.json(dtoProj(updated));
 });
 membershipRoutes.delete("/:id", async (c) => {
-  const id = Number(c.req.param("id"));
+  const id = queryId(c.req.param("id"), "id");
   const scope = c.req.query("scope") ?? "customer";
-  if (!Number.isFinite(id)) throw badRequest("invalid id");
   if (scope !== "customer" && scope !== "project") throw badRequest("scope must be customer or project");
   const me = c.get("user");
   if (scope === "customer") {
@@ -28230,8 +28353,8 @@ versionRoutes.get("/accessible", async (c) => {
   const args = [];
   if (visible !== null) {
     if (visible.length === 0) return c.json([]);
-    where.push(`v.project_id IN (${visible.map(() => "?").join(",")})`);
-    args.push(...visible);
+    where.push("v.project_id IN (SELECT value FROM json_each(?))");
+    args.push(JSON.stringify(visible));
   }
   const rows = await c.env.DB.prepare(
     `SELECT v.id, v.project_id, v.version, v.release_channel, v.status, v.r2_key, v.filename, v.size,
@@ -30201,17 +30324,15 @@ auditRoutes.get("/", async (c) => {
       args.push(cid);
     }
   } else if (!isGlobalVisible(user.role)) {
-    const visibleCust = await visibleCustomerIds(c.env.DB, user);
     const visibleProj = await visibleProjectIds(c.env.DB, user);
-    const clauses = ["(actor_type = ? AND actor_id = ?)"];
-    args.push("user", user.id);
-    if (visibleCust && visibleCust.length > 0) {
-      clauses.push(`customer_id IN (${visibleCust.map(() => "?").join(",")})`);
-      args.push(...visibleCust);
-    }
+    const clauses = [
+      "(actor_type = ? AND actor_id = ?)",
+      "(project_id IS NULL AND customer_id IN (SELECT customer_id FROM memberships WHERE user_id = ?))"
+    ];
+    args.push("user", user.id, user.id);
     if (visibleProj && visibleProj.length > 0) {
-      clauses.push(`project_id IN (${visibleProj.map(() => "?").join(",")})`);
-      args.push(...visibleProj);
+      clauses.push("project_id IN (SELECT value FROM json_each(?))");
+      args.push(JSON.stringify(visibleProj));
     }
     where.push(`(${clauses.join(" OR ")})`);
   }
@@ -30816,6 +30937,9 @@ var mail_default = "CREATE TABLE mail_settings (\n  id INTEGER PRIMARY KEY CHECK
 // apps/worker/migrations/0014_api_token_restrictions.sql
 var api_token_restrictions_default = "-- NULL keeps existing tokens unrestricted on these additional dimensions.\nALTER TABLE api_tokens ADD COLUMN special_version TEXT;\nALTER TABLE api_tokens ADD COLUMN version TEXT;\n-- Deliberately retain a deleted file's id: SET NULL would broaden its token.\n-- Artifact ids are AUTOINCREMENT, so a later upload cannot inherit this grant.\nALTER TABLE api_tokens ADD COLUMN version_id INTEGER;\n";
 
+// apps/worker/migrations/0015_customer_hierarchy.sql
+var customer_hierarchy_default = "-- Hierarchy is organizational only. Memberships remain independently scoped.\nALTER TABLE customers ADD COLUMN parent_id INTEGER REFERENCES customers(id) ON DELETE RESTRICT;\n-- statement-breakpoint\nCREATE INDEX idx_customers_parent ON customers(parent_id);\n-- statement-breakpoint\n-- AFTER INSERT also checks the actual AUTOINCREMENT id when none was supplied.\nCREATE TRIGGER customers_parent_insert\nAFTER INSERT ON customers\nWHEN NEW.parent_id IS NOT NULL\nBEGIN\n  SELECT RAISE(ABORT, 'customer_hierarchy_cycle')\n  WHERE EXISTS (\n    WITH RECURSIVE ancestors(id) AS (\n      SELECT NEW.parent_id\n      UNION\n      SELECT c.parent_id FROM customers c JOIN ancestors a ON c.id = a.id\n       WHERE c.parent_id IS NOT NULL\n    )\n    SELECT 1 FROM ancestors WHERE id = NEW.id\n  );\nEND;\n-- statement-breakpoint\nCREATE TRIGGER customers_parent_update\nBEFORE UPDATE OF parent_id, id ON customers\nWHEN NEW.parent_id IS NOT NULL\nBEGIN\n  SELECT RAISE(ABORT, 'customer_hierarchy_cycle')\n  WHERE EXISTS (\n    WITH RECURSIVE ancestors(id) AS (\n      SELECT NEW.parent_id\n      UNION\n      SELECT c.parent_id FROM customers c JOIN ancestors a ON c.id = a.id\n       WHERE c.parent_id IS NOT NULL\n    )\n    SELECT 1 FROM ancestors WHERE id = NEW.id\n  );\nEND;\n";
+
 // apps/worker/pages-entry.ts
 function statements(sql) {
   return sql.replace(/--[^\n]*/g, "").split(";").map((s) => s.trim()).filter((s) => s.length > 0 && !/^PRAGMA/i.test(s));
@@ -30844,6 +30968,7 @@ async function ensureSchema(env) {
     await ensureAnnouncements(env);
     await ensureMail(env);
     await ensureTokenRestrictions(env);
+    await ensureCustomerHierarchy(env);
     schemaReady = true;
     console.log("[schema] initialized D1 tables on first run");
     return;
@@ -30860,6 +30985,7 @@ async function ensureSchema(env) {
   await ensureAnnouncements(env);
   await ensureMail(env);
   await ensureTokenRestrictions(env);
+  await ensureCustomerHierarchy(env);
   schemaReady = true;
 }
 async function ensureColumn(env, table, column, stmts) {
@@ -30938,6 +31064,14 @@ async function ensureTokenRestrictions(env) {
   if (row && !row.sql.includes("special_version")) {
     await env.DB.batch(statements(api_token_restrictions_default).map((stmt) => env.DB.prepare(stmt)));
     console.log("[schema] added API token version restrictions");
+  }
+}
+async function ensureCustomerHierarchy(env) {
+  const row = await env.DB.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'customers'").first();
+  if (row && !row.sql.includes("parent_id")) {
+    const sql = customer_hierarchy_default.split(/^-- statement-breakpoint\s*$/m).map((statement) => statement.trim()).filter(Boolean);
+    await env.DB.batch(sql.map((statement) => env.DB.prepare(statement)));
+    console.log("[schema] added independent customer hierarchy");
   }
 }
 var pages_entry_default = {

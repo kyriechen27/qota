@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from 'react';
 import { mailSettingsZh, mailSettingsEn } from './mail-settings-i18n';
+import { customerMembershipsZh, customerMembershipsEn } from './customer-memberships-i18n';
 
 export type Lang = 'zh' | 'en';
 
@@ -8,6 +9,7 @@ const LANG_KEY = 'qota.lang';
 type Dict = Record<string, string>;
 
 const zh: Dict = {
+  ...customerMembershipsZh,
   ...mailSettingsZh,
   // common
   'common.cancel': '取消',
@@ -390,8 +392,8 @@ const zh: Dict = {
   'mem.dlgGrant': '授予成员',
   'mem.fldUser': '用户',
   'mem.fldScope': '范围',
-  'mem.scopeCustomer': 'customer(对其所有项目生效)',
-  'mem.scopeProject': 'project(覆盖)',
+  'mem.scopeCustomer': '客户全部项目',
+  'mem.scopeProject': '选择项目',
   'mem.fldTarget': '目标',
   'mem.fldRole': '角色',
 
@@ -415,6 +417,7 @@ const zh: Dict = {
 };
 
 const en: Dict = {
+  ...customerMembershipsEn,
   ...mailSettingsEn,
   'common.cancel': 'Cancel',
   'common.create': 'Create',
@@ -784,8 +787,8 @@ const en: Dict = {
   'mem.dlgGrant': 'Grant membership',
   'mem.fldUser': 'User',
   'mem.fldScope': 'Scope',
-  'mem.scopeCustomer': 'customer (applies to all its projects)',
-  'mem.scopeProject': 'project (override)',
+  'mem.scopeCustomer': 'All customer projects',
+  'mem.scopeProject': 'Select projects',
   'mem.fldTarget': 'Target',
   'mem.fldRole': 'Role',
 

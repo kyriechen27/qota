@@ -105,9 +105,9 @@ export const api = {
 
   // Customers
   listCustomers: () => request<Customer[]>('/api/customers'),
-  createCustomer: (body: { code?: string; name: string; description?: string }) =>
+  createCustomer: (body: { code?: string; name: string; description?: string; parentId?: number | null }) =>
     request<Customer>('/api/customers', { method: 'POST', body: JSON.stringify(body) }),
-  updateCustomer: (id: number, body: { name?: string; description?: string | null }) =>
+  updateCustomer: (id: number, body: { name?: string; description?: string | null; parentId?: number | null }) =>
     request<Customer>(`/api/customers/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   deleteCustomer: (id: number) => request<{ ok: true }>(`/api/customers/${id}`, { method: 'DELETE' }),
 
@@ -139,6 +139,8 @@ export const api = {
     projectId?: number;
     role: CustomerRole;
   }) => request<Membership | ProjectMembership>('/api/memberships', { method: 'POST', body: JSON.stringify(body) }),
+  createProjectMemberships: (body: { userId: number; projectIds: number[]; role: CustomerRole }) =>
+    request<{ items: ProjectMembership[] }>('/api/memberships/batch', { method: 'POST', body: JSON.stringify(body) }),
   updateMembership: (id: number, scope: 'customer' | 'project', body: { role: CustomerRole }) =>
     request<Membership | ProjectMembership>(`/api/memberships/${id}?scope=${scope}`, {
       method: 'PATCH',

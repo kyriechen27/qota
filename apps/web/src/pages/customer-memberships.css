@@ -1,0 +1,55 @@
+.hierarchy-intro { margin: -4px 0 16px; font-size: 13px; line-height: 1.7; }
+.hierarchy-error { display: flex; align-items: center; gap: 12px; justify-content: space-between; margin-bottom: 14px; overflow-wrap: anywhere; }
+.hierarchy-error button { flex-shrink: 0; }
+.hierarchy-table-scroll { width: 100%; min-width: 0; overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; }
+.hierarchy-table-scroll table { margin: 0; min-width: 760px; }
+.hierarchy-table-scroll .hierarchy-empty, .hierarchy-empty { text-align: center; padding: 24px 16px; margin: 0; }
+.customer-tree-table td { vertical-align: middle; }
+.customer-tree-name { display: flex; align-items: center; gap: 7px; min-width: 200px; max-width: 520px; }
+.customer-tree-name a { overflow-wrap: anywhere; }
+.customer-tree-toggle, .customer-tree-spacer { display: inline-flex; width: 30px; min-width: 30px; height: 30px; align-items: center; justify-content: center; padding: 0; }
+.customer-tree-toggle { border-color: transparent; background: transparent; color: var(--muted); font-size: 19px; }
+.customer-tree-toggle:hover { background: rgb(255 255 255 / 6%); color: var(--text); }
+.customer-tree-description { max-width: 320px; overflow-wrap: anywhere; }
+.customer-tree-date { white-space: nowrap; font-size: 12px; }
+.customer-tree-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; white-space: nowrap; }
+.customer-tree-actions button { padding: 6px 9px; font-size: 12px; }
+.dialog.hierarchy-dialog { margin: auto; width: 520px; min-width: 0; max-width: calc(100vw - 32px); max-height: calc(100dvh - 32px); color: var(--text); }
+.hierarchy-dialog::backdrop { background: rgb(5 9 15 / 72%); }
+.hierarchy-dialog fieldset { margin: 0; padding: 0; border: 0; min-width: 0; }
+.hierarchy-dialog label { display: block; margin-top: 13px; }
+.hierarchy-dialog label > input:not([type='checkbox']), .hierarchy-dialog label > textarea, .hierarchy-dialog label > select { width: 100%; }
+.hierarchy-dialog .lbl { display: block; margin-bottom: 6px; }
+.hierarchy-dialog input[readonly] { color: var(--muted); }
+.hierarchy-field-hint { margin: 7px 0 12px; font-size: 12px; line-height: 1.7; }
+.membership-filters { flex-wrap: wrap; }
+.membership-filters > select { max-width: 300px; min-width: 160px; }
+.membership-table { min-width: 980px !important; }
+.membership-table td:first-child { max-width: 260px; overflow-wrap: anywhere; }
+.membership-target { max-width: 420px; min-width: 180px; overflow-wrap: anywhere; }
+.dialog.membership-grant-dialog { width: 620px; }
+.membership-scope-note { padding: 10px 12px; border-radius: 7px; background: rgb(255 255 255 / 3%); color: var(--muted); font-size: 12px; line-height: 1.7; margin: 10px 0; }
+.membership-existing-note { border: 1px solid rgb(251 191 36 / 25%); color: #d9bb78; }
+.membership-project-picker { border: 1px solid var(--border); border-radius: 9px; margin: 16px 0; overflow: hidden; }
+.membership-picker-heading { display: flex; justify-content: space-between; gap: 12px; align-items: center; padding: 12px 14px 6px; font-size: 13px; }
+.membership-picker-heading .muted { font-size: 12px; }
+.membership-picker-actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 7px 14px 12px; }
+.membership-picker-actions button { font-size: 12px; padding: 5px 10px; }
+.membership-project-picker > .hierarchy-field-hint { padding: 0 14px; }
+.membership-project-list { max-height: 240px; overflow-y: auto; border-top: 1px solid var(--border); overscroll-behavior: contain; }
+.hierarchy-dialog label.membership-project-option { margin: 0; display: flex; align-items: center; gap: 11px; padding: 12px 14px; cursor: pointer; border-bottom: 1px solid var(--border); }
+.membership-project-option:last-child { border-bottom: 0; }
+.membership-project-option:hover { background: rgb(255 255 255 / 3%); }
+.membership-project-option input[type='checkbox'] { flex: 0 0 auto; width: 16px; height: 16px; margin: 0; }
+.membership-project-option > span:first-of-type { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+.membership-project-option strong { display: block; font-size: 13px; font-weight: 500; }
+.membership-project-option small { display: block; margin-top: 3px; font-size: 11px; }
+.membership-project-existing { cursor: default !important; color: var(--muted); }
+.membership-project-option .tag { font-size: 11px; flex-shrink: 0; }
+@media (max-width: 640px) {
+  .dialog.hierarchy-dialog { padding: 20px 16px; }
+  .membership-filters > select { max-width: 100%; width: 100%; }
+  .membership-project-option { flex-wrap: wrap; }
+  .membership-project-option .tag { margin-left: 27px; }
+  .hierarchy-error { align-items: flex-start; }
+}

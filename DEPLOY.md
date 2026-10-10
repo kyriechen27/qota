@@ -189,8 +189,9 @@ The bundled Pages entry automatically upgrades the database on the first API
 request, including multiple current versions (`0007`), multiple files per
 version/channel (`0008`), independent version notes (`0009`), version notes
 saved during upload (`0010`), special versions (`0011`), project announcements
-(`0012`), SMTP settings and email delivery records (`0013`), and API token
-version restrictions (`0014`). Existing files, metadata and upload references are
+(`0012`), SMTP settings and email delivery records (`0013`), API token
+version restrictions (`0014`), and nested customers (`0015`). Existing customers
+remain at the top level, with their memberships and projects unchanged. Files, metadata and upload references are
 preserved; these Pages upgrades require no manual SQL. Future migrations must
 also be wired into `pages-entry.ts` to use this automatic upgrade path. Standalone
 Worker deployments still apply migrations with `npm run d1:migrate:remote`
